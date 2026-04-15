@@ -1,0 +1,405 @@
+# Unu-Scooter Pro BLE -Client for Librescoot FW and nRF v2.0.0-ls
+#
+# uses ESPHome BLE Client (https://esphome.io/components/ble_client/) and exposes available characteristics
+# as sensors.
+# More info at LibreScoot Tech Reference: (https://reference.librescoot.org/bluetooth/)
+#
+# to set all the passwords, mac addr and credentials in this example add theses to your secrets.yaml file:
+# see (https://esphome.io/guides/yaml/#secrets-and-the-secretsyaml-file)
+#
+# librescoot_nrf_ble_client_api_key: "xxx"
+# librescoot_nrf_ble_client_ota_pw: "xxx"
+# librescoot_nrf_ble_client_wifi_ssid:"xxx"
+# librescoot_nrf_ble_client_wifi_pw: "xxx"
+# librescoot_nrf_ble_client_fallback_ap_pw: "xxxxxxxx"                #should be 8 digits
+# librescoot_nrf_ble_client_webserver_basic_auth_user: "xxx"
+# librescoot_nrf_ble_client_webserver_basic_auth_pw: "xxx"
+# librescoot_nrf_ble_client_scooter_ble_mac_addr: "XX:XX:XX:XX:XX:XX" # your scooters ble MAC addr
+
+substitutions:
+  device_name: "librescoot-nrf-ble-client"
+  device_friendly_name: "Librescoot-nRF-BLE-Client"
+  device_id_name: "librescoot_nrf_ble_client"
+
+esphome:
+  name: $device_name
+  friendly_name: $device_friendly_name
+  comment: "Unu-Scooter Pro BLE -Client for Librescoot FW and nRF v2.0.0-ls"
+  build_path: "../config/esphome/build/${device_name}_build"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+# Enable Home Assistant API
+api:
+  reboot_timeout: 5min
+  encryption:
+    key: !secret librescoot_nrf_ble_client_api_key
+  actions:
+    - action: passkey_reply
+      variables:
+        pin: int
+      then:
+        - logger.log:
+            format: "Sende PIN %06d an das Gerät..."
+            args: [ pin ]
+        - ble_client.passkey_reply:
+            id: scooter_1_nrf_ble_device
+            passkey: !lambda return pin;
+
+ota:
+  platform: esphome
+  password: !secret librescoot_nrf_ble_client_ota_pw
+
+wifi:
+  ssid: !secret librescoot_nrf_ble_client_wifi_ssid
+  password: !secret librescoot_nrf_ble_client_wifi_pw
+  reboot_timeout: 5min
+  min_auth_mode: WPA
+
+  ap:
+    ssid: ${device_friendly_name}-AP
+    password: !secret librescoot_nrf_ble_client_fallback_ap_pw
+
+captive_portal:
+
+web_server:
+  local: true # no external content from internet (only version 2 supported)
+  version: 2 # 1 or 2 (modern)
+  port: 80
+  auth:
+    username: !secret librescoot_nrf_ble_client_webserver_basic_auth_user
+    password: !secret librescoot_nrf_ble_client_webserver_basic_auth_pw
+
+
+logger:
+  baud_rate: 0  # disable logging over UART
+  #level: VERBOSE
+
+esp32_ble_tracker:
+
+ble_client:
+  - mac_address: !secret librescoot_nrf_ble_client_scooter_ble_mac_addr
+    id: scooter_1_nrf_ble_device
+    auto_connect: true
+    on_connect:
+      then:
+        - logger.log: "Scooter Connected! Characteristics will be listed now..."
+    on_disconnect:
+      then:
+        - logger.log: "Connection lost."
+    on_passkey_request:
+      then:
+        - logger.log: "!!! PIN REQUIRED !!!"
+        - logger.log: "Please go to Home Assistant -> Developer Tools -> Actions"
+        - logger.log: "Select 'esphome.your_node_name_passkey_reply' and enter the PIN."
+    on_passkey_notification:
+      then:
+        - logger.log:
+            format: "The device displays this passkey: %06d"
+            args: [ passkey ]
+
+sensor:
+  # --- Main Battery Service (0x9a5900e0) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Battery 1 SoC"
+    service_uuid: "9a5900e0-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a5900e9-6e67-5d0d-aab9-ad9126b66f91"
+    unit_of_measurement: "%"
+    icon: "mdi:battery"
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Battery 1 Cycles"
+    service_uuid: "9a5900e0-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a5900e6-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:battery-sync"
+    entity_category: diagnostic
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Battery 1 Present"
+    service_uuid: "9a5900e0-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a5900e3-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:battery-check"
+    entity_category: diagnostic
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Battery 2 SoC"
+    service_uuid: "9a5900e0-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a5900f5-6e67-5d0d-aab9-ad9126b66f91"
+    unit_of_measurement: "%"
+    icon: "mdi:battery"
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Battery 2 Cycles"
+    service_uuid: "9a5900e0-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a5900f2-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:battery-sync"
+    entity_category: diagnostic
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Battery 2 Present"
+    service_uuid: "9a5900e0-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a5900ef-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:battery-check"
+    entity_category: diagnostic
+    state_class: measurement
+    accuracy_decimals: 0
+
+  # --- Aux Battery Service (0x9a590040) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Aux Battery Voltage"
+    service_uuid: "9a590040-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590041-6e67-5d0d-aab9-ad9126b66f91"
+    unit_of_measurement: "V"
+    icon: "mdi:lightning-bolt"
+    state_class: measurement
+    accuracy_decimals: 2
+    lambda: |-
+      if (x.size() >= 2) {
+        uint16_t mv = (uint16_t)x[0] | ((uint16_t)x[1] << 8);
+        return (float)mv / 1000.0f;
+      }
+      return 0.0f;
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Aux Battery Level"
+    service_uuid: "9a590040-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590044-6e67-5d0d-aab9-ad9126b66f91"
+    unit_of_measurement: "%"
+    icon: "mdi:battery"
+    accuracy_decimals: 0
+
+  # --- CBB Connectivity Battery (0x9a590060) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "CBB Battery Level"
+    service_uuid: "9a590060-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590061-6e67-5d0d-aab9-ad9126b66f91"
+    unit_of_measurement: "%"
+    icon: "mdi:battery-bluetooth"
+    accuracy_decimals: 0
+
+  # --- Scooter Info (0x9a59a040) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Odometer"
+    service_uuid: "9a59a040-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a59a042-6e67-5d0d-aab9-ad9126b66f91"
+    unit_of_measurement: "km"
+    icon: "mdi:counter"
+    state_class: total_increasing
+    accuracy_decimals: 3
+    lambda: |-
+      if (x.size() >= 4) {
+        uint32_t meters = (uint32_t)x[0] | ((uint32_t)x[1] << 8) | ((uint32_t)x[2] << 16) | ((uint32_t)x[3] << 24);
+        return (float)meters / 1000.0f;
+      }
+      return 0.0f;
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Navigation Active"
+    service_uuid: "9a59a040-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a59a044-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:navigation-variant"
+    entity_category: diagnostic
+    state_class: measurement
+    accuracy_decimals: 0
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "UMS Status"
+    service_uuid: "9a59a040-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a59a045-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:usb-flash-drive"
+    entity_category: diagnostic
+    state_class: measurement
+    accuracy_decimals: 0
+
+  # --- System Info (0x9a59a000) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Reset Count"
+    service_uuid: "9a59a000-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a59a022-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:counter"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+
+  # --- Status Service (9a590020) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    type: characteristic
+    name: "Scooter Temperature"
+    service_uuid: "9a590020-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590024-6e67-5d0d-aab9-ad9126b66f91"
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    disabled_by_default: true   # disabled, because currently not supported [Scooter Temperature] Cannot poll, not connected
+    lambda: |-
+      if (x.size() >= 2) {
+        int16_t raw = (int16_t)((uint16_t)x[1] | ((uint16_t)x[0] << 8));
+        return (float)raw / 10.0f;
+      }
+      return 0.0f;
+
+text_sensor:
+  # --- Power Mux Service (9a590100) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Power Mux Selected Input"
+    service_uuid: "9a590100-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590101-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:source-branch"
+    entity_category: diagnostic
+
+  # --- Aux Charger Control Service (9a590120) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "LTC4020 Aux Charger Status"
+    service_uuid: "9a590120-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590123-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:battery-charging-100"
+    entity_category: diagnostic
+    disabled_by_default: true   # disabled, because currently not supported [LTC4020 Aux Charger Status] Cannot poll, not connected
+
+  # --- Accelerometer Service (9a590200) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Wake-up Suspend"
+    service_uuid: "9a590200-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590201-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:vibrate"
+    entity_category: diagnostic
+    disabled_by_default: true   # disabled, because currently not supported [Wake-up Suspend] Cannot poll, not connected
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Wake-up Hibernation"
+    service_uuid: "9a590200-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590202-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:vibrate-off"
+    entity_category: diagnostic
+    disabled_by_default: true   # disabled, because currently not supported [Wake-up Hibernation] Cannot poll, not connected
+
+  # --- Status Service (0x9a590020) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Status"
+    service_uuid: "9a590020-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590021-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:moped"
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Seatbox"
+    service_uuid: "9a590020-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590022-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:toolbox"
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Handlebar Lock"
+    service_uuid: "9a590020-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590023-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:lock"
+
+  # --- Power State (0x9a5900a0) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Power State"
+    service_uuid: "9a5900a0-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a5900a1-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:power-settings"
+    entity_category: diagnostic
+
+  # --- Main Battery States (0x9a5900e0) ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Battery 1 State"
+    service_uuid: "9a5900e0-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a5900e2-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:battery-heart-variant"
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Battery 2 State"
+    service_uuid: "9a5900e0-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a5900ee-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:battery-heart-variant"
+
+  # --- Diagnostics: Versions ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "iMX Software Version"
+    service_uuid: "9a59a040-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a59a041-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:package-variant-closed"
+    entity_category: diagnostic
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "nRF Version"
+    service_uuid: "9a59a000-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a59a001-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:chip"
+    entity_category: diagnostic
+
+  # --- Charge Status Text ---
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Aux Charge Status"
+    service_uuid: "9a590040-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590043-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:battery-charging"
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "CBB Charge Status"
+    service_uuid: "9a590060-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590072-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:battery-charging-wireless"
+
+  - platform: ble_client
+    ble_client_id: scooter_1_nrf_ble_device
+    name: "Reset Reason"
+    service_uuid: "9a59a000-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a59a021-6e67-5d0d-aab9-ad9126b66f91"
+    icon: "mdi:history"
+    entity_category: diagnostic
+    disabled_by_default: true   # disabled, because currently not supported [Reset Reason] Cannot poll, not connected
