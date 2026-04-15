@@ -1,0 +1,131 @@
+# Unu-Scooter Pro CBB i2c addr 0x36 Interface
+#
+# More info /example arduino scatch / teardown pinouts: https://github.com/Julinho666/UNU-CBB-Battery)
+# - (https://reference.librescoot.org/electronic/#connectivity-battery-cbb)
+#
+# makes use of ESPHome i2c-BUS component (https://esphome.io/components/i2c/)
+#
+# librescoot_api_key: "xxx"                            # use generator on (https://esphome.io/components/api/) to generate a api-key
+# librescoot_ota_pw: "xxx"
+# librescoot_wifi_ssid:"xxx"
+# librescoot_wifi_pw: "xxx"
+# librescoot_fallback_ap_pw: "xxxxxxxx"                #should be 8 digits
+# librescoot_webserver_basic_auth_user: "xxx"
+# librescoot_webserver_basic_auth_pw: "xxx"
+
+substitutions:
+  device_name: "librescoot-cbb-a4c5cb"
+  device_friendly_name: "Librescoot-CBB-A4C5CB"
+  device_id_name: "librescoot_cbb_a4c5cb"
+
+
+esphome:
+  name: $device_name
+  friendly_name: $device_friendly_name
+  comment: "Unu-Scooter Pro CBB i2c interface "
+  build_path: "../config/esphome/build/${device_name}_build"
+  includes:
+    - librescoot-cbb-max17301.h
+
+# Works with both esp32 and esp8266 chip because not much hardware requirements
+#esp32:
+#  board: esp32dev
+#  framework:
+#    type: esp-idf
+
+esp8266:
+  board: nodemcu  # this example is for D1 Mini NodeMcu
+
+# Enable Home Assistant API
+api:
+  reboot_timeout: 5min
+  encryption:
+    key: !secret librescoot_api_key
+
+ota:
+  platform: esphome
+  password: !secret librescoot_ota_pw
+
+wifi:
+  ssid: !secret librescoot_wifi_ssid
+  password: !secret librescoot_wifi_pw
+  reboot_timeout: 5min
+  min_auth_mode: WPA
+
+  ap:
+    ssid: ${device_friendly_name}-AP
+    password: !secret librescoot_fallback_ap_pw
+
+captive_portal:
+
+web_server:
+  local: true # no external content from internet (only version 2 supported)
+  version: 2 # 1 or 2 (modern)
+  port: 80
+  auth:
+    username: !secret librescoot_webserver_basic_auth_user
+    password: !secret librescoot_webserver_basic_auth_pw
+
+
+logger:
+  baud_rate: 0  # disable logging over UART
+  #level: VERBOSE
+
+# i2c Addr: 0x36
+# i2c PINS:
+# // SDA = 21, SCL = 22 (default for ESP32 DevKit)
+# // SDA = D2, SCL = D1 (default for ESP8266 D1-Mini)
+
+i2c:
+  sda: D2 # -> #wire 131 - CBB Module Connector #63 PIN 5 (CBB I2C Bus SDA Line)
+  scl: D1 # -> #wire 132 - CBB Module Connector #63 PIN 2 (CBB I2C Bus SCL Line)
+  scan: true
+  id: lsc_i2c_bus_1
+
+interval:
+  - interval: 10s
+    then:
+      - lambda: 'my_max17301->update();'
+
+binary_sensor:
+  - platform: template
+    name: "Battery Charging"
+    id: battery_charging_status
+    device_class: battery_charging
+    lambda: 'return my_max17301->charging;'
+
+sensor:
+  - platform: template
+    name: "Battery SOC"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    icon: "mdi:battery-sync"
+    state_class: measurement
+    lambda: 'return my_max17301->soc;'
+
+  - platform: template
+    name: "Battery VFSOC"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+    lambda: 'return my_max17301->vfsoc;'
+
+  - platform: template
+    name: "Battery Voltage"
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+    icon: "mdi:flash"
+    lambda: 'return my_max17301->voltage;'
+
+  - platform: template
+    name: "Battery Current"
+    unit_of_measurement: "mA"
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+    icon: "mdi:current-dc"
+    lambda: 'return my_max17301->current;'
