@@ -102,6 +102,36 @@ ble_client:
             args: [ passkey ]
 
 sensor:
+  - platform: ble_client
+    ble_client_id: my_ble_device
+    type: characteristic
+    id: wakeup_suspend_raw
+    internal: true
+    service_uuid: "9a590200-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590201-6e67-5d0d-aab9-ad9126b66f91"
+    update_interval: never
+    notify: true
+    on_notify:
+      then:
+        - event.trigger:
+            id: wakeup_suspend_event
+            event_type: "movement_detected"
+
+  - platform: ble_client
+    ble_client_id: my_ble_device
+    type: characteristic
+    id: wakeup_hibernation_raw
+    internal: true
+    service_uuid: "9a590200-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590202-6e67-5d0d-aab9-ad9126b66f91"
+    update_interval: never
+    notify: true
+    on_notify:
+      then:
+        - event.trigger:
+            id: wakeup_hibernation_event
+            event_type: "movement_detected"
+
   # --- Main Battery Service (0x9a5900e0) ---
   - platform: ble_client
     ble_client_id: my_ble_device
@@ -112,6 +142,7 @@ sensor:
     unit_of_measurement: "%"
     icon: "mdi:battery"
     state_class: measurement
+    device_class: battery
     accuracy_decimals: 0
 
   - platform: ble_client
@@ -153,6 +184,7 @@ sensor:
     unit_of_measurement: "%"
     icon: "mdi:battery"
     state_class: measurement
+    device_class: battery
     accuracy_decimals: 0
 
   - platform: ble_client
@@ -213,6 +245,7 @@ sensor:
     unit_of_measurement: "%"
     icon: "mdi:battery"
     accuracy_decimals: 0
+    device_class: battery
     entity_category: diagnostic
 
   # --- CBB Connectivity Battery (0x9a590060) ---
@@ -225,6 +258,7 @@ sensor:
     unit_of_measurement: "%"
     icon: "mdi:battery-bluetooth"
     accuracy_decimals: 0
+    device_class: battery
     entity_category: diagnostic
 
   # --- Scooter Info (0x9a59a040) ---
@@ -333,29 +367,11 @@ text_sensor:
     entity_category: diagnostic
     disabled_by_default: true
 
-  # --- Accelerometer Service (9a590200) ---
-  - platform: ble_client
-    ble_client_id: my_ble_device
-    name: "Wake-up Suspend"
-    service_uuid: "9a590200-6e67-5d0d-aab9-ad9126b66f91"
-    characteristic_uuid: "9a590201-6e67-5d0d-aab9-ad9126b66f91"
-    icon: "mdi:vibrate"
-    entity_category: diagnostic
-    disabled_by_default: true
-
-  - platform: ble_client
-    ble_client_id: my_ble_device
-    name: "Wake-up Hibernation"
-    service_uuid: "9a590200-6e67-5d0d-aab9-ad9126b66f91"
-    characteristic_uuid: "9a590202-6e67-5d0d-aab9-ad9126b66f91"
-    icon: "mdi:vibrate-off"
-    entity_category: diagnostic
-    disabled_by_default: true
-
   # --- Status Service (0x9a590020) ---
   - platform: ble_client
     ble_client_id: my_ble_device
     name: "Status"
+    id: scooter_state_raw
     service_uuid: "9a590020-6e67-5d0d-aab9-ad9126b66f91"
     characteristic_uuid: "9a590021-6e67-5d0d-aab9-ad9126b66f91"
     icon: "mdi:moped"
@@ -468,3 +484,91 @@ binary_sensor:
     name: "UMS Status"
     icon: "mdi:usb-flash-drive"
     entity_category: diagnostic
+
+select:
+  - platform: template
+    name: "Scooter Blinker"
+    id: scooter_blinker
+    icon: "mdi:car-light-high"
+    entity_category: config
+    options: ["off", "left", "right", "both"]
+    optimistic: true
+    set_action:
+      - ble_client.ble_write:
+          id: my_ble_device
+          service_uuid: "9a590000-6e67-5d0d-aab9-ad9126b66f91"
+          characteristic_uuid: "9a590001-6e67-5d0d-aab9-ad9126b66f91"
+          value: !lambda |-
+            std::string cmd = "scooter:blinker " + x;
+            return std::vector<uint8_t>(cmd.begin(), cmd.end());
+
+button:
+  - platform: template
+    name: "Scooter Seatbox Open"
+    id: scooter_seatbox_open
+    icon: "mdi:package-variant-closed-plus"
+    entity_category: config
+    on_press:
+      - ble_client.ble_write:
+          id: my_ble_device
+          service_uuid: "9a590000-6e67-5d0d-aab9-ad9126b66f91"
+          characteristic_uuid: "9a590001-6e67-5d0d-aab9-ad9126b66f91"
+          value: !lambda |-
+            std::string cmd = "scooter:seatbox open";
+            return std::vector<uint8_t>(cmd.begin(), cmd.end());
+
+  - platform: template
+    name: "Scooter Hibernate"
+    id: scooter_hibernate
+    icon: "mdi:power-sleep"
+    entity_category: config
+    on_press:
+      - ble_client.ble_write:
+          id: my_ble_device
+          service_uuid: "9a590000-6e67-5d0d-aab9-ad9126b66f91"
+          characteristic_uuid: "9a590002-6e67-5d0d-aab9-ad9126b66f91"
+          value: !lambda |-
+            std::string cmd = "hibernate";
+            return std::vector<uint8_t>(cmd.begin(), cmd.end());
+
+  - platform: template
+    name: "Scooter Wakeup"
+    id: scooter_wakeup
+    icon: "mdi:power"
+    entity_category: config
+    on_press:
+      - ble_client.ble_write:
+          id: my_ble_device
+          service_uuid: "9a590000-6e67-5d0d-aab9-ad9126b66f91"
+          characteristic_uuid: "9a590002-6e67-5d0d-aab9-ad9126b66f91"
+          value: !lambda |-
+            std::string cmd = "wakeup";
+            return std::vector<uint8_t>(cmd.begin(), cmd.end());
+
+  - platform: template
+    name: "Scooter Reboot"
+    id: scooter_reboot
+    icon: "mdi:restart"
+    entity_category: config
+    on_press:
+      - ble_client.ble_write:
+          id: my_ble_device
+          service_uuid: "9a590000-6e67-5d0d-aab9-ad9126b66f91"
+          characteristic_uuid: "9a590002-6e67-5d0d-aab9-ad9126b66f91"
+          value: !lambda |-
+            std::string cmd = "reboot";
+            return std::vector<uint8_t>(cmd.begin(), cmd.end());
+
+  - platform: template
+    name: "Scooter Hard Reboot"
+    id: scooter_hard_reboot
+    icon: "mdi:restart-alert"
+    entity_category: config
+    on_press:
+      - ble_client.ble_write:
+          id: my_ble_device
+          service_uuid: "9a590000-6e67-5d0d-aab9-ad9126b66f91"
+          characteristic_uuid: "9a590002-6e67-5d0d-aab9-ad9126b66f91"
+          value: !lambda |-
+            std::string cmd = "hard-reboot";
+            return std::vector<uint8_t>(cmd.begin(), cmd.end());
