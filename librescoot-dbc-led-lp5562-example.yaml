@@ -1,0 +1,221 @@
+# Unu-Scooter Pro DBC i2c 4ch (3ch used) RGY LED Driver lp5562 at addr 0x30 Interface test
+#
+#
+# makes use of ESPHome i2c-BUS component (https://esphome.io/components/i2c/)
+#
+# librescoot_api_key: "xxx"                            # use generator on (https://esphome.io/components/api/) to generate a api-key
+# librescoot_ota_pw: "xxx"
+# librescoot_wifi_ssid:"xxx"
+# librescoot_wifi_pw: "xxx"
+# librescoot_fallback_ap_pw: "xxxxxxxx"                #should be 8 digits
+# librescoot_webserver_basic_auth_user: "xxx"
+# librescoot_webserver_basic_auth_pw: "xxx"
+
+
+substitutions:
+  device_name: "librescoot-dbc-led-lp5562"
+  device_friendly_name: "Librescoot-DBC-LED-LP5562"
+  device_id_name: "librescoot_dbc_led_lp5562"
+
+
+esphome:
+  name: $device_name
+  friendly_name: $device_friendly_name
+  comment: "Unu-Scooter Pro DBC i2c LED driver interface "
+  build_path: "../config/esphome/build/${device_name}_build"
+  on_boot:
+    - priority: -100   # late, after i2c + lp5562 are ready
+      then:
+        - light.turn_on:
+            id: led_green
+            effect: "breathe"
+
+# Works with both esp32 and esp8266 chip because not much hardware requirements
+#esp32:
+#  board: esp32dev
+#  framework:
+#    type: esp-idf
+
+esp8266:
+  board: nodemcu  # this example is for D1 Mini NodeMcu
+
+# Enable Home Assistant API
+api:
+  reboot_timeout: 5min
+  encryption:
+    key: !secret librescoot_api_key
+
+ota:
+  platform: esphome
+  password: !secret librescoot_ota_pw
+
+wifi:
+  ssid: !secret librescoot_wifi_ssid
+  password: !secret librescoot_wifi_pw
+  reboot_timeout: 5min
+  min_auth_mode: WPA
+
+  ap:
+    ssid: ${device_friendly_name}-AP
+    password: !secret librescoot_fallback_ap_pw
+
+captive_portal:
+
+web_server:
+  local: true # no external content from internet (only version 2 supported)
+  version: 2 # 1 or 2 (modern)
+  port: 80
+  auth:
+    username: !secret librescoot_webserver_basic_auth_user
+    password: !secret librescoot_webserver_basic_auth_pw
+
+logger:
+  baud_rate: 0  # disable logging over UART
+  #level: VERBOSE
+
+# i2c Addr lp5562 LED Driver: 0x30
+# i2c PINS:
+# // SDA = 21, SCL = 22 (default for ESP32 DevKit)
+# // SDA = D2, SCL = D1 (default for ESP8266 D1-Mini)
+
+i2c:
+  sda: D2 # Dashboard Connector PIN 8 (DBC I2C3.SDA Dash)   -> #wire 82 -> #wire 141 -> MDB CM1 Pin 5 I2C3 SDA (Dash.)
+  scl: D1 # Dashboard Connector PIN 16 (DBC I2C3.SCL Dash)  -> #wire 83 -> #wire 149 -> MDB CM1 Pin 2 I2C3 SCL (Dash.)
+  scan: true
+  id: lsc_i2c_bus_1
+  #frequency: 100kHz
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/ssieb/esphome
+      ref: lp5562
+    components: [ lp5562 ]
+    refresh: 1d
+
+lp5562:
+  - i2c_id: lsc_i2c_bus_1
+    address: 0x30
+
+
+output:
+  - platform: lp5562
+    id: led_ch0_red_out
+    channel: 0
+  - platform: lp5562
+    id: led_ch1_green_out
+    channel: 1
+  - platform: lp5562
+    id: led_ch2_yellow_out
+    channel: 2
+
+light:
+  - platform: monochromatic
+    id: led_red
+    output: led_ch0_red_out
+    default_transition_length: 0s
+    effects:
+      - pulse:
+          name: "breathe"
+          transition_length: 1500ms
+          update_interval: 1500ms
+          min_brightness: 0%
+          max_brightness: 100%
+  - platform: monochromatic
+    id: led_green
+    output: led_ch1_green_out
+    default_transition_length: 0s
+    effects:
+      - pulse:
+          name: "breathe"
+          transition_length: 1500ms
+          update_interval: 1500ms
+          min_brightness: 0%
+          max_brightness: 100%
+  - platform: monochromatic
+    id: led_yellow
+    output: led_ch2_yellow_out
+    default_transition_length: 0s
+    effects:
+      - pulse:
+          name: "breathe"
+          transition_length: 1500ms
+          update_interval: 1500ms
+          min_brightness: 0%
+          max_brightness: 100%
+
+binary_sensor:
+  - platform: template
+    name: "LED Chip Online"
+    id: led_chip_online
+    lambda: 'return {};'
+    on_press:
+      - logger.log:
+          format: "LED chip (0x30) detected on I2C bus - starting default green breathing"
+          level: INFO
+      - light.turn_on:
+          id: led_green
+          effect: "breathe"
+    on_release:
+      - logger.log:
+          format: "LED chip (0x30) not responding on I2C bus"
+          level: WARN
+      - light.turn_off: led_red
+      - light.turn_off: led_green
+      - light.turn_off: led_yellow
+
+interval:
+  - interval: 2s
+    then:
+      - lambda: |-
+          auto bus = id(lsc_i2c_bus_1);
+          uint8_t dummy;
+          auto err_led = bus->read(0x30, &dummy, 1);
+          id(led_chip_online).publish_state(err_led == esphome::i2c::ERROR_OK);
+
+button:
+  - platform: template
+    name: "LED Red"
+    on_press:
+      - if:
+          condition:
+            binary_sensor.is_on: led_chip_online
+          then:
+            - light.turn_off: led_green
+            - light.turn_off: led_yellow
+            - light.turn_on:
+                id: led_red
+                effect: "breathe"
+
+  - platform: template
+    name: "LED Green"
+    on_press:
+      - if:
+          condition:
+            binary_sensor.is_on: led_chip_online
+          then:
+            - light.turn_off: led_red
+            - light.turn_off: led_yellow
+            - light.turn_on:
+                id: led_green
+                effect: "breathe"
+
+  - platform: template
+    name: "LED Yellow"
+    on_press:
+      - if:
+          condition:
+            binary_sensor.is_on: led_chip_online
+          then:
+            - light.turn_off: led_red
+            - light.turn_off: led_green
+            - light.turn_on:
+                id: led_yellow
+                effect: "breathe"
+
+  - platform: template
+    name: "LED Off"
+    on_press:
+      - light.turn_off: led_red
+      - light.turn_off: led_green
+      - light.turn_off: led_yellow

@@ -14,9 +14,9 @@
 # librescoot_webserver_basic_auth_pw: "xxx"
 
 substitutions:
-  device_name: "librescoot-cbb-a4c5cb"
-  device_friendly_name: "Librescoot-CBB-A4C5CB"
-  device_id_name: "librescoot_cbb_a4c5cb"
+  device_name: "librescoot-cbb"
+  device_friendly_name: "Librescoot-CBB"
+  device_id_name: "librescoot_cbb"
 
 
 esphome:

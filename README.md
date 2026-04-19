@@ -5,7 +5,7 @@ ESPHome Components and configurations for UNU Scooter Pro with opensource [Libre
 
 ## Example .yaml files:
 
-### [nRF-BLE-Client](librescoot-nrf-ble-client-example.yaml)
+### [MDB nRF-BLE-Client](librescoot-nrf-ble-client-example.yaml)
 
 BLE-Client for Unu-Scooter Pro with Librescoot FW and nRF >v2.0.0-ls.
 Uses ESPHome [BLE Client](https://esphome.io/components/ble_client/) and exposes available characteristics as sensors.
@@ -34,52 +34,126 @@ When the ESP32 first connects to the scooter, it will ask for a passkey. To ente
 
 
 ### [CBB monitoring via i2c](librescoot-cbb-example.yaml)
-The UNU-CBB battery board features a **MAX17301** fuel gauge. Integrating this chip into ESPHome requires a custom C++ header [librescoot-cbb-max17301.h](librescoot-cbb-max17301.h) because the chip uses a specific 16-bit register map and a dual-addressing scheme that standard components (like the MAX17043) do not support.
 
-#### I2C Addressing & Memory Mapping
-The MAX17301 organizes its registers into two virtual "pages," each represented by a different 7-bit I2C address. The header logic automatically handles switching between these addresses based on the requested register:
+The UNU-CBB battery board uses a **MAX17301** fuel gauge. A custom C++ header [librescoot-cbb-max17301.h](librescoot-cbb-max17301.h) handles the chip-specific 16-bit register map and dual-address scheme.
 
-| Page | 7-bit Addr (ESPHome) | 8-bit Addr (Arduino) | Function |
-| :--- | :--- | :--- | :--- |
-| **Primary** | `0x36` | `0x6C` | Real-time data (Voltage, SOC, Current) |
-| **Extended**| `0x0B` | `0x16` | Configuration & NVRAM (NRSense) |
+#### Wiring
 
-The ESPHome implementation uses the 7-bit address. If a register address is `> 0xFF` (e.g., NRSense at `0x1CF`), the code automatically communicates with address `0x0B`.
+I2C is wired to the CBB Module Connector (#63):
 
-#### Framework Specifics: ESP32 ESP-IDF vs. ESP8266
-The implementation differs depending on the hardware framework used in your YAML:
+| ESP Pin | Signal | CBB Connector |
+| :--- | :--- | :--- |
+| `D2` | SDA | Pin 5 (wire 131) |
+| `D1` | SCL | Pin 2 (wire 132) |
 
-*   **ESP32 (ESP-IDF Framework):** 
-    This project uses the native **ESP-IDF** framework (non-Arduino). In this mode, we interact directly with the ESPHome `I2CBus` object. Instead of using high-level Arduino-style `read_register` helpers, we perform manual bus transactions:
-    1.  `write()`: Sends the 8-bit register address to the bus.
-    2.  `read()`: Fetches 2 bytes from the chip.
-    3.  **Endianness**: The MAX17301 uses Little Endian. Bytes are reassembled manually: `(buffer[1] << 8) | buffer[0]`.
+#### I2C Addressing
 
-*   **ESP8266 (Arduino Framework):**
-    While possible, the Arduino framework uses the `Wire` library abstraction. The `I2CBus` calls would differ slightly, but for performance and stability on the ESP32, the ESP-IDF framework is preferred.
+The MAX17301 maps its registers across two 7-bit I2C addresses. The header switches between them automatically based on the register being accessed:
 
-#### Data Conversion & Accuracy
-The system translates raw hexadecimal register values into human-readable units:
+| Address | Used for |
+| :--- | :--- |
+| `0x36` | Real-time data (registers `0x00`–`0xFF`) |
+| `0x0B` | Configuration & NVRAM (registers `0x100`+) |
 
-*   **SOC (State of Charge):** Derived from the ModelGauge m5 algorithm. It is highly stable and accounts for battery aging.
-*   **VFSOC (Voltage-based SOC):** A theoretical charge level based strictly on the current voltage. Useful for diagnostics but prone to "voltage sag" under load.
-*   **Voltage:** Calculated with a resolution of `78.125 µV` per LSB.
-*   **Current:** Calculated using the internal `NRSense` calibration value. The formula used is:  
-    `Current (mA) = (Raw_Value * 1.5625 µV) / NRSense_Value`.
+Values are read as 16-bit little-endian: `(buffer[1] << 8) | buffer[0]`.
 
-#### ESPHome Software Architecture
-The integration is split into three parts to ensure a clean YAML structure:
+#### Sensors
 
-1.  **Header File (`.h`):** Contains the `MAX17301` class logic, handling all I2C communication and raw data processing.
-2.  **Polling Interval:** An `interval: 10s` block in the YAML triggers the `update()` method of the C++ class. This centralizes I2C traffic to one burst every 10 seconds.
-3.  **Template Sensors:** Standard ESPHome sensors fetch the calculated values from the C++ class. This allows the use of `device_class: battery`, `voltage`, and `current`, which enables dynamic MDI icons and native behavior in Home Assistant.
+The class polls the fuel gauge every 10s and exposes the following sensors:
 
-#### Console Output Example
-The implementation mirrors the [UNU-CBB-Battery](https://github.com/Julinho666/UNU-CBB-Battery) Arduino-Scetch serial output for debugging purposes:
+**Primary**
+*   **SOC** — State of charge from the ModelGauge m5 algorithm, compensated for aging.
+*   **VFSOC** — Voltage-based SOC. Diagnostic only; affected by load-induced voltage sag.
+*   **Voltage** — Pack voltage, 78.125 µV/LSB.
+*   **Current** — Pack current in mA, calibrated via the chip's internal `NRSense` value: `Current (mA) = Raw × 1.5625 µV / NRSense`.
+*   **Charging** — Binary sensor, true when current > 5 mA.
+
+**Diagnostic**
+*   **Age** — Remaining capacity as a percentage of design capacity (`FullCapNom / DesignCap`). Indicates battery health.
+*   **Cycles** — Total charge/discharge cycles. Register stores quarter-cycles (LSb = 25%).
+*   **Temperature** — Current pack temperature, 1/256 °C/LSB.
+*   **Temperature Min / Max** — Extremes seen since the last NV save (not lifetime-cumulative; resets periodically).
+
+#### Framework
+
+Built for the **ESP-IDF** framework on ESP32. Uses direct `I2CBus` transactions rather than the Arduino `Wire` abstraction for stability and performance.
+
+#### Console Output
+
+Matches the [UNU-CBB-Battery](https://github.com/Julinho666/UNU-CBB-Battery) Arduino sketch format for debugging:
 
 `SOC: 99% VFSOC: 51%, Current: -1.50mA, Charging: No, Voltage: 3.72V`
 
-### DBC monitoring via i2c and UART
-tba
+### [DBC Status LED driver via I²C addr 0x30](librescoot-dbc-led-example.yaml)
+
+The UNU Dashboard Connector (DBC) uses an **LP5562** 4-channel programmable LED driver to control the tri-color keycard status indicator. ESPHome's stock component set doesn't include the LP5562, so this example pulls it in from [ssieb's community fork](https://github.com/ssieb/esphome/tree/lp5562).
+#### Wiring
+
+The LP5562 lives on the DBC's I²C3 bus, exposed on the Dashboard Connector and routed through the MDB:
+
+| ESP pin | DBC pin | Signal | Route |
+| :--- | :--- | :--- | :--- |
+| `D2` | 8 | I²C3 SDA | wire 82 → wire 141 → MDB CM1 Pin 5 |
+| `D1` | 16 | I²C3 SCL | wire 83 → wire 149 → MDB CM1 Pin 2 |
+
+#### I²C Addressing
+
+The LP5562 sits on the DBC's I²C3 bus at a single 7-bit address:
+
+| Address | Used for |
+| :--- | :--- |
+| `0x30` | All register access (enable, PWM, current, config) |
+
+Register writes are straightforward 8-bit values — no dual-address tricks or 16-bit endian concerns.
+
+#### Channels
+
+The LP5562 exposes four PWM channels. On the DBC only three are populated with LED dies (the fourth, intended for a white backlight channel, is not wired up):
+
+| Channel | Register | LED color |
+| :--- | :--- | :--- |
+| 0 | `0x04` | Red |
+| 1 | `0x03` | Green |
+| 2 | `0x02` | Amber |
+| 3 | `0x0E` | *not populated* |
+
+Mixing red + green produces a yellow tone suitable for the "authenticating" state described in the Librescoot keycard protocol. The amber die is left as a distinct third color rather than mixed with the others.
+
+#### ESPHome integration
+
+Each channel is wrapped as a `monochromatic` light with a `pulse` effect named `breathe`, giving a smooth fade-in / fade-out pattern used as the idle indicator. On boot, the green channel starts breathing by default once the chip is confirmed present on the bus.
+
+**Online detection**
+
+A `binary_sensor` of platform `template` named `LED Chip Online` is updated every 2 seconds by a lambda that performs a 1-byte I²C read against `0x30`. When the chip ACKs, the sensor transitions to `true` and the default green breathing effect starts via its `on_press` trigger. When the chip stops responding (cable unplugged, power loss), the sensor transitions to `false` and all lights are turned off in `on_release`, which stops the pulse effect and prevents the LP5562 output component from spamming write errors.
+
+This makes the bus hot-pluggable: the device can boot without the chip connected, and will pick it up the moment it appears.
+
+#### Manual controls
+
+Four template `button` entities are exposed for manual color switching:
+
+*   **LED Red / Green / Yellow** — each one turns off the other two lights and starts the `breathe` effect on the selected channel. All three are guarded by a condition checking `led_chip_online`, so button presses while the chip is unreachable are no-ops instead of generating I²C errors.
+*   **LED Off** — unconditionally turns off all three lights.
+
+#### Framework
+
+Built for the **Arduino** framework on ESP8266 (NodeMCU v3, ESP-12E). Uses the stock ESPHome I²C implementation. No custom C++ header needed — the ssieb `lp5562` component handles register-level access internally.
+
+#### Log output
+
+On first detection of the chip and in steady state:
+
+```
+[I][binary_sensor:...]: 'LED Chip Online': Sending state ON
+[I][main:...]: LED chip (0x30) detected on I2C bus - starting default green breathing
+```
+
+If the chip is pulled off the bus at runtime:
+
+```
+[W][main:...]: LED chip (0x30) not responding on I2C bus
+[I][binary_sensor:...]: 'LED Chip Online': Sending state OFF
+```
 
 

@@ -11,6 +11,17 @@ class MAX17301 {
   float voltage = 0;
   bool charging = false;
 
+  // Diagnostic
+  int age = 0;            // Prozent (FullCapNom / DesignCap)
+  float cycles = 0;       // Anzahl Vollzyklen
+  float temp = 0;         // °C (aktuell)
+  int8_t temp_max = 0;    // °C (seit letztem NV-Save)
+  int8_t temp_min = 0;    // °C (seit letztem NV-Save)
+
+ private:
+  bool info_logged_ = false;
+
+ public:
   uint16_t read_reg(uint16_t reg) {
     uint8_t addr = (reg >> 8) >= 1 ? 0x0B : 0x36;
     uint8_t reg_addr = (uint8_t)(reg & 0xFF);
@@ -48,14 +59,44 @@ class MAX17301 {
     // 3. Charging Logic (Current > 5000uA / 5mA)
     this->charging = current_uA > 5000;
 
-    // 4. EXACT Arduino Format Output
-    // SOC: 99% VFSOC: 50%, Current: -0.52mA, Charging: No, Voltage: 3.71V
+    // 4. Temperature (Temp Register 01Bh)
+    // Two's complement, LSb = 1/256 °C
+    int16_t temp_raw = (int16_t)read_reg(0x1B);
+    this->temp = (float)temp_raw / 256.0f;
+
+    // 5. MaxMinTemp (009h): D15..D8 = Max, D7..D0 = Min, beide 8-bit two's complement, 1°C
+    uint16_t mmt_raw = read_reg(0x09);
+    this->temp_max = (int8_t)((mmt_raw >> 8) & 0xFF);
+    this->temp_min = (int8_t)(mmt_raw & 0xFF);
+
+    // 6. Age + Cycles (einmalig loggen)
+    // Age Register (007h): Percentage, LSb = 1/256 %
+    uint16_t age_raw = read_reg(0x07);
+    this->age = (int)(age_raw >> 8);
+
+    // Cycles Register (017h): 16-bit CycleCount
+    // => Anzahl Vollzyklen = raw * 0.25 / 100 = raw / 400
+    uint16_t cycles_raw = read_reg(0x17);
+    this->cycles = (float)cycles_raw * 0.25f;
+
+    // 7. EXACT Arduino Format Output (unverändert, bei jedem Read)
     ESP_LOGD("max17301", "SOC: %.0f%% VFSOC: %.0f%%, Current: %.2fmA, Charging: %s, Voltage: %.2fV",
              this->soc,
              this->vfsoc,
              this->current,
              this->charging ? "Yes" : "No",
              this->voltage);
+
+    // 8. Einmalige Info-Ausgabe
+    if (!this->info_logged_) {
+      ESP_LOGD("max17301", "Age: %d%%, Cycles: %.2f, Temp: %.1f°C (Min: %d°C, Max: %d°C)",
+               this->age,
+               this->cycles,
+               this->temp,
+               this->temp_min,
+               this->temp_max);
+      this->info_logged_ = true;
+    }
   }
 };
 
