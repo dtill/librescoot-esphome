@@ -35,7 +35,7 @@ When the ESP32 first connects to the scooter, it will ask for a passkey. To ente
 
 ### [CBB monitoring via i2c](librescoot-cbb-example.yaml)
 
-The UNU-CBB battery board uses a **MAX17301** fuel gauge. A custom C++ header [librescoot-cbb-max17301.h](librescoot-cbb-max17301.h) handles the chip-specific 16-bit register map and dual-address scheme.
+The UNU-CBB battery board uses a **MAX17305** fuel gauge. A custom C++ header [librescoot-cbb-max17301.h](librescoot-cbb-max17301.h) handles the chip-specific 16-bit register map and dual-address scheme.
 
 #### Wiring
 
@@ -48,7 +48,7 @@ I2C is wired to the CBB Module Connector (#63):
 
 #### I2C Addressing
 
-The MAX17301 maps its registers across two 7-bit I2C addresses. The header switches between them automatically based on the register being accessed:
+The MAX17305 maps its registers across two 7-bit I2C addresses. The header switches between them automatically based on the register being accessed:
 
 | Address | Used for |
 | :--- | :--- |
@@ -59,24 +59,39 @@ Values are read as 16-bit little-endian: `(buffer[1] << 8) | buffer[0]`.
 
 #### Sensors
 
-The class polls the fuel gauge every 10s and exposes the following sensors:
+The class polls the fuel gauge every 10 s and exposes the following sensors. Sensors marked ☆ are disabled by default in HA and can be enabled on demand.
 
-**Primary**
-*   **SOC** — State of charge from the ModelGauge m5 algorithm, compensated for aging.
-*   **VFSOC** — Voltage-based SOC. Diagnostic only; affected by load-induced voltage sag.
-*   **Voltage** — Pack voltage, 78.125 µV/LSB.
-*   **Current** — Pack current in mA, calibrated via the chip's internal `NRSense` value: `Current (mA) = Raw × 1.5625 µV / NRSense`.
-*   **Charging** — Binary sensor, true when current > 5 mA.
+| Sensor | Unit | Notes |
+| :--- | :--- | :--- |
+| Battery Age | % | `FullCapNom / DesignCap` — capacity vs. design spec |
+| Battery Cycles | cycles | Quarter-cycle resolution (LSb = 25%) |
+| Battery Temperature | °C | 1/256 °C/LSb |
+| Battery Remaining Capacity | mAh | RepCap register, scaled via NRSense |
+| Battery Full Capacity | mAh | FullCapRep register, tracks aging |
+| Battery Serial Number | — | ASCII from NV registers `0xE8–0xEF` |
+| Battery Unique ID | — | 64-bit chip UID from registers `0xBC–0xBF` |
+| Battery Chip Part | — | Decoded from DevName register `0x21` |
 
-**Diagnostic**
-*   **Age** — Remaining capacity as a percentage of design capacity (`FullCapNom / DesignCap`). Indicates battery health.
-*   **Cycles** — Total charge/discharge cycles. Register stores quarter-cycles (LSb = 25%).
-*   **Temperature** — Current pack temperature, 1/256 °C/LSB.
-*   **Temperature Min / Max** — Extremes seen since the last NV save (not lifetime-cumulative; resets periodically).
+**Disabled by default**
+
+| Sensor | Unit | Notes |
+| :--- | :--- | :--- |
+| Battery SOC | % | ModelGauge m5 state of charge, aging-compensated |
+| Battery VFSOC | % | Voltage-based SOC, diagnostic only |
+| Battery Voltage | V | Pack voltage, 78.125 µV/LSb |
+| Battery Current | mA | `Raw × 1.5625 µV / NRSense`; negative = discharge |
+| Battery Charging | — | True when current > 5 mA |
+| Battery Temperature Min | °C | Extreme since last NV save (not lifetime) |
+| Battery Temperature Max | °C | Extreme since last NV save (not lifetime) |
+| Battery Time to Empty | min | 0 when chip reports 0xFFFF (not computed) |
+| Battery Time to Full | min | 0 when chip reports 0xFFFF (not computed) |
+| Battery Charge FET Disabled | — | CommStat bit 8 |
+| Battery Discharge FET Disabled | — | CommStat bit 9 |
+| Battery NV Error | — | CommStat bit 2 |
 
 #### Framework
 
-Built for the **ESP-IDF** framework on ESP32. Uses direct `I2CBus` transactions rather than the Arduino `Wire` abstraction for stability and performance.
+Built for the **ESP-IDF** framework on ESP32, also compatible with ESP8266 (D1 Mini). Uses direct `I2CBus` transactions rather than the Arduino `Wire` abstraction for stability and performance.
 
 #### Console Output
 
