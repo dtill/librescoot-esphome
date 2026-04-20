@@ -94,6 +94,31 @@ binary_sensor:
     device_class: battery_charging
     lambda: 'return my_max17301->charging;'
 
+  # -- FET / protection flags (diagnostic)
+  - platform: template
+    name: "Battery Discharge FET Disabled"
+    entity_category: diagnostic
+    device_class: problem
+    icon: "mdi:battery-off-outline"
+    lambda: 'return my_max17301->dis_fet_disabled;'
+    disabled_by_default: true
+
+  - platform: template
+    name: "Battery Charge FET Disabled"
+    entity_category: diagnostic
+    device_class: problem
+    icon: "mdi:battery-off-outline"
+    lambda: 'return my_max17301->chg_fet_disabled;'
+    disabled_by_default: true
+
+  - platform: template
+    name: "Battery NV Error"
+    entity_category: diagnostic
+    device_class: problem
+    icon: "mdi:alert-circle-outline"
+    lambda: 'return my_max17301->nv_error;'
+    disabled_by_default: true
+
 sensor:
   - platform: template
     name: "Battery SOC"
@@ -129,3 +154,122 @@ sensor:
     state_class: measurement
     icon: "mdi:current-dc"
     lambda: 'return my_max17301->current;'
+
+# -- extra diagnostic sensors:
+  - platform: template
+    name: "Battery Age"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    state_class: measurement
+    icon: "mdi:battery-heart-variant"
+    lambda: 'return my_max17301->age;'
+
+  - platform: template
+    name: "Battery Cycles"
+    unit_of_measurement: "cycles"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    state_class: total_increasing
+    icon: "mdi:battery-sync-outline"
+    lambda: 'return (int) ceil(my_max17301->cycles);'
+
+  - platform: template
+    name: "Battery Temperature"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: temperature
+    entity_category: diagnostic
+    state_class: measurement
+    icon: "mdi:thermometer"
+    lambda: 'return my_max17301->temp;'
+
+  - platform: template
+    name: "Battery Temperature Min"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    entity_category: diagnostic
+    state_class: measurement
+    icon: "mdi:thermometer-low"
+    lambda: 'return my_max17301->temp_min;'
+    disabled_by_default: true
+
+  - platform: template
+    name: "Battery Temperature Max"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    entity_category: diagnostic
+    state_class: measurement
+    icon: "mdi:thermometer-high"
+    lambda: 'return my_max17301->temp_max;'
+    disabled_by_default: true
+
+  # -- capacity & time estimates
+  - platform: template
+    name: "Battery Remaining Capacity"
+    unit_of_measurement: "mAh"
+    accuracy_decimals: 0
+    device_class: energy_storage
+    entity_category: diagnostic
+    state_class: measurement
+    icon: "mdi:battery-50"
+    lambda: 'return my_max17301->rep_cap;'
+
+  - platform: template
+    name: "Battery Full Capacity"
+    unit_of_measurement: "mAh"
+    accuracy_decimals: 0
+    device_class: energy_storage
+    entity_category: diagnostic
+    state_class: measurement
+    icon: "mdi:battery-high"
+    lambda: 'return my_max17301->full_cap;'
+
+  - platform: template
+    name: "Battery Time to Empty"
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    device_class: duration
+    entity_category: diagnostic
+    state_class: measurement
+    icon: "mdi:timer-sand"
+    lambda: 'return my_max17301->tte;'
+    disabled_by_default: true
+
+  - platform: template
+    name: "Battery Time to Full"
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    device_class: duration
+    entity_category: diagnostic
+    state_class: measurement
+    icon: "mdi:timer-sand-complete"
+    lambda: 'return my_max17301->ttf;'
+    disabled_by_default: true
+
+text_sensor:
+  - platform: template
+    name: "Battery Serial Number"
+    entity_category: diagnostic
+    icon: "mdi:barcode"
+    lambda: 'return {my_max17301->serial_number};'
+    update_interval: 60s
+
+
+  - platform: template
+    name: "Battery Unique ID"
+    entity_category: diagnostic
+    icon: "mdi:identifier"
+    lambda: 'return {my_max17301->unique_id};'
+    update_interval: 60s
+    disabled_by_default: true
+
+  - platform: template
+    name: "Battery Chip Part"
+    entity_category: diagnostic
+    icon: "mdi:chip"
+    lambda: 'return {my_max17301->chip_part};'
+    update_interval: 60s
+    disabled_by_default: true
