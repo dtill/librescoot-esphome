@@ -11,10 +11,13 @@
 # librescoot_ota_pw: "xxx"
 # librescoot_wifi_ssid:"xxx"
 # librescoot_wifi_pw: "xxx"
-# librescoot_fallback_ap_pw: "xxxxxxxx"                #should be 8 digits
+# librescoot_fallback_ap_pw: "xxxxxxxx"               #should be 8 digits
 # librescoot_webserver_basic_auth_user: "xxx"
 # librescoot_webserver_basic_auth_pw: "xxx"
-# librescoot_nrf_ble_mac_addr: "XX:XX:XX:XX:XX:XX" # your scooters ble MAC addr
+# librescoot_nrf_ble_mac_addr: "XX:XX:XX:XX:XX:XX"    # your scooters ble MAC addr
+#
+# To delete bond in scooter nRF first use "BLE Remove Bond"-button (you have to enable it first in HA - disabled by default).
+# To delete bond in ESP chip, use erase-flash from estool: 'esptool --port /dev/usbserialxxx erase-flash'
 
 substitutions:
   device_name: "librescoot-nrf-ble-client"
@@ -66,23 +69,35 @@ wifi:
 captive_portal:
 
 web_server:
-  local: true # no external content from internet (only version 2 supported)
-  version: 2 # 1 or 2 (modern)
+  local: true # no external content from internet. All serverd from flash
+  version: 3 # 1 (lightweight), 2 (modern) or 3 (advanced sensor grouping sliders etc)
   port: 80
   auth:
     username: !secret librescoot_webserver_basic_auth_user
     password: !secret librescoot_webserver_basic_auth_pw
 
-
 logger:
   baud_rate: 0  # disable logging over UART
   #level: VERBOSE
+
+globals:
+  - id: cmd_response_log
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: cmd_response_collecting
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+esp32_ble:
+  io_capability: keyboard_only
 
 esp32_ble_tracker:
 
 ble_client:
   - mac_address: !secret librescoot_nrf_ble_mac_addr
-    id: scooter_1_nrf_ble_device
+    id: my_ble_device
     auto_connect: true
     on_connect:
       then:
@@ -103,34 +118,10 @@ ble_client:
 
 sensor:
   - platform: ble_client
+    type: rssi
     ble_client_id: my_ble_device
-    type: characteristic
-    id: wakeup_suspend_raw
-    internal: true
-    service_uuid: "9a590200-6e67-5d0d-aab9-ad9126b66f91"
-    characteristic_uuid: "9a590201-6e67-5d0d-aab9-ad9126b66f91"
-    update_interval: never
-    notify: true
-    on_notify:
-      then:
-        - event.trigger:
-            id: wakeup_suspend_event
-            event_type: "movement_detected"
-
-  - platform: ble_client
-    ble_client_id: my_ble_device
-    type: characteristic
-    id: wakeup_hibernation_raw
-    internal: true
-    service_uuid: "9a590200-6e67-5d0d-aab9-ad9126b66f91"
-    characteristic_uuid: "9a590202-6e67-5d0d-aab9-ad9126b66f91"
-    update_interval: never
-    notify: true
-    on_notify:
-      then:
-        - event.trigger:
-            id: wakeup_hibernation_event
-            event_type: "movement_detected"
+    name: "RSSI"
+    entity_category: diagnostic
 
   # --- Main Battery Service (0x9a5900e0) ---
   - platform: ble_client
@@ -317,36 +308,6 @@ sensor:
             id: ums_status
             state: !lambda 'return x != 0;'
 
-  # --- System Info (0x9a59a000) ---
-  - platform: ble_client
-    ble_client_id: my_ble_device
-    type: characteristic
-    name: "Reset Count"
-    service_uuid: "9a59a000-6e67-5d0d-aab9-ad9126b66f91"
-    characteristic_uuid: "9a59a022-6e67-5d0d-aab9-ad9126b66f91"
-    icon: "mdi:counter"
-    entity_category: diagnostic
-    accuracy_decimals: 0
-
-  # --- Status Service (9a590020) ---
-  - platform: ble_client
-    ble_client_id: my_ble_device
-    type: characteristic
-    name: "Scooter Temperature"
-    service_uuid: "9a590020-6e67-5d0d-aab9-ad9126b66f91"
-    characteristic_uuid: "9a590024-6e67-5d0d-aab9-ad9126b66f91"
-    unit_of_measurement: "°C"
-    icon: "mdi:thermometer"
-    accuracy_decimals: 1
-    entity_category: diagnostic
-    disabled_by_default: true
-    lambda: |-
-      if (x.size() >= 2) {
-        int16_t raw = (int16_t)((uint16_t)x[1] | ((uint16_t)x[0] << 8));
-        return (float)raw / 10.0f;
-      }
-      return 0.0f;
-
 text_sensor:
   # --- Power Mux Service (9a590100) ---
   - platform: ble_client
@@ -357,21 +318,11 @@ text_sensor:
     icon: "mdi:source-branch"
     entity_category: diagnostic
 
-  # --- Aux Charger Control Service (9a590120) ---
-  - platform: ble_client
-    ble_client_id: my_ble_device
-    name: "LTC4020 Aux Charger Status"
-    service_uuid: "9a590120-6e67-5d0d-aab9-ad9126b66f91"
-    characteristic_uuid: "9a590123-6e67-5d0d-aab9-ad9126b66f91"
-    icon: "mdi:battery-charging-100"
-    entity_category: diagnostic
-    disabled_by_default: true
-
   # --- Status Service (0x9a590020) ---
   - platform: ble_client
     ble_client_id: my_ble_device
     name: "Status"
-    id: scooter_state_raw
+    id: state_raw
     service_uuid: "9a590020-6e67-5d0d-aab9-ad9126b66f91"
     characteristic_uuid: "9a590021-6e67-5d0d-aab9-ad9126b66f91"
     icon: "mdi:moped"
@@ -449,16 +400,49 @@ text_sensor:
     icon: "mdi:battery-charging-wireless"
     entity_category: diagnostic
 
+  # Extendec-Commands Response-Sensor (anly last value)
   - platform: ble_client
     ble_client_id: my_ble_device
-    name: "Reset Reason"
-    service_uuid: "9a59a000-6e67-5d0d-aab9-ad9126b66f91"
-    characteristic_uuid: "9a59a021-6e67-5d0d-aab9-ad9126b66f91"
-    icon: "mdi:history"
+    name: "Last Command Response"
+    id: cmd_response
+    service_uuid: "9a590400-6e67-5d0d-aab9-ad9126b66f91"
+    characteristic_uuid: "9a590402-6e67-5d0d-aab9-ad9126b66f91"
+    notify: true
+    update_interval: never
+    icon: "mdi:message-reply-text"
     entity_category: diagnostic
-    disabled_by_default: true
+    on_value:
+      then:
+        - lambda: |-
+            if (id(cmd_response_collecting)) {
+              auto &log = id(cmd_response_log);
+              std::string clean;
+              for (char c : x) {
+                if (c == 0) break;
+                if (c >= 0x20 || c == '\n') {
+                  clean += c;
+                }
+              }
+              if (!log.empty()) log += "\n";
+              log += clean;
+              id(cmd_response_log_txt).publish_state(log);
+            }
+
+  - platform: template
+    name: "Command Response Log"
+    id: cmd_response_log_txt
+    icon: "mdi:script-text-outline"
+    entity_category: diagnostic
 
 binary_sensor:
+  - platform: template
+    name: "BLE Connection"
+    entity_category: diagnostic
+    device_class: connectivity
+    icon: "mdi:bluetooth"
+    lambda: |-
+      return id(my_ble_device).connected();
+
   - platform: template
     id: battery_1_present
     name: "Battery 1 Present"
@@ -487,8 +471,8 @@ binary_sensor:
 
 select:
   - platform: template
-    name: "Scooter Blinker"
-    id: scooter_blinker
+    name: "Blinker"
+    id: blinker
     icon: "mdi:car-light-high"
     entity_category: config
     options: ["off", "left", "right", "both"]
@@ -504,8 +488,8 @@ select:
 
 button:
   - platform: template
-    name: "Scooter Seatbox Open"
-    id: scooter_seatbox_open
+    name: "Seatbox Open"
+    id: seatbox_open
     icon: "mdi:package-variant-closed-plus"
     entity_category: config
     on_press:
@@ -518,8 +502,8 @@ button:
             return std::vector<uint8_t>(cmd.begin(), cmd.end());
 
   - platform: template
-    name: "Scooter Hibernate"
-    id: scooter_hibernate
+    name: "Hibernate"
+    id: hibernate
     icon: "mdi:power-sleep"
     entity_category: config
     on_press:
@@ -532,8 +516,8 @@ button:
             return std::vector<uint8_t>(cmd.begin(), cmd.end());
 
   - platform: template
-    name: "Scooter Wakeup"
-    id: scooter_wakeup
+    name: "Wakeup"
+    id: wakeup
     icon: "mdi:power"
     entity_category: config
     on_press:
@@ -546,8 +530,8 @@ button:
             return std::vector<uint8_t>(cmd.begin(), cmd.end());
 
   - platform: template
-    name: "Scooter Reboot"
-    id: scooter_reboot
+    name: "Reboot"
+    id: reboot
     icon: "mdi:restart"
     entity_category: config
     on_press:
@@ -560,8 +544,8 @@ button:
             return std::vector<uint8_t>(cmd.begin(), cmd.end());
 
   - platform: template
-    name: "Scooter Hard Reboot"
-    id: scooter_hard_reboot
+    name: "Hard Reboot"
+    id: hard_reboot
     icon: "mdi:restart-alert"
     entity_category: config
     on_press:
@@ -572,3 +556,44 @@ button:
           value: !lambda |-
             std::string cmd = "hard-reboot";
             return std::vector<uint8_t>(cmd.begin(), cmd.end());
+
+  - platform: template
+    name: "BLE Remove Bond"
+    id: ble_remove_bond
+    icon: "mdi:bluetooth-off"
+    entity_category: config
+    disabled_by_default: true
+    on_press:
+      - ble_client.remove_bond:
+          id: my_ble_device
+
+text:
+  - platform: template
+    name: "Extended Command"
+    id: extended_command
+    icon: "mdi:console"
+    entity_category: config
+    optimistic: true
+    min_length: 0
+    max_length: 128
+    mode: text
+    set_action:
+      - lambda: |-
+          id(cmd_response_log) = "";
+          id(cmd_response_collecting) = true;
+          ESP_LOGI("cmd", "===== Sending command, started collecting =====");
+      - ble_client.ble_write:
+          id: my_ble_device
+          service_uuid: "9a590400-6e67-5d0d-aab9-ad9126b66f91"
+          characteristic_uuid: "9a590401-6e67-5d0d-aab9-ad9126b66f91"
+          value: !lambda |-
+            std::string cmd = x;
+            cmd.push_back('\0');
+            return std::vector<uint8_t>(cmd.begin(), cmd.end());
+      - delay: 20s
+      - lambda: |-
+          id(cmd_response_collecting) = false;
+          ESP_LOGI("cmd", "===== Stopped collecting, final log: %s", id(cmd_response_log).c_str());
+      - text_sensor.template.publish:
+          id: cmd_response_log_txt
+          state: !lambda 'return id(cmd_response_log);'

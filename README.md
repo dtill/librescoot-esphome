@@ -22,18 +22,63 @@ Setup:
 
 Pairing:
 
-1. Turn on the scooter into parked mode.
-When the ESP32 first connects to the scooter, it will ask for a passkey. To enter it:
-
+1. Turn on the scooter into parked mode. When the ESP32 first connects to the scooter, it will ask for a passkey. To enter it:
 2. Open Home Assistant and go to **Settings → Developer Tools → Actions** (or go directly to `/config/developer-tools/action` in your browser).
 3. In the action search field, type **"librescoot"** — you'll see the `passkey_reply` action appear.
 4. Select it. A field for a 6-digit code will show up.
 5. Check scooters dashboard (DBC) for the passkey the scooter is expecting, enter it in HA, and hit **Perform Action**.
 6. Once accepted, the connection is established. The bond is saved — future reconnects happen automatically.
 
+#### Using the Extended Command
 
+The `Extended Command` text input allows arbitrary commands to be sent to the nRF. After sending, responses are collected for 20 seconds and concatenated into the `Command Response Log` sensor.
 
-### [CBB monitoring via i2c](librescoot-cbb-example.yaml)
+Example — set the cellular APN:
+
+- **Command:** `config:apn <value>` (e.g. `config:apn web.vodafone.de`)
+- **Expected reply (in `Command Response Log`):** `config:ok`
+
+#### Exposed Entities
+
+| Entity                   | Type           | Unit | Description                                                                 |
+| ------------------------ | -------------- | ---- | --------------------------------------------------------------------------- |
+| Status                   | Text Sensor    | —    | Vehicle state (e.g. parked, ready).                                         |
+| Seatbox                  | Text Sensor    | —    | Open/closed state of the seatbox.                                           |
+| Handlebar Lock           | Text Sensor    | —    | Lock/unlock state of the handlebar.                                         |
+| Power State              | Text Sensor    | —    | Current power-management state.                                             |
+| Power Mux Selected Input | Text Sensor    | —    | Currently selected power input source.                                      |
+| Odometer                 | Sensor         | km   | Total distance travelled (converted from meters).                           |
+| Battery 1 SoC            | Sensor         | %    | State of charge, main battery slot 1.                                       |
+| Battery 1 Cycles         | Sensor         | —    | Charge-cycle count, main battery slot 1.                                    |
+| Battery 1 State          | Text Sensor    | —    | State string for main battery slot 1.                                       |
+| Battery 1 Present        | Binary Sensor  | —    | Whether main battery slot 1 is occupied.                                    |
+| Battery 2 SoC            | Sensor         | %    | State of charge, main battery slot 2.                                       |
+| Battery 2 Cycles         | Sensor         | —    | Charge-cycle count, main battery slot 2.                                    |
+| Battery 2 State          | Text Sensor    | —    | State string for main battery slot 2.                                       |
+| Battery 2 Present        | Binary Sensor  | —    | Whether main battery slot 2 is occupied.                                    |
+| Aux Battery Voltage      | Sensor         | V    | Voltage of the auxiliary 12 V battery.                                      |
+| Aux Battery Level        | Sensor         | %    | State of charge of the auxiliary battery.                                   |
+| Aux Charge Status        | Text Sensor    | —    | Charge state of the auxiliary battery.                                      |
+| CBB Battery Level        | Sensor         | %    | State of charge of the connectivity battery.                                |
+| CBB Charge Status        | Text Sensor    | —    | Charge state of the connectivity battery.                                   |
+| iMX Software Version     | Text Sensor    | —    | Software version of the i.MX (MDB).                                         |
+| nRF Version              | Text Sensor    | —    | Firmware version of the nRF52 chip.                                         |
+| Navigation Active        | Binary Sensor  | —    | Whether navigation is currently active.                                     |
+| UMS Status               | Binary Sensor  | —    | USB Mass Storage active state.                                              |
+| BLE Connection           | Binary Sensor  | —    | Connectivity status of the BLE link.                                        |
+| RSSI                     | Sensor         | dBm  | Signal strength of the BLE link.                                            |
+| Blinker                  | Select         | —    | Set turn signal: `off`, `left`, `right`, `both`.                            |
+| Seatbox Open             | Button         | —    | Unlock/open the seatbox.                                                    |
+| Hibernate                | Button         | —    | Put the scooter into hibernation.                                           |
+| Wakeup                   | Button         | —    | Wake the scooter from hibernation.                                          |
+| Reboot                   | Button         | —    | Soft-reboot the MDB.                                                        |
+| Hard Reboot              | Button         | —    | Hard-reboot the MDB.                                                        |
+| BLE Remove Bond          | Button         | —    | Remove the existing BLE bond (disabled by default; use only for re-pairing).|
+| Extended Command         | Text Input     | —    | Send an arbitrary command string to the nRF (see above).                    |
+| Last Command Response    | Text Sensor    | —    | Most recent raw response chunk from an extended command.                    |
+| Command Response Log     | Text Sensor    | —    | Concatenated response collected during the 20 s window after a command.     |
+
+### [CBB monitoring via I²C addr 0x36 and 0x0B](librescoot-cbb-example.yaml)
 
 The UNU-CBB battery board uses a **MAX17305** fuel gauge. A custom C++ header [librescoot-cbb-max17301.h](librescoot-cbb-max17301.h) handles the chip-specific 16-bit register map and dual-address scheme.
 
