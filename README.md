@@ -1,6 +1,26 @@
 # librescoot-esphome
 ESPHome Components and configurations for UNU Scooter Pro with opensource [Librescoot Firmware](https://github.com/librescoot)
 
+
+- [MDB nRF-BLE-Client](#mdb-nrf-ble-client)
+    - [Pairing ESP32 with Scooter Pro nRF via ESPHome BLE](#pairing-esp32-with-scooter-pro-nrf-via-esphome-ble)
+    - [Using the Extended Command](#using-the-extended-command)
+    - [Exposed Entities](#exposed-entities)
+- [CBB monitoring via I²C addr 0x36 and 0x0B](#cbb-monitoring-via-ic-addr-0x36-and-0x0b)
+    - [Wiring](#wiring)
+    - [I2C Addressing](#i2c-addressing)
+    - [Sensors](#sensors)
+    - [Framework](#framework)
+    - [Console Output](#console-output)
+- [DBC Status LED driver via I²C addr 0x30](#dbc-status-led-driver-via-ic-addr-0x30)
+    - [Wiring](#wiring-1)
+    - [I²C Addressing](#ic-addressing)
+    - [Channels](#channels)
+    - [ESPHome integration](#esphome-integration)
+    - [Manual controls](#manual-controls)
+    - [Framework](#framework-1)
+    - [Log output](#log-output)
+
 ---
 
 ## Example .yaml files:
