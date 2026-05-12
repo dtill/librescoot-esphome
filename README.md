@@ -29,7 +29,7 @@ ESPHome Components and configurations for UNU Scooter Pro with opensource [Libre
 
 BLE-Client for Unu-Scooter Pro with Librescoot FW and nRF >v2.0.0-ls.
 Uses ESPHome [BLE Client](https://esphome.io/components/ble_client/) and exposes available characteristics as sensors.
-More info about the provided characteristics at [LibreScoot Tech Reference - Bluetooth Interface Documentation](https://reference.librescoot.org/bluetooth/)
+More info about the provided characteristics at [LibreScoot Tech Reference - Bluetooth Interface Documentation](https://reference.librescoot.org/latest/bluetooth/)
 
 #### Pairing ESP32 with Scooter Pro nRF via ESPHome BLE
 
