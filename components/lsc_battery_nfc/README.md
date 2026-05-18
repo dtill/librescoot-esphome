@@ -53,7 +53,7 @@ lsc_battery_nfc:
     name: "Seatbox Closed"
 ```
 
-A full example with every sub-entity is in [`../../librescoot-batt-nfc-cffbde-phase2.yaml`](../../librescoot-batt-nfc-cffbde-phase2.yaml).
+A full example with every sub-entity is in [`../../librescoot-battery-nfc-example.yaml`](../../librescoot-battery-nfc-example.yaml).
 
 ---
 
