@@ -311,25 +311,6 @@ A complete reference YAML (every sub-entity) is at [`librescoot-battery-nfc-exam
 
 ---
 
-## Repo layout
-
-```
-.
-├── README.md                                                # this file
-├── esphome-test-env/
-│   └── esphome_configs/
-│       ├── librescoot-batt-nfc-cffbde-phase2.yaml          # reference device YAML
-│       └── my_components/
-│           └── lsc_battery_nfc/                             # the component
-│               ├── README.md                                # full component docs
-│               ├── __init__.py                              # ESPHome schema + codegen
-│               ├── lsc_battery_nfc.h
-│               └── lsc_battery_nfc.cpp
-└── battery-service/                                         # (submodule) librescoot Go FSM, reference only
-```
-
----
-
 ## License
 
 See individual files for license headers; the librescoot project conventions apply.
