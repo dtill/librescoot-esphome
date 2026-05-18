@@ -20,7 +20,7 @@ ESPHome Components and configurations for "UNU Scooter Pro" with opensource [Lib
     - [Manual controls](#manual-controls)
     - [Framework](#framework-1)
     - [Log output](#log-output)
-- [main-battery NFC interface via PN532](#main-battery NFC interface via PN532)
+- [main-battery NFC interface via PN532](#main-battery-NFC-interface-via-PN532)
 
 ---
 
