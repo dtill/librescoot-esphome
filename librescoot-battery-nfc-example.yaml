@@ -31,13 +31,6 @@ esphome:
 esp8266:
   board: nodemcu
 
-external_components:
-  - source:
-      type: git
-      url: https://github.com/dtill/librescoot-esphome
-    components: [lsc_battery_nfc]
-    refresh: 0s
-
 logger:
   level: DEBUG
   baud_rate: 0
@@ -82,6 +75,13 @@ web_server:
   auth:
     username: !secret librescoot_webserver_basic_auth_user
     password: !secret librescoot_webserver_basic_auth_pw
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/dtill/librescoot-esphome
+    components: [lsc_battery_nfc]
+    refresh: 0s
 
 i2c:
   sda: D2
