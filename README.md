@@ -20,7 +20,7 @@ ESPHome Components and configurations for "UNU Scooter Pro" with opensource [Lib
     - [Manual controls](#manual-controls)
     - [Framework](#framework-1)
     - [Log output](#log-output)
-- [main-battery NFC interface via PN532](#main-battery-NFC-interface-via-PN532)
+- [Battery NFC interface via PN532](#battery-NFC-interface-via-PN532)
 
 ---
 
@@ -237,7 +237,7 @@ If the chip is pulled off the bus at runtime:
 [I][binary_sensor:...]: 'LED Chip Online': Sending state OFF
 ```
 
-### [main-battery NFC interface via PN532](librescoot-battery-nfc-example.yaml)
+### [Battery NFC interface via PN532](librescoot-battery-nfc-example.yaml)
 
 
 Uses [`lsc_battery_nfc`](components/lsc_battery_nfc/)-component
