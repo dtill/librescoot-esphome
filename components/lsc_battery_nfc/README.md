@@ -24,7 +24,7 @@ i2c:
   scan: true
   id: lsc_i2c_bus_1
 
-# Stock PN532 component — used only for chip init (SAMConfig). Set its
+# ESPHome native PN532 component — used only for chip init (SAMConfig). Set its
 # update_interval high so it doesn't poll for tags; lsc_battery_nfc drives
 # polling itself.
 pn532_i2c:
