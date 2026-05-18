@@ -1,5 +1,5 @@
 # librescoot-esphome
-ESPHome Components and configurations for UNU Scooter Pro with opensource [Librescoot Firmware](https://github.com/librescoot)
+ESPHome Components and configurations for "UNU Scooter Pro" with opensource [Librescoot Firmware](https://github.com/librescoot)
 
 
 - [MDB nRF-BLE-Client](#mdb-nrf-ble-client)
@@ -20,6 +20,7 @@ ESPHome Components and configurations for UNU Scooter Pro with opensource [Libre
     - [Manual controls](#manual-controls)
     - [Framework](#framework-1)
     - [Log output](#log-output)
+- [main-battery NFC interface via PN532](#main-battery NFC interface via PN532)
 
 ---
 
@@ -236,4 +237,100 @@ If the chip is pulled off the bus at runtime:
 [I][binary_sensor:...]: 'LED Chip Online': Sending state OFF
 ```
 
+### [main-battery NFC interface via PN532](librescoot-battery-nfc-example.yaml)
+
+
+Uses [`lsc_battery_nfc`](components/lsc_battery_nfc/)-component
+
+Talks to the scooter's main battery over an NFC reader, reads BMS telemetry, and exposes a high-current-path switch plus a seatbox-state switch to Home Assistant. Mirrors the [librescoot battery-service](https://github.com/librescoot/battery-service) Go FSM at a useful fidelity (heartbeat + state-mismatch recovery + seatbox-open maintenance loop).
+
+* **Telemetry**: voltage, current, level %, state-of-health, BMS state (`asleep`/`idle`/`active`), cycle count, four cell-pack temperatures, capacity, fault code + human-readable description, serial, firmware, manufacturing date, manufacturer.
+* **Controls**: High-Current Path switch (drives wake sequence + active-keep heartbeat), Seatbox Closed switch (persistent across reboots, drives the safety override and the OPENED/INSERTED maintenance loop).
+* **Diagnostics**: Full NFC Dump, Force Status Refresh.
+* **Safety**: foreign tags are detected but writes are inhibited; opening the seatbox forces the high-current path off (unless `keep_active_on_seatbox_open: true`); the high-current switch never restores ON across reboots.
+
+Full details, options, FSM walk-through, and NFC protocol info: **[component README](components/lsc_battery_nfc/README.md)**.
+
+#### Quick start
+
+Pull the component straight from this repo:
+
+```yaml
+external_components:
+  - source:
+      type: git
+      url: https://github.com/dtill/librescoot-esphome
+      ref: main
+    components: [lsc_battery_nfc]
+
+i2c:
+  sda: D2
+  scl: D1
+  scan: true
+  id: lsc_i2c_bus_1
+
+pn532_i2c:
+  id: pn532_rdr
+  i2c_id: lsc_i2c_bus_1
+  address: 0x24
+  update_interval: 60min   # suppress upstream polling; the component does its own
+
+lsc_battery_nfc:
+  id: lsc_battery
+  pn532_id: pn532_rdr
+  update_interval: 2s
+  heartbeat_interval: 10s
+  keep_active_on_seatbox_open: false
+
+  # Sensors / switches / buttons are all opt-in; declare with a name to expose.
+  state:
+    name: "Battery State"
+  voltage:
+    name: "Battery Voltage"
+  level:
+    name: "Battery Level"
+  high_current_path:
+    name: "Battery High-Current Path"
+  seatbox_closed:
+    name: "Seatbox Closed"
+```
+
+A complete reference YAML (every sub-entity) is at [`librescoot-battery-nfc-example.yaml`](librescoot-battery-nfc-example.yaml).
+
+#### Hardware
+
+* ESP8266 (NodeMCU) or ESP32 with I²C.
+* **HW-147 PN-NFC v3** PN532 board (red, large square antenna) on `0x24`. Smaller round-antenna PN532 breakouts have not been reliable through the battery housing.
+
+| ESP Pin | Signal | PN532 (HW-147) |
+| :--- | :--- | :--- |
+| `D2` | SDA | SDA |
+| `D1` | SCL | SCL |
+| `3V3` | VCC | VCC (3.3 V — do not feed 5 V) |
+| `GND` | GND | GND |
+
+---
+
+## Repo layout
+
+```
+.
+├── README.md                                                # this file
+├── esphome-test-env/
+│   └── esphome_configs/
+│       ├── librescoot-batt-nfc-cffbde-phase2.yaml          # reference device YAML
+│       └── my_components/
+│           └── lsc_battery_nfc/                             # the component
+│               ├── README.md                                # full component docs
+│               ├── __init__.py                              # ESPHome schema + codegen
+│               ├── lsc_battery_nfc.h
+│               └── lsc_battery_nfc.cpp
+└── battery-service/                                         # (submodule) librescoot Go FSM, reference only
+```
+
+---
+
+## License
+
+See individual files for license headers; the librescoot project conventions apply.
 

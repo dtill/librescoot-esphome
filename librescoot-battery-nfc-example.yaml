@@ -1,0 +1,167 @@
+# Unu-Scooter Pro Battery NFC Interface for ESP8266 and PN532 NFC Module
+#
+# reader and mirror the battery-service Go FSM at a useful fidelity:
+#   - Heartbeat cycle = CMD_SEATBOX_CLOSED + CMD_ON/OFF every 10 s
+#   - Seatbox state drives the heartbeat command flavour
+#   - Just-inserted wake-up sequence (OPENED + INSERTED )
+
+# More info /example arduino scatch to unlock main mattery via PN532 NFC Board: (https://github.com/reunu/arduino/tree/main/bat-unlocker)
+#
+# makes use of ESPHome i2c-BUS component (https://esphome.io/components/i2c/)
+#
+# librescoot_api_key: "xxx"                            # use generator on (https://esphome.io/components/api/) to generate a api-key
+# librescoot_ota_pw: "xxx"
+# librescoot_wifi_ssid:"xxx"
+# librescoot_wifi_pw: "xxx"
+# librescoot_fallback_ap_pw: "xxxxxxxx"                #should be 8 digits
+# librescoot_webserver_basic_auth_user: "xxx"
+# librescoot_webserver_basic_auth_pw: "xxx"
+
+
+substitutions:
+  device_name: "librescoot-batt-nfc"
+  device_friendly_name: "Librescoot-Batt-NFC-Interface"
+  device_id_name: "librescoot_batt_nfc"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${device_friendly_name}
+  build_path: "../config/esphome/build/${device_name}_build"
+
+esp8266:
+  board: nodemcu
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/dtill/librescoot-esphome
+    components: [lsc_battery_nfc]
+    refresh: 0s
+
+logger:
+  level: DEBUG
+  baud_rate: 0
+  logs:
+    api: INFO
+    api.service: INFO
+    api.connection: INFO
+    i2c.arduino: NONE
+    pn532_i2c: NONE
+    pn532.mifare_ultralight: NONE
+    pn532: INFO
+    sensor: WARN
+    text_sensor: WARN
+    switch: WARN
+    binary_sensor: WARN
+
+api:
+  reboot_timeout: 5min
+  encryption:
+    key: !secret librescoot_api_key
+
+ota:
+  platform: esphome
+  password: !secret librescoot_ota_pw
+
+wifi:
+  ssid: !secret librescoot_wifi_ssid
+  password: !secret librescoot_wifi_pw
+  reboot_timeout: 5min
+  min_auth_mode: WPA
+
+  ap:
+    ssid: ${device_friendly_name}-AP
+    password: !secret librescoot_fallback_ap_pw
+
+captive_portal:
+
+web_server:
+  local: true # no external content from internet (only version 2 supported)
+  version: 2 # 1 or 2 (modern)
+  port: 80
+  auth:
+    username: !secret librescoot_webserver_basic_auth_user
+    password: !secret librescoot_webserver_basic_auth_pw
+
+i2c:
+  sda: D2
+  scl: D1
+  scan: true
+  id: lsc_i2c_bus_1
+
+# -----------------------------------------------------------------------------
+# PN532 — used only for chip init (SAMConfig). Our component drives polling.
+# -----------------------------------------------------------------------------
+pn532_i2c:
+  id: pn532_rdr
+  i2c_id: lsc_i2c_bus_1
+  address: 0x24
+  update_interval: 60min  # suppress upstream polling; component does its own
+
+# -----------------------------------------------------------------------------
+# LSC Battery NFC component
+# -----------------------------------------------------------------------------
+lsc_battery_nfc:
+  id: lsc_battery
+  pn532_id: pn532_rdr
+  update_interval: 2s
+  heartbeat_interval: 10s
+  keep_active_on_seatbox_open: false
+
+  # ----- Primary sensors -----------------------------------------------------
+  state:
+    name: "Battery State"
+  voltage:
+    name: "Battery Voltage"
+  current:
+    name: "Battery Current"
+  level:
+    name: "Battery Level"
+  health:
+    name: "Battery Health"
+  cycle_count:
+    name: "Battery Cycle Count"
+
+  # ----- Diagnostic sensors --------------------------------------------------
+  remaining_capacity:
+    name: "Battery Remaining Capacity"
+  full_capacity:
+    name: "Battery Full Capacity"
+  fault_code:
+    name: "Battery Fault Code"
+    filters:
+      - round: 0
+  fault_description:
+    name: "Battery Fault Description"
+  temp_0:
+    name: "Battery Temp 0"
+  temp_1:
+    name: "Battery Temp 1"
+  temp_2:
+    name: "Battery Temp 2"
+  temp_3:
+    name: "Battery Temp 3"
+  low_soc:
+    name: "Battery Low SOC"
+  serial:
+    name: "Battery Serial"
+  firmware:
+    name: "Battery Firmware"
+  manufacturing_date:
+    name: "Battery Manufacturing Date"
+  manufacturer:
+    name: "Battery Manufacturer"
+  tag_present:
+    name: "NFC Tag Present"
+  battery_detected:
+    name: "Battery Detected"
+
+  # ----- Controls ------------------------------------------------------------
+  high_current_path:
+    name: "Battery High-Current Path"
+  seatbox_closed:
+    name: "Seatbox Closed"
+  full_dump:
+    name: "Full NFC Dump"
+  manual_refresh:
+    name: "Force Status Refresh"

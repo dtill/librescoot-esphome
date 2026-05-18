@@ -1,7 +1,7 @@
 # Unu-Scooter Pro CBB i2c addr 0x36 Interface
 #
 # More info /example arduino scatch / teardown pinouts: https://github.com/Julinho666/UNU-CBB-Battery)
-# - (https://reference.librescoot.org/electronic/#connectivity-battery-cbb)
+# - (https://reference.librescoot.org/latest/electronic/#connectivity-battery-cbb)
 #
 # makes use of ESPHome i2c-BUS component (https://esphome.io/components/i2c/)
 #
