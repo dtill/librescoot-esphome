@@ -36,9 +36,12 @@ esp32:
     type: esp-idf
 
 # Enable Home Assistant API
+# see more help on ESPHome Native API: https://esphome.io/components/api)
 api:
   reboot_timeout: 5min
   encryption:
+    # generate a key yourself on the shell "openssl rand -base64 24"
+    # or generate one at the https://esphome.io/components/api
     key: !secret librescoot_api_key
   actions:
     - action: passkey_reply
@@ -51,6 +54,14 @@ api:
         - ble_client.passkey_reply:
             id: scooter_1_nrf_ble_device
             passkey: !lambda return pin;
+
+# OPTIONAL: Enable MQTT just uncomment and fill the following part. Get more help: https://esphome.io/components/mqtt/
+#mqtt:
+#  broker: 127.0.0.1          # mqtt broaker IP address
+#  username: !secret librescoot_mqtt_user
+#  password: !secret librescoot_mqtt_password
+#  discovery: false
+#  reboot_timeout: 0s         # 0s = disable restart on mqtt connection loss
 
 ota:
   platform: esphome

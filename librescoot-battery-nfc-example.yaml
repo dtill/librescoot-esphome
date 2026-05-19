@@ -28,6 +28,10 @@ esphome:
   friendly_name: ${device_friendly_name}
   build_path: "../config/esphome/build/${device_name}_build"
 
+# If you use ESP32 Boards:
+#esp32:
+#  board: esp32dev
+# If you use ESP8266 Boards:
 esp8266:
   board: nodemcu
 
@@ -47,10 +51,22 @@ logger:
     switch: WARN
     binary_sensor: WARN
 
+# Enable Home Assistant API
+# see more help on ESPHome Native API: https://esphome.io/components/api)
 api:
   reboot_timeout: 5min
   encryption:
+    # generate a key yourself on the shell "openssl rand -base64 24"
+    # or generate one at the https://esphome.io/components/api
     key: !secret librescoot_api_key
+
+# OPTIONAL: Enable MQTT just uncomment and fill the following part. Get more help: https://esphome.io/components/mqtt/
+#mqtt:
+#  broker: 127.0.0.1          # mqtt broaker IP address
+#  username: !secret librescoot_mqtt_user
+#  password: !secret librescoot_mqtt_password
+#  discovery: false
+#  reboot_timeout: 0s         # 0s = disable restart on mqtt connection loss
 
 ota:
   platform: esphome
@@ -83,8 +99,14 @@ external_components:
     components: [lsc_battery_nfc]
     refresh: 0s
 
+# refer to your ESP Boards pinout to choose I2C pins
+# diffrent for ESP8266 and ESP32!
+# i2c Addr: 0x24
+# i2c PINS:
+# // SDA = 21, SCL = 22 (default for ESP32 DevKit)
+# // SDA = D2, SCL = D1 (default for ESP8266 D1-Mini)
 i2c:
-  sda: D2
+  sda: D2 # refer to your ESP Boards pinout to choose I2C pins
   scl: D1
   scan: true
   id: lsc_i2c_bus_1

@@ -40,10 +40,21 @@ esp8266:
   board: nodemcu  # this example is for D1 Mini NodeMcu
 
 # Enable Home Assistant API
+# see more help on ESPHome Native API: https://esphome.io/components/api)
 api:
   reboot_timeout: 5min
   encryption:
+    # generate a key yourself on the shell "openssl rand -base64 24"
+    # or generate one at the https://esphome.io/components/api
     key: !secret librescoot_api_key
+
+# OPTIONAL: Enable MQTT just uncomment and fill the following part. Get more help: https://esphome.io/components/mqtt/
+#mqtt:
+#  broker: 127.0.0.1          # mqtt broaker IP address
+#  username: !secret librescoot_mqtt_user
+#  password: !secret librescoot_mqtt_password
+#  discovery: false
+#  reboot_timeout: 0s         # 0s = disable restart on mqtt connection loss
 
 ota:
   platform: esphome
@@ -73,7 +84,9 @@ logger:
   baud_rate: 0  # disable logging over UART
   #level: VERBOSE
 
-# i2c Addr lp5562 LED Driver: 0x30
+# refer to your ESP Boards pinout to choose I2C pins
+# diffrent for ESP8266 and ESP32!
+# i2c Addr: 0x30 (lp5562 LED Driver)
 # i2c PINS:
 # // SDA = 21, SCL = 22 (default for ESP32 DevKit)
 # // SDA = D2, SCL = D1 (default for ESP8266 D1-Mini)

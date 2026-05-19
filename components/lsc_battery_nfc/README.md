@@ -12,11 +12,9 @@ Foreign NFC tags (door fobs, transit cards, etc.) are detected but commands are 
 external_components:
   - source:
       type: git
-      url: https://github.com/danieltill/librescoot-esphome
+      url: https://github.com/dtill/librescoot-esphome
       ref: main
     components: [lsc_battery_nfc]
-    # The component lives in a subfolder of the repo, so point ESPHome at it:
-    path: esphome-test-env/esphome_configs/my_components
 
 i2c:
   sda: D2
@@ -71,8 +69,8 @@ A full example with every sub-entity is in [`../../librescoot-battery-nfc-exampl
 
 ## Requirements
 
-* ESPHome ≥ 2026.4.x (tested on `2026.4.5`).
-* An I²C-capable ESP board. Tested on ESP8266 NodeMCU; ESP32 should work without changes (the PN532 part is hardware-agnostic).
+* ESPHome  (tested on Version `2026.4.5`).
+* An ESP board. Tested on ESP8266 NodeMCU; ESP32 should work without changes (the PN532 part is hardware-agnostic).
 * A **PN532 NFC board**. The **HW-147 PN-NFC v3** (red, large square antenna) is strongly recommended — the battery's NFC coil sits behind the pack housing and needs a stronger antenna than the small round-antenna breakouts can reliably provide.
 * The stock ESPHome `pn532_i2c` component (auto-loaded as a dependency).
 
