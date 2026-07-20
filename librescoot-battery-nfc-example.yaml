@@ -76,7 +76,7 @@ wifi:
   ssid: !secret librescoot_wifi_ssid
   password: !secret librescoot_wifi_pw
   reboot_timeout: 5min
-  min_auth_mode: WPA
+  min_auth_mode: WPA2
 
   ap:
     ssid: ${device_friendly_name}-AP
@@ -91,6 +91,7 @@ web_server:
   auth:
     username: !secret librescoot_webserver_basic_auth_user
     password: !secret librescoot_webserver_basic_auth_pw
+    type: digest
 
 external_components:
   - source:
