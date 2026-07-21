@@ -49,7 +49,7 @@ api:
         pin: int
       then:
         - logger.log:
-            format: "Sende PIN %06d an das Gerät..."
+            format: "Sende PIN %06ld an das Gerät..."
             args: [ pin ]
         - ble_client.passkey_reply:
             id: scooter_1_nrf_ble_device
@@ -71,7 +71,7 @@ wifi:
   ssid: !secret librescoot_wifi_ssid
   password: !secret librescoot_wifi_pw
   reboot_timeout: 5min
-  min_auth_mode: WPA
+  min_auth_mode: WPA2
 
   ap:
     ssid: ${device_friendly_name}-AP
@@ -86,6 +86,7 @@ web_server:
   auth:
     username: !secret librescoot_webserver_basic_auth_user
     password: !secret librescoot_webserver_basic_auth_pw
+    type: digest
 
 logger:
   baud_rate: 0  # disable logging over UART
@@ -124,7 +125,7 @@ ble_client:
     on_passkey_notification:
       then:
         - logger.log:
-            format: "The device displays this passkey: %06d"
+            format: "The device displays this passkey: %06lu"
             args: [ passkey ]
 
 sensor:
