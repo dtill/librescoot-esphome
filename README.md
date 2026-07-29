@@ -28,76 +28,245 @@ ESPHome Components and configurations for "UNU Scooter Pro" with opensource [Lib
 
 ### [MDB nRF-BLE-Client](librescoot-nrf-ble-client-example.yaml)
 
-BLE-Client for Unu-Scooter Pro with Librescoot FW and nRF >v2.0.0-ls.
-Uses ESPHome [BLE Client](https://esphome.io/components/ble_client/) and exposes available characteristics as sensors.
-More info about the provided characteristics at [LibreScoot Tech Reference - Bluetooth Interface Documentation](https://reference.librescoot.org/latest/bluetooth/)
+**Component edition.** BLE interface for the Unu-Scooter Pro (Librescoot FW, nRF >v2.0.0-ls),
+built as the [`librescoot_ble_client`](components/librescoot_ble_client/) external component.
+Where the [standalone edition](librescoot-ble-client-minimal-example.yaml) wires ~25 `ble_client` characteristic
+sensors and template entities together in YAML, this edition puts all of that — the BLE
+client, the passkey pairing, every characteristic parser, the extended-command engine, the
+BLE link manager and the OTA-status diagnostics — into one C++ component. **The YAML only
+names the entities it wants.** Same functionality, a fraction of the YAML.
+More info about the characteristics at [LibreScoot Tech Reference - Bluetooth Interface Documentation](https://reference.librescoot.org/dev/bluetooth/)
+
+```yaml
+external_components:
+  - source:
+      type: local
+      path: my_components
+    components: [librescoot_ble_client]
+
+# BLE stack plumbing (shared, stack-level; stays in the YAML)
+esp32_ble:
+  io_capability: keyboard_only   # required for the scooter's passkey pairing
+esp32_ble_tracker:
+
+librescoot_ble_client:
+  id: librescoot_ble_client_hub
+  mac_address: !secret librescoot_nrf_ble_mac_addr
+  time_id: sntp_time             # optional, enables the clock-set entities
+  # --- optional OTA settings (defaults shown) ---
+  github_repo: "librescoot/librescoot"   # repo the firmware releases come from
+  update_check_interval: 6h              # how often to poll GitHub for a newer release
+  stage_only: false                      # true = transfers stop before COMPLETE (no install)
+
+  status:      {name: "Status"}
+  odometer:    {name: "Odometer"}
+  scooter_lock: {name: "Scooter Lock"}
+  # ... only the entities you name are created (full list in the component README) ...
+```
+
+The complete option and entity-key reference lives in the
+[component README](components/librescoot_ble_client/README.md).
 
 #### Pairing ESP32 with Scooter Pro nRF via ESPHome BLE
+> [!WARNING]
+> ### A paired ESP is a key to your scooter — read this first
+>
+> Pairing the ESP with the scooter creates a **bond** that is stored in the **ESP32's flash
+> (NVS)**. It **survives reboots — and survives re-flashing the firmware.** A normal
+> `esphome run` / OTA update does **not** erase it.
+>
+> - **Anyone holding a paired ESP can connect to and control your scooter** — even after
+>   flashing completely different firmware onto that ESP. Treat a paired ESP like a physical
+>   key: don't give it away or throw it out while it's still bonded.
+> - **The scooter can only forget _all_ bonds at once**, never a single device. If you clear
+>   the ESP's bond from the scooter side, you also **lose your phone pairing** and have to
+>   re-pair your phone.
+> - **To remove the bond from the ESP:** press **"BLE Remove Bond"** in Home Assistant, or
+>   erase the ESP's `nvs` flash region with `esptool` (a plain re-flash won't touch it).
+> 
 
-An ESP32 board running ESPHome connects to the Scooter Pro's nRF BLE chip over Bluetooth. The connection is secured with a one-time 6-digit passkey that gets generated during pairing.
+An ESP32 board running ESPHome connects to the Scooter Pro's nRF BLE chip over Bluetooth. The connection is secured with a one-time 6-digit passkey that gets generated during pairing. The component performs the pairing internally; the passkey is entered from Home Assistant.
 
 Setup:
 
-1. Flash the ESPHome [nRF-BLE-Client](librescoot-nrf-ble-client-example.yaml) onto your ESP32. Set all secrets in your ESPHome-Device-Builders `secrets.yaml` especially your scooter's BLE MAC address.
+1. Flash the ESPHome [nRF-BLE-Client](librescoot-nrf-ble-client-example.yaml) onto your ESP32. Set all secrets in your ESPHome-Device-Builder's `secrets.yaml`, especially your scooter's BLE MAC address.
 2. Add the ESP32 device to Home Assistant via the ESPHome integration.
 
 Pairing:
 
 1. Turn on the scooter into parked mode. When the ESP32 first connects to the scooter, it will ask for a passkey. To enter it:
 2. Open Home Assistant and go to **Settings → Developer Tools → Actions** (or go directly to `/config/developer-tools/action` in your browser).
-3. In the action search field, type **"librescoot"** — you'll see the `passkey_reply` action appear.
+3. In the action search field, type **"passkey"** — you'll see the `passkey_reply` action appear.
 4. Select it. A field for a 6-digit code will show up.
-5. Check scooters dashboard (DBC) for the passkey the scooter is expecting, enter it in HA, and hit **Perform Action**.
+5. Check the scooter's dashboard (DBC) for the passkey the scooter is expecting, enter it in HA, and hit **Perform Action**.
 6. Once accepted, the connection is established. The bond is saved — future reconnects happen automatically.
+
+Wire the action to the component:
+
+```yaml
+api:
+  actions:
+    - action: passkey_reply
+      variables:
+        pin: int
+      then:
+        - librescoot_ble_client.passkey_reply:
+            id: librescoot_ble_client_hub
+            passkey: !lambda "return pin;"
+```
+
+> When switching to a new ESP chip, first press **BLE Remove Bond** (disabled by default — enable it in HA first) *and* remove the bond on the scooter side, otherwise the new chip cannot re-pair against the stale bond.
 
 #### Using the Extended Command
 
-The `Extended Command` text input allows arbitrary commands to be sent to the nRF. After sending, responses are collected for 20 seconds and concatenated into the `Command Response Log` sensor.
+The nRF exposes a text command channel (write on `9a590401`, responses notify on `9a590402`). The **Command** text input sends an arbitrary command string; the component collects the reply with a terminator-aware engine (it stops on `:ok`, `:error:`, a standalone line, or a `…:count:<n>` header followed by *n* lines) with a 20 s timeout fallback. Two sensors surface the result:
 
-Example — set the cellular APN:
+- **Command last response** — the cleaned, correlated reply (truncated to 255 characters, the Home Assistant text-state limit; the full text is visible in the ESPHome web server / log).
+- **Command response** — the raw notification feed as it arrives.
 
-- **Command:** `config:apn <value>` (e.g. `config:apn web.vodafone.de`)
-- **Expected reply (in `Command Response Log`):** `config:ok`
+Many commands are already wrapped as first-class entities (the alarm switches, USB Mode, the navigation and power-management controls, the config text inputs, etc.), so the freeform channel is mainly for ad-hoc queries such as `cap:list` (the default prefill) or `cap:<category>`.
+
+Configuration keys use a `get:`/`set:` convention. Read-only queries the component runs on connect (they do **not** actuate the scooter): `status:version:dbc`, `status:maps-available`, `status:navigation-available`, `keycard:count`, `get:cellular.apn`, `get:pm.scheduled-hibernate-*`.
 
 #### Exposed Entities
 
-| Entity                   | Type           | Unit | Description                                                                 |
-| ------------------------ | -------------- | ---- | --------------------------------------------------------------------------- |
-| Status                   | Text Sensor    | —    | Vehicle state (e.g. parked, ready).                                         |
-| Seatbox                  | Text Sensor    | —    | Open/closed state of the seatbox.                                           |
-| Handlebar Lock           | Text Sensor    | —    | Lock/unlock state of the handlebar.                                         |
-| Power State              | Text Sensor    | —    | Current power-management state.                                             |
-| Power Mux Selected Input | Text Sensor    | —    | Currently selected power input source.                                      |
-| Odometer                 | Sensor         | km   | Total distance travelled (converted from meters).                           |
-| Battery 1 SoC            | Sensor         | %    | State of charge, main battery slot 1.                                       |
-| Battery 1 Cycles         | Sensor         | —    | Charge-cycle count, main battery slot 1.                                    |
-| Battery 1 State          | Text Sensor    | —    | State string for main battery slot 1.                                       |
-| Battery 1 Present        | Binary Sensor  | —    | Whether main battery slot 1 is occupied.                                    |
-| Battery 2 SoC            | Sensor         | %    | State of charge, main battery slot 2.                                       |
-| Battery 2 Cycles         | Sensor         | —    | Charge-cycle count, main battery slot 2.                                    |
-| Battery 2 State          | Text Sensor    | —    | State string for main battery slot 2.                                       |
-| Battery 2 Present        | Binary Sensor  | —    | Whether main battery slot 2 is occupied.                                    |
-| Aux Battery Voltage      | Sensor         | V    | Voltage of the auxiliary 12 V battery.                                      |
-| Aux Battery Level        | Sensor         | %    | State of charge of the auxiliary battery.                                   |
-| Aux Charge Status        | Text Sensor    | —    | Charge state of the auxiliary battery.                                      |
-| CBB Battery Level        | Sensor         | %    | State of charge of the connectivity battery.                                |
-| CBB Charge Status        | Text Sensor    | —    | Charge state of the connectivity battery.                                   |
-| iMX Software Version     | Text Sensor    | —    | Software version of the i.MX (MDB).                                         |
-| nRF Version              | Text Sensor    | —    | Firmware version of the nRF52 chip.                                         |
-| Navigation Active        | Binary Sensor  | —    | Whether navigation is currently active.                                     |
-| UMS Status               | Binary Sensor  | —    | USB Mass Storage active state.                                              |
-| BLE Connection           | Binary Sensor  | —    | Connectivity status of the BLE link.                                        |
-| RSSI                     | Sensor         | dBm  | Signal strength of the BLE link.                                            |
-| Blinker                  | Select         | —    | Set turn signal: `off`, `left`, `right`, `both`.                            |
-| Seatbox Open             | Button         | —    | Unlock/open the seatbox.                                                    |
-| Hibernate                | Button         | —    | Put the scooter into hibernation.                                           |
-| Wakeup                   | Button         | —    | Wake the scooter from hibernation.                                          |
-| Reboot                   | Button         | —    | Soft-reboot the MDB.                                                        |
-| Hard Reboot              | Button         | —    | Hard-reboot the MDB.                                                        |
-| BLE Remove Bond          | Button         | —    | Remove the existing BLE bond (disabled by default; use only for re-pairing).|
-| Extended Command         | Text Input     | —    | Send an arbitrary command string to the nRF (see above).                    |
-| Last Command Response    | Text Sensor    | —    | Most recent raw response chunk from an extended command.                    |
-| Command Response Log     | Text Sensor    | —    | Concatenated response collected during the 20 s window after a command.     |
+Entity keys are opt-in: only keys you declare with a `name` are instantiated. All read
+entities become *unknown* while the BLE link is down and repopulate on reconnect. "Update"
+is the poll interval; `on connect` values are queried once per connection, `on notify` are
+pushed by the scooter, and `—` marks action/control entities with no periodic state.
+
+**Vehicle & battery telemetry (read)**
+
+| Key | Entity | Type | Update | Description |
+| --- | --- | --- | --- | --- |
+| `status` | Status | Text Sensor | 5 s | Operating state (`ready-to-drive`, `parked`, `stand-by`). |
+| `seatbox` | Seatbox | Text Sensor | 5 s | Seatbox open/closed. |
+| `handlebar_lock` | Handlebar Lock | Text Sensor | 5 s | Handlebar lock state. |
+| `power_state` | Power State | Text Sensor | 5 s | Power-management state. |
+| `power_mux` | MDB Power Mux Selected Input | Text Sensor | 600 s | Selected power input. |
+| `odometer` | Odometer | Sensor (km) | 120 s | Total distance travelled. |
+| `battery_1_soc` / `battery_2_soc` | Battery n SoC | Sensor (%) | 60 s | Main battery charge (unknown when unplugged). |
+| `battery_1_cycles` / `battery_2_cycles` | Battery n Cycles | Sensor | 600 s | Charge cycles (unknown when unplugged). |
+| `battery_1_state` / `battery_2_state` | Battery n State | Text Sensor | 120 s | Battery state (unknown when unplugged). |
+| `battery_1_present` / `battery_2_present` | Battery n Present | Binary Sensor | 10 s | Slot occupied. |
+| `aux_voltage` | Aux Battery Voltage | Sensor (V) | 60 s | 12 V aux battery voltage. |
+| `aux_level` | Aux Battery Level | Sensor (%) | 60 s | Aux battery charge. |
+| `aux_charge_status` | Aux Charge Status | Text Sensor | 120 s | Aux charge state. |
+| `cbb_level` | CBB Battery Level | Sensor (%) | 60 s | Connectivity battery charge. |
+| `cbb_charge_status` | CBB Charge Status | Text Sensor | 120 s | CBB charge state. |
+| `cbb_remaining` / `cbb_full` | CBB Remaining / Full Capacity | Sensor (Ah) | 600 s | µAh → Ah. |
+| `cbb_cell` | CBB Cell Voltage | Sensor (V) | 120 s | µV → V. |
+| `navigation_active` | Navigation Active | Binary Sensor | 60 s | Navigation running. |
+| `ums_status` | UMS Status | Binary Sensor | 60 s | USB mass-storage active. |
+| `maps_available` | Maps Available | Binary Sensor | on connect | Offline maps present. |
+| `navigation_available` | Navigation Available | Binary Sensor | on connect | Navigation service available. |
+| `keycard_count` | Keycard Count | Text Sensor | on connect | Registered keycards. |
+
+**Versions**
+
+| Key | Entity | Type | Update | Description |
+| --- | --- | --- | --- | --- |
+| `sw_mdb` | SW MDB | Text Sensor | 1800 s + on connect | i.MX (MDB) version. |
+| `sw_nrf` | SW nRF | Text Sensor | 1800 s + on connect | nRF52 firmware version. |
+| `sw_dbc` | SW DBC | Text Sensor | on connect | Dashboard version. |
+| `sw_esp` | SW ESP | Text Sensor | static | ESPHome build of this bridge. |
+
+**BLE link**
+
+| Key | Entity | Type | Update | Description |
+| --- | --- | --- | --- | --- |
+| `ble_connection` | BLE Connection | Binary Sensor | 1 s | Connected to the scooter. |
+| `ble_presence` | BLE Presence | Binary Sensor | 1 s | Connected, or advertisement seen while scanning. |
+| `rssi` | BLE RSSI | Sensor (dBm) | 60 s | Link signal strength. |
+| `ble_link_mode` | BLE Link Mode | Select | — | `disconnect` / `scan` / `auto` / `always`; persisted. `auto` releases the link for ~20 s on each disconnect so a phone can take over; any OTA pins the link up. |
+
+> **Connect-on-demand:** in `scan`/`disconnect` the link is down, but triggering any control
+> still works — the component brings the link up, replays the action, waits for the reply,
+> then releases the link again.
+
+**Lock & controls**
+
+| Key | Entity | Type | Description |
+| --- | --- | --- | --- |
+| `scooter_lock` | Scooter Lock | Lock | Lock = `stand-by`, unlock = `ready-to-drive`; reflected, defaults LOCKED. |
+| `blinker` | Blinker | Select | `off` / `left` / `right` / `both`. |
+| `usb_mode` | USB Mode | Select | `Normal` / `Mass Storage`, reflected from UMS. |
+| `seatbox_open` | Seatbox Open | Button | Open the seatbox. |
+| `hibernate` / `wakeup` | Hibernate / Wakeup | Button | Power management. |
+| `reboot_mdb` / `reboot_mdb_hard` | Reboot MDB / (hard) | Button | Reboot the MDB. |
+
+**Alarm & navigation**
+
+| Key | Entity | Type |
+| --- | --- | --- |
+| `alarm_enabled` / `alarm_armed` | Alarm Enabled / Armed | Switch (optimistic) |
+| `alarm_start` / `alarm_stop` | Alarm Start / Stop | Button |
+| `navigation_set` | Navigation Set to | Text (`lat,lon[,name]`) |
+| `navigation_clear` | Navigation Clear | Button |
+| `cancel_hibernate` | Cancel Hibernate | Button |
+
+**Configuration**
+
+| Key | Entity | Type | Description |
+| --- | --- | --- | --- |
+| `cellular_apn` | Cellular APN | Text | Read back on connect; edit sends `set:cellular.apn`. |
+| `pm_scheduled_hibernate_enabled` | PM Scheduled Hibernation Enabled | Switch | Read back on connect. |
+| `pm_scheduled_hibernate_cron` | PM Scheduled Hibernation Cron | Text | Cron expression. |
+| `pm_scheduled_hibernate_duration` | PM Scheduled Hibernation Duration | Text | e.g. `5h30m`. |
+| `ota_channel` | OTA channel | Select | `undefined` / `stable` / `testing` / `nightly`. Reflects the running channel. |
+| `ota_update_method` | OTA Update Method | Select | `delta` (default, small patch) / `full` (complete `.mender` image). |
+
+**System, time & diagnostics**
+
+| Key | Entity | Type | Description |
+| --- | --- | --- | --- |
+| `system_time_sync` | System Time sync with ESP | Button | Set the clock to the ESP's SNTP time. |
+| `system_time_iso` | System Time Set UTC ISO-8601 | Text | Set the clock from `2026-07-26T18:45:30Z`. |
+| `refresh` | A-Refresh Sensor States | Button | Re-poll everything + re-run on-connect queries. |
+| `ble_remove_bond` | BLE Remove Bond | Button | Remove the bond (disabled by default). |
+| `restart_esp` | Restart ESPHome Device | Button | Reboot the ESP bridge. |
+
+**Extended command**
+
+| Key | Entity | Type | Update | Description |
+| --- | --- | --- | --- | --- |
+| `command` | Command | Text | — | Arbitrary command (prefilled `cap:list`). |
+| `command_last_response` | Command last response | Text Sensor | on command | Correlated reply (255-char limit). |
+| `command_response` | Command response | Text Sensor | on notify | Raw notification feed. |
+
+**OTA — firmware update (service `9a590500`)**
+
+| Key | Entity | Type | Description |
+| --- | --- | --- | --- |
+| `update` | OTA Librescoot Update | Update | One entity for both firmware parts. GitHub release check vs the running versions (MDB `9a59a041`, DBC `status:version:dbc`); shows release notes. |
+| `ota_update` | OTA Update | Button | Transfer + install the target release (MDB then DBC), honouring the method select. |
+| `ota_version` | OTA Version | Text | Optional specific release tag; empty = latest. Verified against GitHub before any bytes move. |
+| `ota_source_url` | OTA Source URL | Text | Where the firmware bytes come from. Default = GitHub; the HA integration points this at its local plain-HTTP relay automatically. |
+| `ota_status` | OTA Status | Text Sensor | Decoded OTA status (`Transferring X%`, milestones, errors). |
+| `ota_eta` | OTA Upload ETA | Text Sensor | Estimated time remaining, `HH:MM:SS`. |
+| `ota_status_request` | OTA Status Request | Button | `STATUS_REQ` (diagnostics). |
+| `ota_abort` | OTA Abort | Button | Abort an OTA session (user cancel). |
+
+**How it works.** The component queries the GitHub releases API itself over TLS (only the two
+GitHub root CAs are pinned in `github_ca.h`, so the Mozilla bundle is off:
+`CONFIG_MBEDTLS_CERTIFICATE_BUNDLE: n`) and compares the newest release for the channel shown
+by `OTA channel`. Pressing **OTA Update** resolves the release's assets (delta or full per
+`OTA Update Method`), then streams them over BLE-OTA to the scooter — **MDB first, then DBC**,
+each a separate session distinguished by a component byte in the START message. When all bytes
+are acknowledged it sends COMPLETE; the scooter verifies the SHA-256 and installs. Installing
+is always allowed — the scooter's firmware decides when to apply it and reboots to finish.
+
+The status/log cadence scales with file size (≈5 s for deltas, 60 s up to 30 MB, 5 min beyond)
+so a big transfer doesn't flood Home Assistant.
+
+*Build-time test flag:* set `stage_only: true` in the component config to run the whole
+transfer but stop **before** COMPLETE (nothing is installed) — useful for exercising the path.
+
+**Pairing (for the HA integration)**
+
+| Key | Entity | Type | Description |
+| --- | --- | --- | --- |
+| `passkey_required` | Passkey Required | Binary Sensor | On while the scooter is asking for the pairing passkey. **Add `disabled_by_default: true`** — the Home Assistant integration enables it on demand and turns it into a Repairs pop-up; it isn't meant to be a user-facing entity. |
 
 ### [CBB monitoring via I²C addr 0x36 and 0x0B](librescoot-cbb-example.yaml)
 

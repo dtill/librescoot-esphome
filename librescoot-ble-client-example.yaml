@@ -1,0 +1,333 @@
+# Unu-Scooter Pro BLE - Client for Librescoot FW and nRF v2.0.0-ls
+#
+# uses ESPHome BLE Client (https://esphome.io/components/ble_client/) and exposes available characteristics
+# as sensors.
+# More info at LibreScoot Tech Reference: ( https://reference.librescoot.org/dev/bluetooth/ and https://reference.librescoot.org/dev/bluetooth/ota-transfer/)
+#
+# to set all the passwords, mac addr and credentials in this example add theses to your secrets.yaml file:
+# see (https://esphome.io/guides/yaml/#secrets-and-the-secretsyaml-file)
+#
+# librescoot_api_key: "xxx"
+# librescoot_ota_pw: "xxx"
+# librescoot_wifi_ssid:"xxx"
+# librescoot_wifi_pw: "xxx"
+# librescoot_fallback_ap_pw: "xxxxxxxx"               #should be 8 digits
+# librescoot_webserver_basic_auth_user: "xxx"
+# librescoot_webserver_basic_auth_pw: "xxx"
+# librescoot_nrf_ble_mac_addr: "XX:XX:XX:XX:XX:XX"    # your scooters ble MAC addr
+#
+# To delete bond in scooter nRF first use "BLE Remove Bond"-button (you have to enable it first in HA - disabled by default).
+# To delete bond in ESP chip, use erase-flash from estool: 'esptool --port /dev/usbserialxxx erase-flash'
+# Is designed for ESP32 classic chipsets with low IRAM. Therfore it comes with a Range-Server to serve the OTA Files in the Local Network.
+# in the future there will be a Homeassistant integration that helps finding and integrating the device and also serves as a range server.
+
+substitutions:
+  device_name: "librescoot-nrf-ble-client"
+  device_friendly_name: "Librescoot-nRF-BLE-Client"
+  device_id_name: "librescoot_nrf_ble_client"
+
+esphome:
+  name: $device_name
+  friendly_name: $device_friendly_name
+  comment: "Connects to the LibreScoot / unu Scooter Pro firmware through the nRF BLE chip and controls the most common phone-app functions and a little more."
+  build_path: "../config/esphome/build/${device_name}_build"
+  # Advertised in the mDNS TXT record so the Librescoot-BLE-Client HA integration can
+  # zeroconf-discover this device (and only this kind of device).
+  project:
+    name: "librescoot.ble_client"
+    version: "1.0.0"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    advanced:
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: false   # SRAM1 -> DRAM heap (~+40 kB) so the RSA-4096 CDN TLS handshake fits
+    sdkconfig_options:
+      # The OTA update check pins only the two GitHub root CAs in the component.
+      CONFIG_MBEDTLS_CERTIFICATE_BUNDLE: n
+      # Shrink the TLS heap footprint so the handshake still fits alongside BLE + the OTA
+      # ring buffer on the ESP32-classic (no PSRAM). Only small requests are sent.
+      CONFIG_MBEDTLS_DYNAMIC_BUFFER: y
+      CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN: "4096"
+      CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN: y
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/dtill/librescoot-esphome
+    components: [librescoot_ble_client]
+    refresh: 0s
+
+api:
+  reboot_timeout: 5min
+  encryption:
+    key: !secret librescoot_api_key
+  actions:
+    # Pairing: the scooter shows a 6-digit passkey on its dashboard; reply with it here.
+    - action: passkey_reply
+      variables:
+        pin: int
+      then:
+        - librescoot_ble_client.passkey_reply:
+            id: librescoot_ble_client_hub
+            passkey: !lambda "return pin;"
+    # Test hook for the OTA transfer engine (stage-only by default; nothing is installed).
+    - action: ota_test
+      variables:
+        url: string
+        size: int
+        bundle: string
+        component: int
+      then:
+        - librescoot_ble_client.ota_transfer:
+            id: librescoot_ble_client_hub
+            url: !lambda "return url;"
+            size: !lambda "return size;"
+            bundle_id: !lambda "return bundle;"
+            component: !lambda "return component;"
+    - action: ota_abort
+      then:
+        - librescoot_ble_client.ota_abort:
+            id: librescoot_ble_client_hub
+
+ota:
+  platform: esphome
+  password: !secret librescoot_ota_pw
+
+wifi:
+  use_address: 192.168.178.171
+  ssid: !secret librescoot_wifi_ssid
+  password: !secret librescoot_wifi_pw
+  reboot_timeout: 1min
+  min_auth_mode: WPA2
+  ap:
+    ssid: ${device_name}-ap
+    password: !secret librescoot_fallback_ap_pw
+
+captive_portal:
+
+web_server:
+  local: true
+  version: 3
+  port: 80
+  auth:
+    username: !secret librescoot_webserver_basic_auth_user
+    password: !secret librescoot_webserver_basic_auth_pw
+    type: digest
+
+logger:
+  baud_rate: 0
+
+# --- BLE stack plumbing (shared, stack-level; must stay in the YAML) ---
+esp32_ble:
+  io_capability: keyboard_only   # required for the scooter's passkey pairing
+esp32_ble_tracker:
+
+# Time source for the clock-set entities (System Time sync / UTC ISO-8601).
+time:
+  - platform: sntp
+    id: sntp_time
+    servers:
+      #- 192.168.178.1 # put your local ntp here
+      - pool.ntp.org
+
+# -----------------------------------------------------------------------------
+# LSC Bluetooth nRF component — every scooter entity, opt-in by name.
+# -----------------------------------------------------------------------------
+librescoot_ble_client:
+  id: librescoot_ble_client_hub
+  mac_address: ${ble_mac}
+  time_id: sntp_time
+  # --- optional OTA settings (defaults shown) ---
+  # github_repo: "librescoot/librescoot"   # owner/name the firmware releases come from
+  # update_check_interval: 6h              # how often to poll GitHub for a newer release
+  # stage_only: false                      # true = transfers stop before COMPLETE (no install on scooter - good for transfer-tests)
+
+  # ----- Telemetry (read) ----------------------------------------------------
+  status:
+    name: "Status"
+  seatbox:
+    name: "Seatbox"
+  handlebar_lock:
+    name: "Handlebar Lock"
+  power_state:
+    name: "Power State"
+  power_mux:
+    name: "MDB Power Mux Selected Input"
+  odometer:
+    name: "Odometer"
+
+  battery_1_soc:
+    name: "Battery 1 SoC"
+  battery_1_cycles:
+    name: "Battery 1 Cycles"
+  battery_1_state:
+    name: "Battery 1 State"
+  battery_1_present:
+    name: "Battery 1 Present"
+  battery_2_soc:
+    name: "Battery 2 SoC"
+  battery_2_cycles:
+    name: "Battery 2 Cycles"
+  battery_2_state:
+    name: "Battery 2 State"
+  battery_2_present:
+    name: "Battery 2 Present"
+
+  aux_voltage:
+    name: "Aux Battery Voltage"
+  aux_level:
+    name: "Aux Battery Level"
+  aux_charge_status:
+    name: "Aux Charge Status"
+
+  cbb_level:
+    name: "CBB Battery Level"
+  cbb_charge_status:
+    name: "CBB Charge Status"
+  cbb_remaining:
+    name: "CBB Remaining Capacity"
+  cbb_full:
+    name: "CBB Full Capacity"
+  cbb_cell:
+    name: "CBB Cell Voltage"
+
+  navigation_active:
+    name: "Navigation Active"
+  ums_status:
+    name: "UMS Status"
+  maps_available:
+    name: "Maps Available"
+  navigation_available:
+    name: "Navigation Available"
+  keycard_count:
+    name: "Keycard Count"
+
+  # ----- Versions ------------------------------------------------------------
+  sw_mdb:
+    name: "SW MDB"
+  sw_nrf:
+    name: "SW nRF"
+  sw_dbc:
+    name: "SW DBC"
+  sw_esp:
+    name: "SW ESP"
+
+  # ----- BLE link ------------------------------------------------------------
+  ble_connection:
+    name: "BLE Connection"
+  ble_presence:
+    name: "BLE Presence"
+  # On = the scooter is asking for the pairing passkey; the HA integration raises a Repair
+  # dialog to enter it. Clears on successful bonding. Hidden by default (the integration
+  # enables it when needed) so it doesn't clutter the device page.
+  passkey_required:
+    name: "Passkey Required"
+    disabled_by_default: true
+  rssi:
+    name: "BLE RSSI"
+  ble_link_mode:
+    name: "BLE Link Mode"
+
+  # ----- Lock & controls -----------------------------------------------------
+  scooter_lock:
+    name: "Scooter Lock"
+  blinker:
+    name: "Blinker"
+  usb_mode:
+    name: "USB Mode"
+  seatbox_open:
+    name: "Seatbox Open"
+  hibernate:
+    name: "Hibernate"
+  wakeup:
+    name: "Wakeup"
+  reboot_mdb:
+    name: "Reboot MDB"
+  reboot_mdb_hard:
+    name: "Reboot MDB (hard)"
+
+  # ----- Alarm & navigation --------------------------------------------------
+  alarm_enabled:
+    name: "Alarm Enabled"
+  alarm_armed:
+    name: "Alarm Armed"
+  alarm_start:
+    name: "Alarm Start"
+  alarm_stop:
+    name: "Alarm Stop"
+  navigation_set:
+    name: "Navigation Set to"
+  navigation_clear:
+    name: "Navigation Clear"
+  cancel_hibernate:
+    name: "Cancel Hibernate"
+
+  # ----- Configuration -------------------------------------------------------
+  cellular_apn:
+    name: "Cellular APN"
+  pm_scheduled_hibernate_enabled:
+    name: "PM Scheduled Hibernation Enabled"
+  pm_scheduled_hibernate_cron:
+    name: "PM Scheduled Hibernation Cron"
+  pm_scheduled_hibernate_duration:
+    name: "PM Scheduled Hibernation Duration"
+  ota_channel:
+    name: "OTA channel"
+  # Transfer method for the next install: "delta" (small patch, default) or "full"
+  # (complete .mender image, hundreds of MB — an overnight transfer on this hardware).
+  ota_update_method:
+    name: "OTA Update Method"
+
+  # ----- System, time & diagnostics ------------------------------------------
+  system_time_sync:
+    name: "System Time sync with ESP"
+  system_time_iso:
+    name: "System Time Set UTC ISO-8601"
+  refresh:
+    name: "A-Refresh Sensor States"
+  ble_remove_bond:
+    name: "BLE Remove Bond"
+    disabled_by_default: true
+  restart_esp:
+    name: "Restart ESPHome Device"
+
+  # ----- Extended command ----------------------------------------------------
+  command:
+    name: "Command"
+  command_response:
+    name: "Command response"
+  command_last_response:
+    name: "Command last response"
+
+  # ----- OTA diagnostics -----------------------------------------------------
+  ota_status:
+    name: "OTA Status"
+  # Estimated time remaining for the running transfer, HH:MM:SS (updated on the throttled
+  # status cadence: every 5 s, or 60 s / 5 min for larger bundles).
+  ota_eta:
+    name: "OTA Upload ETA"
+  ota_status_request:
+    name: "OTA Status Request"
+  ota_abort:
+    name: "OTA Abort"
+
+  # ----- Firmware update (GitHub release check; one entity, MDB + DBC together) ------
+  update:
+    name: "OTA Librescoot Update"
+  # Byte source for the transfer. Default = GitHub; point at a local HTTP mirror
+  # (e.g. http://192.168.178.71:8000) to drop TLS from the bulk download. Files served at
+  # <base>/<tag>/<asset-name>. Metadata (size/SHA) always comes from the GitHub API.
+  ota_source_url:
+    name: "OTA Source URL"
+  # Transfer + install the target release: the OTA Version tag if set, else the latest
+  # resolved release. Honours the OTA Update Method select. The target tag is verified
+  # against GitHub (the resolve queries that exact tag) before any bytes move.
+  ota_update:
+    name: "OTA Update"
+  # Optional specific release tag to install (e.g. nightly-20260724T040816). Leave empty to
+  # use the latest release for the selected channel.
+  ota_version:
+    name: "OTA Version"
