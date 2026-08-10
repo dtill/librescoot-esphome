@@ -1,30 +1,18 @@
-# Unu-Scooter Pro BLE - Client for Librescoot FW and nRF v2.0.0-ls
+# Unu-Scooter Pro BLE interface for Librescoot FW and nRF >v2.0.0-ls
 #
-# uses ESPHome BLE Client (https://esphome.io/components/ble_client/) and exposes available characteristics
-# as sensors.
-# More info at LibreScoot Tech Reference: ( https://reference.librescoot.org/dev/bluetooth/ and https://reference.librescoot.org/dev/bluetooth/ota-transfer/)
+# Component edition: the librescoot_ble_client external component owns the BLE client and
+# implements every characteristic parser, the passkey pairing flow, the extended-command
+# engine and the OTA diagnostics in C++. This YAML only names the entities it wants.
 #
-# to set all the passwords, mac addr and credentials in this example add theses to your secrets.yaml file:
-# see (https://esphome.io/guides/yaml/#secrets-and-the-secretsyaml-file)
-#
-# librescoot_api_key: "xxx"
-# librescoot_ota_pw: "xxx"
-# librescoot_wifi_ssid:"xxx"
-# librescoot_wifi_pw: "xxx"
-# librescoot_fallback_ap_pw: "xxxxxxxx"               #should be 8 digits
-# librescoot_webserver_basic_auth_user: "xxx"
-# librescoot_webserver_basic_auth_pw: "xxx"
-# librescoot_nrf_ble_mac_addr: "XX:XX:XX:XX:XX:XX"    # your scooters ble MAC addr
-#
-# To delete bond in scooter nRF first use "BLE Remove Bond"-button (you have to enable it first in HA - disabled by default).
-# To delete bond in ESP chip, use erase-flash from estool: 'esptool --port /dev/usbserialxxx erase-flash'
-# Is designed for ESP32 classic chipsets with low IRAM. Therfore it comes with a Range-Server to serve the OTA Files in the Local Network.
-# in the future there will be a Homeassistant integration that helps finding and integrating the device and also serves as a range server.
+# secrets.yaml keys used below:
+#   librescoot_wifi_ssid / _pw, librescoot_fallback_ap_pw,
+#   librescoot_webserver_basic_auth_user / _pw, librescoot_nrf_ble_mac_addr
 
 substitutions:
-  device_name: "librescoot-nrf-ble-client"
-  device_friendly_name: "Librescoot-nRF-BLE-Client"
-  device_id_name: "librescoot_nrf_ble_client"
+  device_name: "librescoot-component-485934"   # hostname, must be <=31 chars
+  device_friendly_name: "Librescoot-BLE-Client-component-485934"
+  device_id_name: "librescoot_nrf_component_485934"
+  ble_mac: !secret librescoot_nrf_ble_mac_addr
 
 esphome:
   name: $device_name
@@ -45,7 +33,8 @@ esp32:
       minimum_chip_revision: "3.1"
       sram1_as_iram: false   # SRAM1 -> DRAM heap (~+40 kB) so the RSA-4096 CDN TLS handshake fits
     sdkconfig_options:
-      # The OTA update check pins only the two GitHub root CAs in the component.
+      # The OTA update check pins only the two GitHub root CAs in the component
+      # (github_ca.h), so the ~100 kB Mozilla cert bundle is not compiled in.
       CONFIG_MBEDTLS_CERTIFICATE_BUNDLE: n
       # Shrink the TLS heap footprint so the handshake still fits alongside BLE + the OTA
       # ring buffer on the ESP32-classic (no PSRAM). Only small requests are sent.
@@ -130,7 +119,7 @@ time:
   - platform: sntp
     id: sntp_time
     servers:
-      #- 192.168.178.1 # put your local ntp here
+      - 192.168.178.1
       - pool.ntp.org
 
 # -----------------------------------------------------------------------------
@@ -143,7 +132,7 @@ librescoot_ble_client:
   # --- optional OTA settings (defaults shown) ---
   # github_repo: "librescoot/librescoot"   # owner/name the firmware releases come from
   # update_check_interval: 6h              # how often to poll GitHub for a newer release
-  # stage_only: false                      # true = transfers stop before COMPLETE (no install on scooter - good for transfer-tests)
+  # stage_only: false                      # true = transfers stop before COMPLETE (no install)
 
   # ----- Telemetry (read) ----------------------------------------------------
   status:
@@ -220,16 +209,35 @@ librescoot_ble_client:
     name: "BLE Connection"
   ble_presence:
     name: "BLE Presence"
-  # On = the scooter is asking for the pairing passkey; the HA integration raises a Repair
-  # dialog to enter it. Clears on successful bonding. Hidden by default (the integration
-  # enables it when needed) so it doesn't clutter the device page.
+  # Problem sensor (device_class: problem — shows red/"Detected" in HA). ON while the scooter is
+  # asking for the pairing passkey; enter it with the passkey_reply action (or, with the HA
+  # integration, its Repair dialog). Turns OFF once bonding succeeds.
   passkey_required:
     name: "Passkey Required"
-    disabled_by_default: true
+  # Problem sensor (device_class: problem). ON only when the configured scooter is in range
+  # (advertising) but not bonded — i.e. an unrequested (re)pair was refused because the bond was
+  # lost. Never fires just because the scooter is away or momentarily disconnected. The HA
+  # integration turns this into a Repair that starts the pairing flow. Clears on bond / out of range.
+  pairing_required:
+    name: "Pairing Required"
+  # Problem sensor (device_class: problem). ON when the scooter has sat in "pending reboot" for
+  # >20 min — a firmware install finished but the reboot that applies it hasn't happened (or the
+  # BLE status latched stale). Press "Reboot MDB" to clear it (the HA integration offers this as a
+  # Repair). Turns OFF as soon as the scooter leaves pending-reboot.
+  reboot_required:
+    name: "Reboot Required"
   rssi:
     name: "BLE RSSI"
   ble_link_mode:
     name: "BLE Link Mode"
+  # The scooter MAC this ESP is configured for (its `mac_address`), always shown — the HA
+  # integration reads it to preselect/show the connected scooter without scanning.
+  scooter_mac:
+    name: "Scooter MAC"
+  # On = the Home Assistant "Librescoot-BLE-Client" integration is active — the component pings
+  # its plain-HTTP OTA relay. Drives whether OTA is possible (else the ESP needs direct-GitHub).
+  ha_integration:
+    name: "HA Integration"
 
   # ----- Lock & controls -----------------------------------------------------
   scooter_lock:
@@ -291,6 +299,10 @@ librescoot_ble_client:
   ble_remove_bond:
     name: "BLE Remove Bond"
     disabled_by_default: true
+  # Explicitly (re)bond with the scooter. The ESP NEVER pairs on its own — a lost/stale bond just
+  # releases the link; press this (or use the HA pairing Repair) to bond intentionally.
+  pair_scooter:
+    name: "Pair Scooter"
   restart_esp:
     name: "Restart ESPHome Device"
 
@@ -314,19 +326,24 @@ librescoot_ble_client:
   ota_abort:
     name: "OTA Abort"
 
-  # ----- Firmware update (GitHub release check; one entity, MDB + DBC together) ------
-  update:
-    name: "OTA Librescoot Update"
+  # ----- Firmware update — one entity per board (they install sequentially: the scooter
+  # reboots after each component). DBC only shows "available" once MDB is already at the
+  # latest and DBC is behind; the manual Install buttons below always work. ------
+  mdb_update:
+    name: "OTA MDB Update"
+  dbc_update:
+    name: "OTA DBC Update"
   # Byte source for the transfer. Default = GitHub; point at a local HTTP mirror
   # (e.g. http://192.168.178.71:8000) to drop TLS from the bulk download. Files served at
   # <base>/<tag>/<asset-name>. Metadata (size/SHA) always comes from the GitHub API.
   ota_source_url:
     name: "OTA Source URL"
-  # Transfer + install the target release: the OTA Version tag if set, else the latest
-  # resolved release. Honours the OTA Update Method select. The target tag is verified
-  # against GitHub (the resolve queries that exact tag) before any bytes move.
-  ota_update:
-    name: "OTA Update"
+  # Manual per-board install (always available). Target = OTA Version if set, else: MDB = the
+  # channel latest, DBC = the MDB's current version (bring DBC up to match the board).
+  ota_mdb_update:
+    name: "OTA MDB Install"
+  ota_dbc_update:
+    name: "OTA DBC Install"
   # Optional specific release tag to install (e.g. nightly-20260724T040816). Leave empty to
   # use the latest release for the selected channel.
   ota_version:
