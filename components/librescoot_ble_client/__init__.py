@@ -15,6 +15,7 @@ from esphome import automation
 from esphome.components import (
     binary_sensor,
     button,
+    esp32,
     esp32_ble,
     esp32_ble_client,
     esp32_ble_tracker,
@@ -75,8 +76,14 @@ OtaAbortAction = librescoot_ns.class_("OtaAbortAction", automation.Action)
 CONF_TIME_ID = "time_id"
 CONF_PASSKEY = "passkey"
 CONF_STAGE_ONLY = "stage_only"
+CONF_PRESENCE_TIMEOUT = "presence_timeout"
 CONF_GITHUB_REPO = "github_repo"
 CONF_UPDATE_INTERVAL = "update_check_interval"
+CONF_LINK_INTERVAL = "link_interval"
+CONF_FIRMWARE_SOURCE = "firmware_source"
+CONF_CA_CERTIFICATE = "ca_certificate"
+CONF_USE_CERT_BUNDLE = "use_cert_bundle"
+CONF_SCOOTER_FILTER = "scooter_filter"
 
 # ---------------------------------------------------------------------------
 # Read entity tables:  yaml_key -> (setter, schema)
@@ -108,6 +115,9 @@ BINARY_SENSORS = {
     # Machinery for the HA integration's pairing Repair dialog. Add `disabled_by_default: true`
     # in the YAML so it doesn't clutter the device page — the integration enables it on demand.
     "passkey_required": ("set_passkey_required", dict(device_class="problem", icon="mdi:key-alert", entity_category="diagnostic")),
+    "pairing_required": ("set_pairing_required_sensor", dict(device_class="problem", icon="mdi:bluetooth-off", entity_category="diagnostic")),
+    "reboot_required": ("set_reboot_required", dict(device_class="problem", icon="mdi:restart-alert", entity_category="diagnostic")),
+    "ha_integration": ("set_ha_integration", dict(device_class="connectivity", icon="mdi:home-assistant", entity_category="diagnostic")),
     "ble_presence": ("set_ble_presence", dict(device_class="presence", icon="mdi:bluetooth-audio", entity_category="diagnostic")),
 }
 
@@ -130,13 +140,14 @@ TEXT_SENSORS = {
     "command_last_response": ("set_cmd_last_response", dict(icon="mdi:script-text-outline", entity_category="diagnostic")),
     "ota_status": ("set_ota_status", dict(icon="mdi:progress-download", entity_category="diagnostic")),
     "ota_eta": ("set_ota_eta", dict(icon="mdi:timer-sand", entity_category="diagnostic")),
+    "scooter_mac": ("set_scooter_mac_sensor", dict(icon="mdi:bluetooth", entity_category="diagnostic")),
 }
 
 # Controls: yaml_key -> (setter_or_None, kind_enum, options_or_minmax, entity_category, icon)
 SELECTS = {
     "blinker": ("set_blinker", SelKind.BLINKER, ["off", "left", "right", "both"], None, "mdi:car-light-high"),
     "usb_mode": ("set_usb_mode", SelKind.USB_MODE, ["Normal", "Mass Storage"], "diagnostic", "mdi:usb-flash-drive"),
-    "ble_link_mode": ("set_link_mode", SelKind.LINK_MODE, ["disconnect", "scan", "auto", "always"], "diagnostic", "mdi:bluetooth-connect"),
+    "ble_link_mode": ("set_link_mode", SelKind.LINK_MODE, ["disconnect", "scan", "auto", "always", "interval"], "diagnostic", "mdi:bluetooth-connect"),
     "ota_channel": ("set_ota_channel", SelKind.OTA_CHANNEL, ["undefined", "stable", "testing", "nightly"], "diagnostic", "mdi:update"),
     "ota_update_method": ("set_ota_method", SelKind.OTA_METHOD, ["delta", "full"], "diagnostic", "mdi:package-variant"),
 }
@@ -154,9 +165,11 @@ BUTTONS = {
     "reboot_mdb": (BtnAction.REBOOT, "config", "mdi:restart"),
     "reboot_mdb_hard": (BtnAction.REBOOT_HARD, "config", "mdi:restart-alert"),
     "ble_remove_bond": (BtnAction.REMOVE_BOND, "config", "mdi:bluetooth-off"),
+    "pair_scooter": (BtnAction.PAIR, "config", "mdi:bluetooth-connect"),
     "ota_status_request": (BtnAction.OTA_STATUS_REQ, "diagnostic", "mdi:progress-question"),
     "ota_abort": (BtnAction.OTA_ABORT, "diagnostic", "mdi:cancel"),
-    "ota_update": (BtnAction.OTA_UPDATE, "diagnostic", "mdi:cloud-download"),
+    "ota_mdb_update": (BtnAction.OTA_MDB_UPDATE, "diagnostic", "mdi:cloud-download"),
+    "ota_dbc_update": (BtnAction.OTA_DBC_UPDATE, "diagnostic", "mdi:cloud-download"),
     "system_time_sync": (BtnAction.SYSTIME_SYNC, "diagnostic", "mdi:clock-check"),
     "restart_esp": (BtnAction.RESTART_ESP, "config", "mdi:restart"),
     "alarm_start": (BtnAction.ALARM_START, None, "mdi:alarm-light-outline"),
@@ -209,10 +222,13 @@ _ENTITY_SCHEMAS.update(
 )
 _ENTITY_SCHEMAS[cv.Optional("scooter_lock")] = lock.lock_schema(LibrescootLock)
 
-# Single update entity for the whole scooter (MDB + DBC ship together as one release).
-# The transfer engine still runs MDB and DBC as two separate background OTA processes.
-_ENTITY_SCHEMAS[cv.Optional("update")] = update.update_schema(
-    LibrescootUpdate, icon="mdi:package-up", entity_category="diagnostic"
+# Two update entities — one per scooter board. They must install sequentially (the scooter
+# reboots after each component's install), so they share the single OTA engine.
+_ENTITY_SCHEMAS[cv.Optional("mdb_update")] = update.update_schema(
+    LibrescootUpdate, icon="mdi:chip", entity_category="diagnostic"
+)
+_ENTITY_SCHEMAS[cv.Optional("dbc_update")] = update.update_schema(
+    LibrescootUpdate, icon="mdi:gauge", entity_category="diagnostic"
 )
 
 
@@ -228,6 +244,22 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_GITHUB_REPO, default="librescoot/librescoot"): cv.string,
             # How often to poll GitHub for a newer release.
             cv.Optional(CONF_UPDATE_INTERVAL, default="6h"): cv.positive_time_period_milliseconds,
+            # "BLE Presence" stays Home if an advert was seen within this window (weak signal).
+            cv.Optional(CONF_PRESENCE_TIMEOUT, default="60s"): cv.positive_time_period_milliseconds,
+            # "interval" BLE Link Mode: how often to connect, refresh every sensor once, then release.
+            cv.Optional(CONF_LINK_INTERVAL, default="5min"): cv.positive_time_period_milliseconds,
+            # Compile-time default byte source for the OTA transfer (e.g. a local mirror). The
+            # runtime "OTA Source URL" text entity still overrides it. Default = GitHub.
+            cv.Optional(CONF_FIRMWARE_SOURCE): cv.string,
+            # TLS trust for the GitHub HTTPS requests, supplied from YAML instead of baked in:
+            #   use_cert_bundle → the ESP-IDF Mozilla bundle (auto-enables the sdkconfig option;
+            #     needs PSRAM headroom — the S3, not the classic);
+            #   ca_certificate  → explicit PEM root/chain; else the built-in GitHub roots are used.
+            cv.Optional(CONF_USE_CERT_BUNDLE, default=False): cv.boolean,
+            cv.Optional(CONF_CA_CERTIFICATE): cv.string,
+            # Case-insensitive substring an advertised BLE name must contain to count as a scooter
+            # for the `discovered_scooters` sensor / the HA integration's new-scooter picker.
+            cv.Optional(CONF_SCOOTER_FILTER, default="scooter"): cv.string,
         }
     )
     .extend(_ENTITY_SCHEMAS)
@@ -250,7 +282,18 @@ async def to_code(config):
 
     cg.add(var.set_stage_only(config[CONF_STAGE_ONLY]))
     cg.add(var.set_github_repo(config[CONF_GITHUB_REPO]))
+    if CONF_FIRMWARE_SOURCE in config:  # after set_github_repo (which sets the default source)
+        cg.add(var.set_firmware_source(config[CONF_FIRMWARE_SOURCE]))
+    cg.add(var.set_use_cert_bundle(config[CONF_USE_CERT_BUNDLE]))
+    if config[CONF_USE_CERT_BUNDLE]:
+        # Enabling the bundle option from YAML pulls in the Mozilla roots (no pinned cert needed).
+        esp32.add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)
+    if CONF_CA_CERTIFICATE in config:
+        cg.add(var.set_ca_certificate(config[CONF_CA_CERTIFICATE]))
+    cg.add(var.set_scooter_filter(config[CONF_SCOOTER_FILTER]))
     cg.add(var.set_update_check_interval(config[CONF_UPDATE_INTERVAL]))
+    cg.add(var.set_link_interval_ms(config[CONF_LINK_INTERVAL]))
+    cg.add(var.set_presence_timeout(config[CONF_PRESENCE_TIMEOUT]))
     if CONF_TIME_ID in config:
         cg.add(var.set_time(await cg.get_variable(config[CONF_TIME_ID])))
 
@@ -303,11 +346,15 @@ async def to_code(config):
         await cg.register_parented(lk, var)
         cg.add(var.set_scooter_lock(lk))
 
-    # --- update entity ---
-    if "update" in config:
-        up = await update.new_update(config["update"])
+    # --- update entities (one per board) ---
+    if "mdb_update" in config:
+        up = await update.new_update(config["mdb_update"])
         await cg.register_parented(up, var)
-        cg.add(var.set_update(up))
+        cg.add(var.set_mdb_update(up))
+    if "dbc_update" in config:
+        up = await update.new_update(config["dbc_update"])
+        await cg.register_parented(up, var)
+        cg.add(var.set_dbc_update(up))
 
 
 # ---------------------------------------------------------------------------

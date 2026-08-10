@@ -12,9 +12,13 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "sdkconfig.h"
 #include "esp_http_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+#include "esp_crt_bundle.h"
+#endif
 
 #include "github_ca.h"
 
@@ -28,6 +32,19 @@ static const char *comp_name(uint8_t c) { return c == 0x01 ? "DBC" : "MDB"; }
 static uint16_t u16le(const uint8_t *v) { return (uint16_t) v[0] | ((uint16_t) v[1] << 8); }
 static uint32_t rd_u32le(const uint8_t *v) {
   return (uint32_t) v[0] | ((uint32_t) v[1] << 8) | ((uint32_t) v[2] << 16) | ((uint32_t) v[3] << 24);
+}
+
+// TLS trust for the GitHub HTTPS requests, chosen from the YAML config. Single source of truth
+// used by both the update-check stream and the OTA asset resolve/download.
+void LibrescootBleClient::ota_http_tls_(esp_http_client_config_t *cfg) {
+#ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+  if (this->use_cert_bundle_) {
+    cfg->crt_bundle_attach = esp_crt_bundle_attach;  // ESP-IDF Mozilla bundle (enabled in YAML)
+    return;
+  }
+#endif
+  // Explicit PEM from YAML, or the two pinned GitHub roots as the built-in fallback default.
+  cfg->cert_pem = this->ca_cert_.empty() ? GITHUB_ROOTS : this->ca_cert_.c_str();
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +82,12 @@ void LibrescootBleClient::ota_start(const std::string &url, const std::string &s
   this->ota_last_report_ms_ = 0;
   this->ota_send_gap_ms_ = 6;  // start fast; back off adaptively on rewinds
   this->ota_producer_done_ = true;  // no producer yet
+  this->ota_install_pct_ = this->ota_install_sub_ = 0;
+  // Split the progress bar by time: upload (size / ~8 kB/s) vs the on-scooter install (~10 min).
+  {
+    uint32_t t_tx = size / 8000u;
+    this->ota_transfer_share_ = (float) t_tx / (float) (t_tx + 600u);
+  }
   if (this->ota_buf_ == nullptr || this->ota_cap_ == 0) {
     ESP_LOGW(OTAG, "no ring buffer (OTA disabled)");
     return;
@@ -77,7 +100,7 @@ void LibrescootBleClient::ota_start(const std::string &url, const std::string &s
   cp.min_int = 12;   // 15 ms
   cp.max_int = 24;   // 30 ms
   cp.latency = 0;
-  cp.timeout = 400;  // 4 s
+  cp.timeout = 800;  // 8 s supervision — tolerate brief dropouts at weak signal before the link dies
   esp_ble_gap_update_conn_params(&cp);
   memset(this->ota_sha_, 0, sizeof(this->ota_sha_));
   if (sha256_hex.size() == 64) {
@@ -99,12 +122,26 @@ void LibrescootBleClient::ota_start(const std::string &url, const std::string &s
 }
 
 void LibrescootBleClient::ota_user_abort() {
-  if (this->ota_state_ == OtaState::IDLE)
+  bool active = this->ota_state_ != OtaState::IDLE || this->ota_resolve_running_ ||
+                !this->ota_jobs_.empty() || this->ota_awaiting_version_;
+  if (!active)
     return;
   ESP_LOGW(OTAG, "user abort");
-  const uint8_t m[2] = {0x04, 0x00};  // ABORT, reason=user cancel
-  this->write_now_(CharId::OTA_CONTROL, m, sizeof(m));
-  this->ota_finish_(false);
+  bool was_awaiting = this->ota_awaiting_version_;
+  this->ota_jobs_.clear();               // don't start the next queued component (e.g. DBC)
+  this->ota_cancel_ = true;              // discard a resolve result that may still be in flight
+  this->ota_awaiting_version_ = false;   // stop waiting for the post-install reboot/version
+  if (this->ota_state_ != OtaState::IDLE) {
+    const uint8_t m[2] = {0x04, 0x00};   // ABORT, reason=user cancel
+    this->write_now_(CharId::OTA_CONTROL, m, sizeof(m));
+    this->ota_finish_(false);            // settles the update entity
+  } else {
+    // Nothing is transferring (resolve pending, or just waiting for the reboot) — reset locally
+    // without kicking off an online check; the scheduled check will re-evaluate later.
+    this->ota_settle_update_entity_();
+    if (this->ota_status_ != nullptr)
+      this->ota_status_->publish_state(was_awaiting ? "Install wait cancelled" : "Aborted");
+  }
 }
 
 void LibrescootBleClient::ota_send_start_() {
@@ -163,7 +200,7 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       this->ota_producer_run_ = true;
       this->ota_producer_done_ = false;
       this->ota_http_ok_ = false;
-      if (xTaskCreate(&LibrescootBleClient::ota_producer_task_, "librescoot_dl", 8192, this, 6, nullptr) != pdPASS) {
+      if (xTaskCreate(&LibrescootBleClient::ota_producer_task_, "librescoot_dl", 16384, this, 6, nullptr) != pdPASS) {
         this->ota_fail_("could not start download task");
         return;
       }
@@ -222,12 +259,22 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       }
       break;
     }
-    case 0x84:  // INSTALL_PROGRESS [phase][percent] — relayed by parse_ota_status_ to the text
-      if (len >= 3 && (x[1] == 0x02 || x[1] == 0x04 || x[1] == 0x05)) {
-        ESP_LOGI(OTAG, "install terminal phase 0x%02X", x[1]);
-        this->ota_finish_(x[1] != 0x05);
+    case 0x84: {  // INSTALL_PROGRESS [phase][percent] — text relayed by parse_ota_status_
+      if (len < 3)
+        break;
+      uint8_t phase = x[1], pct = x[2];
+      this->ota_state_ms_ = millis();  // progress arrived → reset the no-progress timeout
+      if (phase == 0x00 || phase == 0x01) {  // verify / install — two 0-100% sub-phases
+        if (this->ota_install_sub_ == 0 && this->ota_install_pct_ > 60 && pct + 30 < this->ota_install_pct_)
+          this->ota_install_sub_ = 1;  // percent dropped a lot → second sub-phase started
+        this->ota_install_pct_ = pct;
+        this->ota_install_progress_();
+      } else if (phase == 0x02 || phase == 0x04 || phase == 0x05) {
+        ESP_LOGI(OTAG, "install terminal phase 0x%02X", phase);
+        this->ota_finish_(phase != 0x05);
       }
       break;
+    }
     case 0x85:  // ABORT_ACK
       this->ota_finish_(false);
       break;
@@ -266,8 +313,10 @@ void LibrescootBleClient::ota_step_() {
         this->ota_fail_("COMPLETE_ACK timeout");
       break;
     case OtaState::INSTALLING:
-      if (now - this->ota_state_ms_ > 300000)
-        this->ota_fail_("install timeout");
+      // No-progress timeout: the on-scooter install can take ~10 min (verify + install), so only
+      // fail if NO INSTALL_PROGRESS arrives for a while (ota_state_ms_ is reset on each 0x84).
+      if (now - this->ota_state_ms_ > 180000)
+        this->ota_fail_("install stalled (no progress)");
       break;
     case OtaState::DONE:
     case OtaState::FAILED:
@@ -359,7 +408,7 @@ void LibrescootBleClient::ota_producer_() {
   esp_http_client_config_t cfg = {};
   cfg.url = this->ota_url_.c_str();
   if (this->ota_url_.rfind("https", 0) == 0)
-    cfg.cert_pem = GITHUB_ROOTS;
+    this->ota_http_tls_(&cfg);
   cfg.timeout_ms = 8000;
   cfg.buffer_size = 1024;
   cfg.buffer_size_tx = 512;
@@ -446,7 +495,7 @@ void LibrescootBleClient::ota_resolve_() {
 
   esp_http_client_config_t cfg = {};
   cfg.url = url.c_str();
-  cfg.cert_pem = GITHUB_ROOTS;
+  this->ota_http_tls_(&cfg);
   cfg.timeout_ms = 15000;
   cfg.buffer_size = 1024;
   cfg.buffer_size_tx = 512;
@@ -539,11 +588,48 @@ void LibrescootBleClient::ota_resolve_() {
 void LibrescootBleClient::ota_kick_next_job_() {
   if (this->ota_state_ != OtaState::IDLE || this->ota_jobs_.empty())
     return;
+  if (this->state() != espbt::ClientState::ESTABLISHED)
+    return;  // wait for the (re)connect — don't consume the job while disconnected
   OtaJob job = this->ota_jobs_.front();
   this->ota_jobs_.erase(this->ota_jobs_.begin());
+  this->ota_install_component_ = job.component;
+  this->ota_active_update_ = (job.component == 1) ? this->dbc_update_ : this->mdb_update_;
+  this->ota_current_job_ = job;         // keep it so a mid-transfer disconnect can resume it
+  this->ota_have_current_job_ = true;
   ESP_LOGI(OTAG, "install: starting %s (%s, %u B)", comp_name(job.component), job.bundle_id.c_str(),
            (unsigned) job.size);
   this->ota_start(job.url, job.sha, job.size, job.bundle_id, job.component);
+}
+
+// Map the on-scooter install (two 0-100% sub-phases) onto the second slice of the progress bar.
+void LibrescootBleClient::ota_install_progress_() {
+  float inst = (float) (this->ota_install_sub_ * 50) + (float) this->ota_install_pct_ / 2.0f;  // 0-100
+  if (inst > 100.0f)
+    inst = 100.0f;
+  float bar = this->ota_transfer_share_ * 100.0f + (1.0f - this->ota_transfer_share_) * inst;
+  if (this->ota_active_update_ != nullptr)
+    this->ota_active_update_->set_progress(bar);
+}
+
+// A BLE drop mid-OTA: during the transfer, re-queue the job so it resumes on reconnect; during
+// the install, the scooter finishes on its own, so just wait for the reboot + new version.
+void LibrescootBleClient::ota_handle_disconnect_() {
+  if (this->ota_state_ == OtaState::STARTING || this->ota_state_ == OtaState::STREAMING) {
+    this->ota_producer_run_ = false;
+    if (this->ota_have_current_job_ && ++this->ota_resume_count_ <= 40) {
+      ESP_LOGW(OTAG, "link dropped mid-transfer — will resume on reconnect (#%d)", this->ota_resume_count_);
+      this->ota_jobs_.insert(this->ota_jobs_.begin(), this->ota_current_job_);  // resume this one first
+      this->ota_set_state_(OtaState::IDLE);  // ota_kick_next_job_ re-runs it once reconnected
+      if (this->ota_status_ != nullptr)
+        this->ota_status_->publish_state("Uploading — reconnecting…");
+    } else {
+      this->ota_fail_("too many reconnects");
+    }
+  } else if (this->ota_state_ == OtaState::COMPLETING || this->ota_state_ == OtaState::INSTALLING) {
+    ESP_LOGW(OTAG, "link dropped during install — the scooter finishes on its own");
+    this->ota_begin_await_version_();
+    this->ota_set_state_(OtaState::IDLE);
+  }
 }
 
 void LibrescootBleClient::ota_set_state_(OtaState s) {
@@ -574,17 +660,19 @@ void LibrescootBleClient::ota_progress_() {
     return;
 
   float pct = 100.0f * (float) this->ota_acked_ / (float) this->ota_total_;
-  if (this->update_ != nullptr)
-    this->update_->set_progress(pct);
+  if (this->ota_active_update_ != nullptr)
+    this->ota_active_update_->set_progress(this->ota_transfer_share_ * pct);  // upload = first slice
 
   // ETA from the rate actually achieved this session (bytes moved since the resume offset).
+  // Wait for a couple of seconds and >2% of real data before estimating, or the first sample
+  // (a single chunk) produces a nonsense hour-long guess.
   char eta[12] = "--:--:--";
   if (final) {
     strncpy(eta, "00:00:00", sizeof(eta));
   } else if (this->ota_start_ms_ != 0 && this->ota_acked_ > this->ota_resume_) {
     uint32_t dt = millis() - this->ota_start_ms_;
     uint32_t moved = this->ota_acked_ - this->ota_resume_;
-    if (dt > 500 && moved > 0) {
+    if (dt > 3000 && moved > this->ota_total_ / 50) {
       float bps = (float) moved * 1000.0f / (float) dt;  // bytes/sec
       uint32_t secs = (uint32_t) ((float) (this->ota_total_ - this->ota_acked_) / bps);
       snprintf(eta, sizeof(eta), "%02u:%02u:%02u", (unsigned) (secs / 3600),
@@ -595,9 +683,9 @@ void LibrescootBleClient::ota_progress_() {
     this->ota_eta_->publish_state(eta);
 
   if (this->ota_status_ != nullptr) {
-    char b[48];
-    snprintf(b, sizeof(b), "Transferring %.0f%% (%u/%u)", pct, (unsigned) this->ota_acked_,
-             (unsigned) this->ota_total_);
+    char b[56];
+    snprintf(b, sizeof(b), "Uploading %s %.0f%% (%u/%u)", comp_name(this->ota_component_), pct,
+             (unsigned) this->ota_acked_, (unsigned) this->ota_total_);
     this->ota_status_->publish_state(b);
   }
   ESP_LOGI(OTAG, "%s %.0f%% (%u/%u) ETA %s", comp_name(this->ota_component_), pct,
@@ -625,9 +713,33 @@ void LibrescootBleClient::ota_finish_(bool ok) {
   }
   if (this->ota_eta_ != nullptr)
     this->ota_eta_->publish_state(ok ? "00:00:00" : "--:--:--");
-  if (this->update_ != nullptr)
-    this->update_->clear_progress(false);
+
+  if (!ok)
+    this->ota_jobs_.clear();  // a failure or abort stops the whole MDB+DBC sequence
+
+  if (ok && !this->ota_jobs_.empty()) {
+    // More components queued (DBC after MDB) — keep the progress bar; the next one starts.
+  } else if (ok && !this->stage_only_) {
+    // Last component's install is queued — keep "installing" until the scooter reboots into the
+    // new version (or the user aborts the wait).
+    this->ota_begin_await_version_();
+  } else {
+    // Failed, aborted, or stage-only complete — settle the entity from the versions we know
+    // (no online check; the scheduled check runs on its own timer).
+    this->ota_settle_update_entity_();
+  }
   this->ota_set_state_(ok ? OtaState::DONE : OtaState::FAILED);
+}
+
+void LibrescootBleClient::ota_begin_await_version_() {
+  this->ota_awaiting_version_ = true;
+  this->ota_await_tag_ = this->rs_tag_;
+  this->ota_await_until_ms_ = millis() + 30UL * 60 * 1000;  // safety cap; user can abort sooner
+  if (this->ota_active_update_ != nullptr)
+    this->ota_active_update_->set_progress(100.0f);  // stay in "installing" until the reboot confirms
+  if (this->ota_status_ != nullptr)
+    this->ota_status_->publish_state("Installing — waiting for scooter reboot…");
+  ESP_LOGI(OTAG, "install queued; awaiting reboot into %s", this->ota_await_tag_.c_str());
 }
 
 }  // namespace librescoot_ble_client
