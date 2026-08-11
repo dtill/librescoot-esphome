@@ -129,10 +129,20 @@ librescoot_ble_client:
   id: librescoot_ble_client_hub
   mac_address: ${ble_mac}
   time_id: sntp_time
-  # --- optional OTA settings (defaults shown) ---
+  # --- OTA settings ---------------------------------------------------------
+  # Autonomous, no Home Assistant relay: the S3 has the PSRAM headroom to do the RSA-4096 CDN
+  # TLS handshake, so it downloads firmware straight from GitHub. use_cert_bundle validates
+  # api.github.com + objects.githubusercontent.com against the Mozilla roots (auto-enables the
+  # CONFIG_MBEDTLS_CERTIFICATE_BUNDLE sdkconfig) — no pinned cert baked into the component.
+  use_cert_bundle: true
+  # Test board: stop every transfer before COMPLETE, so nothing is actually installed. Flip to
+  # false for a real install.
+  stage_only: false
+  # ca_certificate: |                      # alternative to the bundle: explicit PEM root(s)
+  #   -----BEGIN CERTIFICATE----- ...
+  # firmware_source: "http://192.168.178.71:8000"   # compile-time default byte source (mirror)
   # github_repo: "librescoot/librescoot"   # owner/name the firmware releases come from
   # update_check_interval: 6h              # how often to poll GitHub for a newer release
-  # stage_only: false                      # true = transfers stop before COMPLETE (no install)
 
   # ----- Telemetry (read) ----------------------------------------------------
   status:
@@ -288,6 +298,10 @@ librescoot_ble_client:
   # (complete .mender image, hundreds of MB — an overnight transfer on this hardware).
   ota_update_method:
     name: "OTA Update Method"
+  # OTA byte source: "direct GitHub" (this ESP fetches from GitHub itself) or "HA relay" (Home
+  # Assistant serves the bytes). Default is chip-based (this S3 → direct GitHub); persisted in NVS.
+  ota_source:
+    name: "OTA Source"
 
   # ----- System, time & diagnostics ------------------------------------------
   system_time_sync:

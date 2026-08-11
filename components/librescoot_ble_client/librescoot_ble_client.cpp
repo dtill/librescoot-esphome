@@ -290,6 +290,16 @@ void LibrescootBleClient::setup() {
   if (this->ota_source_url_text_ != nullptr)
     this->ota_source_url_text_->publish_state(this->ota_source_url_);
 
+  // OTA byte source mode (github/relay): NVS-persisted; else the compile-time default (chip-based or
+  // YAML `ota_source:`). github mode reconstructs the URL from github_base_(); relay keeps the
+  // persisted/integration URL restored just above.
+  this->ota_source_pref_ = global_preferences->make_preference<uint8_t>(fnv1_hash("librescoot_ble_client_ota_source"));
+  uint8_t osv;
+  std::string osmode = this->ota_source_default_;
+  if (this->ota_source_pref_.load(&osv))
+    osmode = osv ? "github" : "relay";
+  this->apply_ota_source_(osmode, false);  // don't re-persist on boot
+
   // Reachability of the HA-integration relay runs on the scheduler, not loop(): BLEClientBase
   // disables our loop() whenever the BLE link is idle, but this check must keep working then.
   this->set_interval("hi_check", 5000, [this]() { this->service_integration_check_(); });
@@ -465,6 +475,18 @@ void LibrescootBleClient::loop() {
       if (this->reboot_required_ != nullptr)
         this->reboot_required_->publish_state(true);
       ESP_LOGW(TAG, "scooter pending-reboot for >20 min — manual restart may be needed");
+    }
+  }
+
+  // If the OTA phase never resolved (0xFF) — e.g. the on-connect STATUS_REQ was missed on a flaky
+  // link — keep asking every 15 s while connected. Otherwise the idle-gate stays shut and a real,
+  // available update is never offered until someone presses STATUS_REQ by hand.
+  if (this->ota_scooter_phase_ == 0xFF && this->state() == espbt::ClientState::ESTABLISHED &&
+      this->find_char_(CharId::OTA_CONTROL) != nullptr) {
+    if (this->ota_status_retry_ms_ == 0 || now - this->ota_status_retry_ms_ >= 15000) {
+      this->ota_status_retry_ms_ = now;
+      const uint8_t d[] = {0x05};  // STATUS_REQ — read-only
+      this->write_raw_(CharId::OTA_CONTROL, d, sizeof(d));
     }
   }
 
@@ -824,6 +846,7 @@ void LibrescootBleClient::on_connected_() {
   if (this->find_char_(CharId::OTA_CONTROL) != nullptr) {
     const uint8_t d[] = {0x05};  // STATUS_REQ
     this->write_raw_(CharId::OTA_CONTROL, d, sizeof(d));
+    this->ota_status_retry_ms_ = millis();  // first unknown-phase retry waits 15 s after this one
   }
 
   // Queue the read-only on-connect queries (only those with a target entity).
@@ -985,9 +1008,14 @@ void LibrescootBleClient::handle_char_value_(CharId id, uint8_t *v, uint16_t len
       std::string s = clean_str_(v, len);
       if (this->status_ != nullptr)
         this->status_->publish_state(s);
-      if (this->scooter_lock_ != nullptr && millis() >= this->lock_suppress_until_)
-        this->scooter_lock_->publish_state(s == "ready-to-drive" ? lock::LOCK_STATE_UNLOCKED
-                                                                  : lock::LOCK_STATE_LOCKED);
+      if (this->scooter_lock_ != nullptr && millis() >= this->lock_suppress_until_) {
+        // Reflect the lock from the operating state only: "parked" and "ready-to-drive" are
+        // UNLOCKED; "hibernating"/"booting"/"stand-by"/"hop-on" (and anything else, incl. unknown)
+        // are LOCKED. Handlebar lock is NOT a reliable proxy (it can be open in stand-by).
+        bool unlocked = (s == "ready-to-drive" || s == "parked");
+        this->scooter_lock_->publish_state(unlocked ? lock::LOCK_STATE_UNLOCKED
+                                                     : lock::LOCK_STATE_LOCKED);
+      }
       break;
     }
     case CharId::CMD_RESPONSE: {
@@ -1306,6 +1334,25 @@ void LibrescootBleClient::apply_link_state_() {
   this->set_enabled(want);
 }
 
+void LibrescootBleClient::apply_ota_source_(const std::string &mode, bool persist) {
+  this->ota_source_mode_ = (mode == "github") ? "github" : "relay";
+  if (this->ota_source_mode_ == "github") {
+    // github mode owns the URL — point it straight at the GitHub download base.
+    this->ota_source_url_ = this->github_base_();
+    if (this->ota_source_url_text_ != nullptr)
+      this->ota_source_url_text_->publish_state(this->ota_source_url_);
+  }
+  // relay mode: leave ota_source_url_ as the HA integration set it (persisted / re-pushed).
+  if (this->ota_source_select_ != nullptr)
+    this->ota_source_select_->publish_state(this->ota_source_mode_ == "github" ? "direct GitHub" : "HA relay");
+  if (persist) {
+    uint8_t v = (this->ota_source_mode_ == "github") ? 1 : 0;
+    this->ota_source_pref_.save(&v);
+  }
+  this->hi_next_check_ms_ = millis();  // re-evaluate relay reachability for the new source
+  ESP_LOGI(TAG, "OTA byte source = %s (%s)", this->ota_source_mode_.c_str(), this->ota_source_url_.c_str());
+}
+
 void LibrescootBleClient::save_link_mode_() {
   uint8_t idx = 2;
   if (this->link_mode_str_ == "disconnect")
@@ -1595,8 +1642,10 @@ void LibrescootBleClient::github_fetch_() {
     int mode = 0;  // 0 idle, 1 capturing tag, 2 capturing body
     bool esc = false; int uskip = 0;
     std::string cur_tag, cur_body;
-    const size_t MAX_REL = 8, PER_BODY = 400;
-    this->github_http_stream_(base + "?per_page=30", [&](char ch) {
+    // Capture enough releases to cover a large multi-hop jump so NO intermediate version's changelog
+    // is dropped (a small MAX_REL silently hid the oldest skipped releases entirely).
+    const size_t MAX_REL = 40, PER_BODY = 400;
+    this->github_http_stream_(base + "?per_page=40", [&](char ch) {
       if (mode == 1) {  // tags have no escapes
         if (ch == '"') mode = 0; else cur_tag += ch;
         return;
@@ -1638,7 +1687,9 @@ void LibrescootBleClient::github_fetch_() {
       for (auto *r : inc) summary += "• " + r->tag + "\n";
       for (auto *r : inc) {
         summary += "\n### " + r->tag + "\n" + r->body + "\n";
-        if (summary.size() > 2400) { summary += "\n…"; break; }
+        // Generous total cap so every skipped release's changelog is included on a multi-hop jump
+        // (the bullet list above always lists ALL versions regardless; this bounds the bodies).
+        if (summary.size() > 7000) { summary += "\n…"; break; }
       }
     }
   }
@@ -1938,6 +1989,12 @@ void LibrescootBleClient::on_select(LibrescootSelect *sel, const std::string &va
       this->ota_method_str_ = value;
       sel->publish_state(value);
       break;
+    case SelKind::OTA_SOURCE:
+      // Byte source for the OTA download: "direct GitHub" (the ESP fetches from GitHub itself) or
+      // "HA relay" (the Home Assistant integration serves the bytes over plain HTTP). apply_ota_source_
+      // publishes the select + persists the mode; in github mode it also points the URL at GitHub.
+      this->apply_ota_source_(value == "direct GitHub" ? "github" : "relay", true);
+      break;
   }
 }
 
@@ -1988,6 +2045,14 @@ void LibrescootBleClient::on_text(TxtKind k, const std::string &value) {
         this->pm_duration_text_->publish_state(value);
       break;
     case TxtKind::OTA_SOURCE_URL: {
+      // In "direct GitHub" mode the OTA Source select owns the URL — ignore external writes (e.g. a
+      // racing/stale HA-relay push) and reflect the real GitHub URL back, so mode and URL never
+      // disagree. Only "HA relay" mode accepts an integration-supplied URL.
+      if (this->ota_source_mode_ == "github") {
+        if (this->ota_source_url_text_ != nullptr && value != this->ota_source_url_)
+          this->ota_source_url_text_->publish_state(this->ota_source_url_);
+        break;
+      }
       this->ota_source_url_ = value;
       if (this->ota_source_url_text_ != nullptr)
         this->ota_source_url_text_->publish_state(value);

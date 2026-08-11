@@ -35,7 +35,7 @@ enum class BtnAction : uint8_t {
   ALARM_START, ALARM_STOP, NAV_CLEAR, CANCEL_HIBERNATE, REFRESH, OTA_MDB_UPDATE, OTA_DBC_UPDATE,
   PAIR,
 };
-enum class SelKind : uint8_t { BLINKER, USB_MODE, LINK_MODE, OTA_CHANNEL, OTA_METHOD };
+enum class SelKind : uint8_t { BLINKER, USB_MODE, LINK_MODE, OTA_CHANNEL, OTA_METHOD, OTA_SOURCE };
 enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, PM_SCHED_HIB };
 enum class TxtKind : uint8_t {
   COMMAND, NAV_DEST, CELLULAR_APN, PM_CRON, PM_DURATION, SYSTIME_ISO, OTA_SOURCE_URL, OTA_VERSION
@@ -219,6 +219,10 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void set_link_mode(LibrescootSelect *s) { link_mode_ = s; }
   void set_ota_channel(LibrescootSelect *s) { ota_channel_ = s; }
   void set_ota_method(LibrescootSelect *s) { ota_method_ = s; }
+  void set_ota_source_select(LibrescootSelect *s) { ota_source_select_ = s; }
+  // Compile-time default OTA byte source ("github" = direct GitHub, "relay" = HA integration relay).
+  // Codegen picks it by chip (S3 → github, else relay) unless the YAML sets ota_source:.
+  void set_ota_source_default(const std::string &m) { this->ota_source_default_ = m; }
 
   void set_alarm_enabled(LibrescootSwitch *s) { alarm_enabled_ = s; }
   void set_alarm_armed(LibrescootSwitch *s) { alarm_armed_ = s; }
@@ -446,6 +450,15 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
 
   LibrescootSelect *blinker_{nullptr}, *usb_mode_{nullptr}, *link_mode_{nullptr}, *ota_channel_{nullptr};
   LibrescootSelect *ota_method_{nullptr};
+  LibrescootSelect *ota_source_select_{nullptr};
+  // OTA byte source: "github" (direct) or "relay" (HA integration). Persisted in NVS; the select,
+  // the YAML default and the HA config flow all set it. github mode owns ota_source_url_ (= the
+  // github base); relay mode expects the HA integration to set the URL.
+  std::string ota_source_mode_{"relay"};
+  std::string ota_source_default_{"relay"};
+  ESPPreferenceObject ota_source_pref_;
+  std::string github_base_() const { return "https://github.com/" + this->github_repo_ + "/releases/download"; }
+  void apply_ota_source_(const std::string &mode, bool persist);  // set mode → url, publish, persist
   std::string ota_method_str_{"delta"};  // delta (default) or full (.mender image)
   LibrescootSwitch *alarm_enabled_{nullptr}, *alarm_armed_{nullptr}, *pm_sched_hib_{nullptr};
   text::Text *command_text_{nullptr}, *apn_text_{nullptr}, *pm_cron_text_{nullptr}, *pm_duration_text_{nullptr};
@@ -529,6 +542,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   // offered when this is 0x06 (idle); any other value — including unknown — suppresses them and
   // shows the ongoing status instead. Requested via STATUS_REQ on every connect.
   uint8_t ota_scooter_phase_{0xFF};
+  uint32_t ota_status_retry_ms_{0};  // re-ask STATUS_REQ while the phase is still unknown (0xFF)
   // Stuck-pending-reboot watchdog: when the phase has been pending-reboot (0x02) continuously for
   // >20 min, raise reboot_required_ so the HA integration can offer a manual restart. Re-requests
   // STATUS_REQ every 30 s while pending so a clear (or a genuinely-needed reboot) is caught.

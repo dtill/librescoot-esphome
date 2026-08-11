@@ -2,7 +2,7 @@
 ESPHome Components and configurations for "UNU Scooter Pro" with opensource [Librescoot Firmware](https://github.com/librescoot)
 
 
-- [MDB nRF-BLE-Client](#mdb-nrf-ble-client)
+- [BLE-Client](#ble-client)
     - [Pairing ESP32 with Scooter Pro nRF via ESPHome BLE](#pairing-esp32-with-scooter-pro-nrf-via-esphome-ble)
     - [Using the Extended Command](#using-the-extended-command)
     - [Exposed Entities](#exposed-entities)
@@ -26,15 +26,13 @@ ESPHome Components and configurations for "UNU Scooter Pro" with opensource [Lib
 
 ## Example .yaml files:
 
-### [MDB nRF-BLE-Client](librescoot-nrf-ble-client-example.yaml)
+### [BLE-Client](librescoot-ble-client-example.yaml)
 
 **Component edition.** BLE interface for the Unu-Scooter Pro (Librescoot FW, nRF >v2.0.0-ls),
 built as the [`librescoot_ble_client`](components/librescoot_ble_client/) external component.
-Where the [standalone edition](librescoot-ble-client-minimal-example.yaml) wires ~25 `ble_client` characteristic
-sensors and template entities together in YAML, this edition puts all of that — the BLE
+This edition puts all the BLE
 client, the passkey pairing, every characteristic parser, the extended-command engine, the
-BLE link manager and the OTA-status diagnostics — into one C++ component. **The YAML only
-names the entities it wants.** Same functionality, a fraction of the YAML.
+BLE link manager and the OTA-status diagnostics — into one C++ component. 
 More info about the characteristics at [LibreScoot Tech Reference - Bluetooth Interface Documentation](https://reference.librescoot.org/dev/bluetooth/)
 
 ```yaml

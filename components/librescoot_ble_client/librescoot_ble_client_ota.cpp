@@ -410,8 +410,12 @@ void LibrescootBleClient::ota_producer_() {
   if (this->ota_url_.rfind("https", 0) == 0)
     this->ota_http_tls_(&cfg);
   cfg.timeout_ms = 8000;
-  cfg.buffer_size = 1024;
-  cfg.buffer_size_tx = 512;
+  cfg.buffer_size = 4096;  // RX: response headers/data (CDN headers are modest)
+  // TX buffer holds the request LINE ("GET <path>?<query> HTTP/1.1"). After GitHub's 302 the CDN URL
+  // is a long signed objects.githubusercontent.com URL (~1 KB of X-Amz-* query), so the default 512
+  // overflows and esp_http_client fails the request with "Out of buffer" — that was the real cause of
+  // the failed direct download (the metadata fetch has short api.github.com URLs, so it was fine).
+  cfg.buffer_size_tx = 4096;
   esp_http_client_handle_t c = esp_http_client_init(&cfg);
   esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
   char range[48];

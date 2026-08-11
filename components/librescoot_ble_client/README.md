@@ -60,6 +60,8 @@ librescoot_ble_client:
 | `update_check_interval` | time, `6h` | How often to poll GitHub for a newer release. |
 | `stage_only` | bool, `false` | `true` = every transfer stops before `COMPLETE` (nothing installed). |
 | `presence_timeout` | time, `60s` | **BLE Presence** stays Home if an advert was seen within this window. |
+| `link_interval` | time, `5min` | For the **`interval`** BLE Link Mode: how often to connect, refresh every sensor once, then release the link again. |
+| `ota_source_default` | `github` / `relay`, optional | Default OTA byte source. Omitted → **chip-based** (ESP32-S3 → `github`, every other chip → `relay`). The runtime **OTA Source** select overrides it and is persisted in NVS. |
 | `use_cert_bundle` | bool, `false` | Validate GitHub HTTPS against the ESP-IDF **Mozilla bundle** instead of the pinned roots (auto-enables `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`). Use on **PSRAM boards** for autonomous direct-GitHub downloads. |
 | `ca_certificate` | string, optional | Explicit PEM root/chain for GitHub HTTPS (alternative to the bundle). |
 | `firmware_source` | string, optional | Compile-time default byte source (e.g. a local mirror); the **OTA Source URL** entity still overrides at runtime. |
@@ -168,10 +170,27 @@ and every polled characteristic is read once immediately on connect.
 | :--- | :--- | :--- | :--- | :--- |
 | `ble_connection` | BLE Connection | binary_sensor | 1 s | Connected to the scooter. |
 | `ble_presence` | BLE Presence | binary_sensor | 1 s | Connected, or advertisement seen while scanning. |
-| `rssi` | BLE RSSI | sensor (dBm) | 60 s | Link signal strength. |
-| `ble_link_mode` | BLE Link Mode | select | — | `disconnect` / `scan` / `auto` / `always`; persisted across reboots. Any OTA in progress pins the link up. |
+| `rssi` | BLE RSSI | sensor (dBm) | live | Signal to the configured scooter. **Also updated while disconnected** — the advertisement RSSI is published (throttled) so you can see whether the scooter is in range before/without a connection (the connection-RSSI read only works while connected). |
+| `ble_link_mode` | BLE Link Mode | select | — | `disconnect` / `scan` / `auto` / `always` / `interval`; persisted across reboots. Any OTA in progress pins the link up. See **Link modes** below. |
+| `pairing_required` | Pairing Required | binary_sensor (problem) | 2 s | **Tri-state.** `OK` **only while a connection is established** (an encrypted link is the sole proof of a valid bond); `Problem` while the configured scooter is **in range but not bonded** (an unrequested re-pair was refused — e.g. a firmware update reset the bond); `unknown` otherwise (out of range, or not connected yet). It is never a reassuring `OK` until the link is actually up. Drives the HA pairing Repair. |
+| `passkey_required` | Passkey Required | binary_sensor (problem) | event | On while the scooter is displaying a passkey during an **armed** pairing (after **Pair Scooter**). |
 | `scooter_mac` | Scooter MAC | text_sensor | on boot | The scooter MAC this ESP is configured for (`mac_address`), always shown — the HA integration reads it to preselect the connected scooter. |
 | `ha_integration` | HA Integration | binary_sensor (connectivity) | 60 s | On = the Home Assistant **Librescoot-BLE-Client integration is active**, detected by pinging its plain-HTTP OTA relay (the `http://` OTA Source URL it sets). Off = no relay (autonomous/direct-GitHub, or the integration isn't installed). |
+
+**Link modes** (`ble_link_mode`):
+
+| Mode | Behaviour |
+| :--- | :--- |
+| `disconnect` | Stay disconnected. |
+| `scan` | Stay disconnected and scan for scooter advertisements (used by the HA "find scooter" flow). |
+| `auto` | Stay connected, but release the link for ~20 s after each disconnect so a phone app can take over. |
+| `always` | Stay connected; reconnect immediately. |
+| `interval` | Stay disconnected, but every `link_interval` (default **5 min**) connect, refresh **every** sensor once, then release the link again — low duty cycle, periodic fresh readings. |
+
+The component **never pairs unprompted.** A valid bond reconnects silently; a lost/stale bond
+(unrequested pairing) is refused and the link released rather than retried, so a scooter returning
+to range is never spammed with pairing requests. Fresh pairing is only ever triggered by the
+**Pair Scooter** button (or the HA pairing Repair).
 
 **OTA byte-source capability.** The component decides whether an OTA can even start: a plain-HTTP
 source (the HA relay, or a local mirror) must be **reachable** (the `ha_integration` ping); an
@@ -196,7 +215,7 @@ again. Optimistic UI state updates immediately; the BLE write follows on connect
 
 | Key | Entity | Type | Description |
 | :--- | :--- | :--- | :--- |
-| `scooter_lock` | Scooter Lock | lock | Lock = `stand-by`, unlock = `ready-to-drive`; reflected from operating state, defaults LOCKED. |
+| `scooter_lock` | Scooter Lock | lock | Reflected from the operating state (`9a590021`): **UNLOCKED** for `parked`/`ready-to-drive`, **LOCKED** for everything else (`hibernating`/`booting`/`stand-by`/`hop-on`, unknown). Defaults LOCKED; never auto-unlocks (security). |
 | `blinker` | Blinker | select | `off` / `left` / `right` / `both`. |
 | `usb_mode` | USB Mode | select | `Normal` / `Mass Storage`, reflected from UMS status. |
 | `seatbox_open` | Seatbox Open | button | Open the seatbox. |
@@ -273,7 +292,8 @@ single BLE session cannot flash both back-to-back. The component therefore expos
 | `ota_dbc_update` | OTA DBC Install | button | Manual DBC install — **always** works, ignores the availability gate. |
 | `ota_version` | OTA Version | text | Optional target tag (e.g. `nightly-20260803T062157`); empty = channel default. |
 | `ota_update_method` | OTA Update Method | select | `delta` (small patch, default) or `full` (complete `.mender`, hundreds of MB). |
-| `ota_source_url` | OTA Source URL | text | Byte source for the transfer (default GitHub; a local mirror drops TLS — see below). |
+| `ota_source` | OTA Source | select | **`direct GitHub`** (the ESP fetches from GitHub itself) or **`HA relay`** (the Home Assistant integration serves the bytes). Default is chip-based (`ota_source_default`), persisted in NVS. In `direct GitHub` mode the ESP owns the **OTA Source URL** (it ignores external writes); in `HA relay` mode the integration sets it. |
+| `ota_source_url` | OTA Source URL | text | Effective byte source URL for the transfer, driven by the **OTA Source** select (or a local mirror). |
 
 #### The update check
 
@@ -310,7 +330,10 @@ while the scooter's OTA phase is `idle` (`0x06`). Any other phase — "unknown" 
 first `STATUS_REQ` reply) or "pending reboot" after an install — hides the offer. Because Home
 Assistant derives "update available" purely from `latest_version != installed_version`, the
 entity publishes `latest == installed` to hide it; the live phase/percent still shows in the
-**OTA Status** text. A `STATUS_REQ` is sent on every connect so the phase is known.
+**OTA Status** text. A `STATUS_REQ` is sent on every connect so the phase is known — and if that
+reply is missed (e.g. a flaky link) so the phase stays `unknown`, it is **re-requested every 15 s
+while connected** until it resolves, so a genuinely available update isn't left hidden behind a
+stuck `unknown` phase.
 
 An **`unknown` installed version is never offered an update.** In stand-by the scooter reports
 `status:version:dbc:unknown` (the dashboard is off), so the DBC's installed version reads
@@ -377,9 +400,13 @@ onto a road vehicle is a deliberate act.
 
 **Direct GitHub download needs an S3+PSRAM board.** On the ESP32-classic the RSA-4096 handshake
 to `objects.githubusercontent.com` runs out of contiguous heap while BLE is active
-(`api.github.com` metadata uses ECC and is fine). Point **`OTA Source URL`** at a local HTTP
-mirror to drop TLS from the bulk download — faster (~2×), reliable (0 rewinds), and the
-recommended path on the classic. Metadata (size/SHA) always still comes from the GitHub API.
+(`api.github.com` metadata uses ECC and is fine). On the **S3 with PSRAM** the bulk `.mender` download runs **directly from GitHub**: it follows the
+`302` from `github.com` to the signed `objects.githubusercontent.com` CDN URL and streams the bytes
+(the HTTP client's TX buffer is sized for that long signed URL). Measured ≈ 5 kB/s over BLE at weak
+signal — the BLE link is the bottleneck, not the download. On the **classic**, direct GitHub is not
+possible (the RSA-4096 CDN handshake runs out of contiguous heap while BLE is active), so point
+**`OTA Source URL`** at the **Home Assistant relay** or a local HTTP mirror. Metadata (size/SHA)
+always comes from the GitHub API on both boards.
 
 ```bash
 mkdir -p mirror/<tag> && cd mirror

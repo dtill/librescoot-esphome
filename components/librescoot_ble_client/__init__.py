@@ -80,6 +80,8 @@ CONF_PRESENCE_TIMEOUT = "presence_timeout"
 CONF_GITHUB_REPO = "github_repo"
 CONF_UPDATE_INTERVAL = "update_check_interval"
 CONF_LINK_INTERVAL = "link_interval"
+# DEFAULT OTA byte source ("github"/"relay"); distinct key from the `ota_source` select entity.
+CONF_OTA_SOURCE_DEFAULT = "ota_source_default"
 CONF_FIRMWARE_SOURCE = "firmware_source"
 CONF_CA_CERTIFICATE = "ca_certificate"
 CONF_USE_CERT_BUNDLE = "use_cert_bundle"
@@ -150,6 +152,7 @@ SELECTS = {
     "ble_link_mode": ("set_link_mode", SelKind.LINK_MODE, ["disconnect", "scan", "auto", "always", "interval"], "diagnostic", "mdi:bluetooth-connect"),
     "ota_channel": ("set_ota_channel", SelKind.OTA_CHANNEL, ["undefined", "stable", "testing", "nightly"], "diagnostic", "mdi:update"),
     "ota_update_method": ("set_ota_method", SelKind.OTA_METHOD, ["delta", "full"], "diagnostic", "mdi:package-variant"),
+    "ota_source": ("set_ota_source_select", SelKind.OTA_SOURCE, ["HA relay", "direct GitHub"], "config", "mdi:cloud-download"),
 }
 
 SWITCHES = {
@@ -248,6 +251,8 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PRESENCE_TIMEOUT, default="60s"): cv.positive_time_period_milliseconds,
             # "interval" BLE Link Mode: how often to connect, refresh every sensor once, then release.
             cv.Optional(CONF_LINK_INTERVAL, default="5min"): cv.positive_time_period_milliseconds,
+            # OTA byte source default. Omitted → chip-based (ESP32-S3 → direct GitHub, else HA relay).
+            cv.Optional(CONF_OTA_SOURCE_DEFAULT): cv.one_of("github", "relay", lower=True),
             # Compile-time default byte source for the OTA transfer (e.g. a local mirror). The
             # runtime "OTA Source URL" text entity still overrides it. Default = GitHub.
             cv.Optional(CONF_FIRMWARE_SOURCE): cv.string,
@@ -282,6 +287,16 @@ async def to_code(config):
 
     cg.add(var.set_stage_only(config[CONF_STAGE_ONLY]))
     cg.add(var.set_github_repo(config[CONF_GITHUB_REPO]))
+    # OTA byte source DEFAULT: YAML `ota_source:` wins; else chip-based — ESP32-S3 (PSRAM, can do the
+    # GitHub-CDN TLS) defaults to direct GitHub, every other chip defaults to the HA relay.
+    if CONF_OTA_SOURCE_DEFAULT in config:
+        _ota_src_default = config[CONF_OTA_SOURCE_DEFAULT]
+    else:
+        try:
+            _ota_src_default = "github" if esp32.get_esp32_variant() == "ESP32S3" else "relay"
+        except Exception:  # noqa: BLE001 - be safe if the variant can't be determined
+            _ota_src_default = "relay"
+    cg.add(var.set_ota_source_default(_ota_src_default))
     if CONF_FIRMWARE_SOURCE in config:  # after set_github_repo (which sets the default source)
         cg.add(var.set_firmware_source(config[CONF_FIRMWARE_SOURCE]))
     cg.add(var.set_use_cert_bundle(config[CONF_USE_CERT_BUNDLE]))
