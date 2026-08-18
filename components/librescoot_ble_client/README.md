@@ -18,9 +18,10 @@ Protocol reference: <https://reference.librescoot.org/latest/bluetooth/>
 ```yaml
 external_components:
   - source:
-      type: local
-      path: my_components          # directory containing librescoot_ble_client/
+      type: git
+      url: https://github.com/dtill/librescoot-esphome
     components: [librescoot_ble_client]
+    refresh: 0s
 ```
 
 ### Required BLE plumbing (stack-level, stays in YAML)
