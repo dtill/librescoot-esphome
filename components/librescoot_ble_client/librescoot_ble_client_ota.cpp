@@ -50,6 +50,14 @@ void LibrescootBleClient::ota_http_tls_(esp_http_client_config_t *cfg) {
 // ---------------------------------------------------------------------------
 // entry points
 // ---------------------------------------------------------------------------
+// Self-heal bounds: a recoverable transfer-phase failure (rewinds/stall/timeout) auto-resumes from
+// the staged offset after a backoff, instead of aborting the whole update. The consecutive count is
+// bounded so a truly dead link eventually gives up, but it resets after real forward progress, so a
+// long transfer over a flaky link keeps healing as long as it keeps moving.
+static constexpr uint16_t OTA_SELFHEAL_MAX = 30;              // consecutive auto-resumes before giving up
+static constexpr uint32_t OTA_SELFHEAL_BACKOFF_MS = 15000;    // wait between auto-resumes (avoid hot-loop)
+static constexpr uint32_t OTA_SELFHEAL_PROGRESS_RESET = 262144;  // 256 KB of new data clears the count
+
 void LibrescootBleClient::ota_start(const std::string &url, const std::string &sha256_hex, uint32_t size,
                                 const std::string &bundle_id, uint8_t component) {
   if (this->ota_state_ != OtaState::IDLE) {
@@ -78,6 +86,9 @@ void LibrescootBleClient::ota_start(const std::string &url, const std::string &s
   this->ota_rewinds_ = 0;
   this->ota_congested_ = false;
   this->ota_sent_ = this->ota_acked_ = this->ota_produced_ = 0;
+  this->ota_rate_ms_ = 0;  // re-baseline the throughput sensors on the first streaming tick
+  this->ota_ul_ema_bpms_ = 0;  // reset the ETA's smoothed upload rate for the new/resumed transfer
+  this->ota_log_ms_ = 0;       // re-baseline the 1 s speed log
   this->ota_start_ms_ = this->ota_last_ack_ms_ = this->ota_last_send_ms_ = 0;
   this->ota_last_report_ms_ = 0;
   this->ota_send_gap_ms_ = 6;  // start fast; back off adaptively on rewinds
@@ -196,6 +207,7 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
         this->ota_window_chunks_ = ring_chunks;
       this->ota_ack_every_ = ack_every ? ack_every : 16;
       this->ota_resume_ = resume;
+      this->ota_selfheal_anchor_ = resume;  // progress detector baseline for the self-heal streak
       this->ota_acked_ = this->ota_sent_ = this->ota_produced_ = resume;
       this->ota_producer_run_ = true;
       this->ota_producer_done_ = false;
@@ -230,8 +242,18 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
         ESP_LOGD(OTAG, "REWIND to %u (#%d, gap now %u ms)", (unsigned) acked, this->ota_rewinds_,
                  this->ota_send_gap_ms_);
       }
-      if (acked > this->ota_acked_)
+      if (acked > this->ota_acked_) {
         this->ota_acked_ = acked;
+        // Real forward progress clears BOTH the rewind self-heal streak and the disconnect-resume
+        // streak, so a long transfer over a flaky link (or one that keeps dropping out of range)
+        // keeps its full budget as long as it keeps advancing — it only gives up after that many
+        // resumes with NO progress (a truly dead link) or a user abort.
+        if (this->ota_acked_ - this->ota_selfheal_anchor_ > OTA_SELFHEAL_PROGRESS_RESET) {
+          this->ota_selfheal_count_ = 0;
+          this->ota_resume_count_ = 0;
+          this->ota_selfheal_anchor_ = this->ota_acked_;
+        }
+      }
       this->ota_progress_();
       if (this->ota_acked_ >= this->ota_total_ && this->ota_state_ == OtaState::STREAMING) {
         if (this->stage_only_) {
@@ -303,6 +325,7 @@ void LibrescootBleClient::ota_step_() {
       break;
     case OtaState::STREAMING:
       this->ota_send_data_();
+      this->ota_publish_rates_();
       if (this->ota_sent_ > this->ota_acked_ && now - this->ota_last_ack_ms_ > 5000)
         this->ota_fail_("ACK stalled");
       else if (this->ota_producer_done_ && !this->ota_http_ok_ && this->ota_produced_ < this->ota_total_)
@@ -328,6 +351,67 @@ void LibrescootBleClient::ota_step_() {
     default:
       break;
   }
+}
+
+// Throughput/byte sensors measured straight from the transfer counters (ota_produced_ =
+// HTTP -> ring buffer from GitHub/relay; ota_acked_ = in-order bytes confirmed by the scooter over
+// BLE). Called only from the STREAMING case, so nothing publishes while idle. 10 s cadence.
+void LibrescootBleClient::ota_publish_rates_() {
+  const uint32_t now = millis();
+  // 1 s cadence: log the live speeds to the ESP log only (NOT to HA — logs don't reach HA; only the
+  // 10 s sensor publishes below do, kept sparse so HA isn't flooded). Own baselines so this doesn't
+  // disturb the 10 s window math.
+  if (this->ota_log_ms_ == 0 || now - this->ota_log_ms_ >= 1000) {
+    if (this->ota_log_ms_ != 0) {
+      const uint32_t ldt = now - this->ota_log_ms_;
+      ESP_LOGD(OTAG, "speed: down %.2f  up %.2f kB/s  (%u/%u)",
+               (float) (this->ota_produced_ - this->ota_log_last_prod_) / (float) ldt,
+               (float) (this->ota_acked_ - this->ota_log_last_ack_) / (float) ldt,
+               (unsigned) this->ota_acked_, (unsigned) this->ota_total_);
+    }
+    this->ota_log_ms_ = now;
+    this->ota_log_last_prod_ = this->ota_produced_;
+    this->ota_log_last_ack_ = this->ota_acked_;
+  }
+  // Re-baseline at streaming start and right after a resume (ota_rate_ms_ == 0), so the resume
+  // offset is never counted as bytes "transferred now".
+  if (this->ota_rate_ms_ == 0) {
+    this->ota_rate_ms_ = now;
+    this->ota_rate_last_prod_ = this->ota_produced_;
+    this->ota_rate_last_ack_ = this->ota_acked_;
+    return;
+  }
+  const uint32_t dt = now - this->ota_rate_ms_;
+  if (dt < 10000)
+    return;
+  // ota_acked_ is cumulative and monotonic; ota_produced_ only grows. bytes/ms == kB/s.
+  const uint32_t d_prod = this->ota_produced_ - this->ota_rate_last_prod_;
+  const uint32_t d_ack = this->ota_acked_ - this->ota_rate_last_ack_;
+  const float ul = (float) d_ack / (float) dt;  // bytes/ms == kB/s
+  this->ota_ble_bytes_total_v_ += (double) d_ack;
+  if (this->ota_dl_speed_ != nullptr)
+    this->ota_dl_speed_->publish_state((float) d_prod / (float) dt);
+  if (this->ota_ul_speed_ != nullptr)
+    this->ota_ul_speed_->publish_state(ul);
+  if (this->ota_ble_bytes_total_ != nullptr)
+    this->ota_ble_bytes_total_->publish_state((float) this->ota_ble_bytes_total_v_);
+  if (this->ota_target_transferred_ != nullptr)
+    this->ota_target_transferred_->publish_state((float) this->ota_acked_);
+  // OTA Upload ETA, based on the OTA Speed BLE Upload rate. Smooth it (EMA) so a single slow/fast
+  // 10 s window doesn't swing the estimate; freeze the ETA while stalled (rate ~0) rather than
+  // showing infinity. bytes/ms * 1000 = bytes/s.
+  if (ul > 0.02f)
+    this->ota_ul_ema_bpms_ = (this->ota_ul_ema_bpms_ <= 0.0f) ? ul : (0.6f * this->ota_ul_ema_bpms_ + 0.4f * ul);
+  if (this->ota_eta_ != nullptr && this->ota_ul_ema_bpms_ > 0.0f && this->ota_total_ > this->ota_acked_) {
+    const uint32_t secs = (uint32_t) ((float) (this->ota_total_ - this->ota_acked_) / (this->ota_ul_ema_bpms_ * 1000.0f));
+    char eta[12];
+    snprintf(eta, sizeof(eta), "%02u:%02u:%02u", (unsigned) (secs / 3600), (unsigned) ((secs % 3600) / 60),
+             (unsigned) (secs % 60));
+    this->ota_eta_->publish_state(eta);
+  }
+  this->ota_rate_ms_ = now;
+  this->ota_rate_last_prod_ = this->ota_produced_;
+  this->ota_rate_last_ack_ = this->ota_acked_;
 }
 
 void LibrescootBleClient::ota_send_data_() {
@@ -594,6 +678,9 @@ void LibrescootBleClient::ota_kick_next_job_() {
     return;
   if (this->state() != espbt::ClientState::ESTABLISHED)
     return;  // wait for the (re)connect — don't consume the job while disconnected
+  if (this->ota_selfheal_at_ms_ != 0 && millis() < this->ota_selfheal_at_ms_)
+    return;  // self-heal backoff not elapsed yet (lets the old producer drain, throttles retries)
+  this->ota_selfheal_at_ms_ = 0;
   OtaJob job = this->ota_jobs_.front();
   this->ota_jobs_.erase(this->ota_jobs_.begin());
   this->ota_install_component_ = job.component;
@@ -667,24 +754,10 @@ void LibrescootBleClient::ota_progress_() {
   if (this->ota_active_update_ != nullptr)
     this->ota_active_update_->set_progress(this->ota_transfer_share_ * pct);  // upload = first slice
 
-  // ETA from the rate actually achieved this session (bytes moved since the resume offset).
-  // Wait for a couple of seconds and >2% of real data before estimating, or the first sample
-  // (a single chunk) produces a nonsense hour-long guess.
-  char eta[12] = "--:--:--";
-  if (final) {
-    strncpy(eta, "00:00:00", sizeof(eta));
-  } else if (this->ota_start_ms_ != 0 && this->ota_acked_ > this->ota_resume_) {
-    uint32_t dt = millis() - this->ota_start_ms_;
-    uint32_t moved = this->ota_acked_ - this->ota_resume_;
-    if (dt > 3000 && moved > this->ota_total_ / 50) {
-      float bps = (float) moved * 1000.0f / (float) dt;  // bytes/sec
-      uint32_t secs = (uint32_t) ((float) (this->ota_total_ - this->ota_acked_) / bps);
-      snprintf(eta, sizeof(eta), "%02u:%02u:%02u", (unsigned) (secs / 3600),
-               (unsigned) ((secs % 3600) / 60), (unsigned) (secs % 60));
-    }
-  }
-  if (this->ota_eta_ != nullptr)
-    this->ota_eta_->publish_state(eta);
+  // Live ETA is owned by ota_publish_rates_ (driven off the OTA Speed BLE Upload rate); here we only
+  // stamp the terminal 00:00:00 when the upload is complete.
+  if (final && this->ota_eta_ != nullptr)
+    this->ota_eta_->publish_state("00:00:00");
 
   if (this->ota_status_ != nullptr) {
     char b[56];
@@ -692,13 +765,42 @@ void LibrescootBleClient::ota_progress_() {
              (unsigned) this->ota_acked_, (unsigned) this->ota_total_);
     this->ota_status_->publish_state(b);
   }
-  ESP_LOGI(OTAG, "%s %.0f%% (%u/%u) ETA %s", comp_name(this->ota_component_), pct,
-           (unsigned) this->ota_acked_, (unsigned) this->ota_total_, eta);
+  ESP_LOGI(OTAG, "%s %.0f%% (%u/%u)", comp_name(this->ota_component_), pct,
+           (unsigned) this->ota_acked_, (unsigned) this->ota_total_);
 }
 
 void LibrescootBleClient::ota_fail_(const char *why) {
   ESP_LOGE(OTAG, "transfer failed: %s (sent=%u acked=%u/%u)", why, (unsigned) this->ota_sent_,
            (unsigned) this->ota_acked_, (unsigned) this->ota_total_);
+  // Self-heal: a recoverable transfer-phase failure (rewinds/stall/timeout) re-queues the current
+  // job and auto-resumes from the staged offset after a backoff, instead of aborting the whole
+  // update. Bounded (OTA_SELFHEAL_MAX consecutive, reset on real progress). Never on a user abort
+  // (ota_cancel_) and never past the transfer (COMPLETING/INSTALLING install failures hard-fail).
+  const bool transfer_phase = this->ota_state_ == OtaState::STARTING || this->ota_state_ == OtaState::STREAMING;
+  if (this->ota_auto_resume_ && !this->ota_cancel_ && this->ota_have_current_job_ && transfer_phase &&
+      ++this->ota_selfheal_count_ <= OTA_SELFHEAL_MAX) {
+    this->ota_producer_run_ = false;  // stop the download task; ota_start re-inits it on resume
+    if (this->ota_dl_speed_ != nullptr)
+      this->ota_dl_speed_->publish_state(0.0f);
+    if (this->ota_ul_speed_ != nullptr)
+      this->ota_ul_speed_->publish_state(0.0f);
+    this->ota_rate_ms_ = 0;
+    this->ota_selfheal_total_ += 1.0;
+    if (this->ota_selfheal_resumes_ != nullptr)
+      this->ota_selfheal_resumes_->publish_state((float) this->ota_selfheal_total_);
+    this->ota_jobs_.insert(this->ota_jobs_.begin(), this->ota_current_job_);  // resume this one first
+    this->ota_selfheal_at_ms_ = millis() + OTA_SELFHEAL_BACKOFF_MS;
+    if (this->ota_selfheal_at_ms_ == 0)
+      this->ota_selfheal_at_ms_ = 1;  // 0 is the "no backoff" sentinel; never store it
+    this->ota_set_state_(OtaState::IDLE);  // ota_kick_next_job_ re-runs it after the backoff
+    ESP_LOGW(OTAG, "self-heal: '%s' — auto-resume #%u (streak %u/%u) in %u s", why,
+             (unsigned) this->ota_selfheal_total_, (unsigned) this->ota_selfheal_count_, OTA_SELFHEAL_MAX,
+             OTA_SELFHEAL_BACKOFF_MS / 1000);
+    if (this->ota_status_ != nullptr)
+      this->ota_status_->publish_state(std::string("Auto-resume #") + std::to_string((unsigned) this->ota_selfheal_count_) +
+                                       " (" + why + ")");
+    return;
+  }
   if (this->ota_status_ != nullptr)
     this->ota_status_->publish_state(std::string("Error: ") + why);
   this->ota_finish_(false);
@@ -706,6 +808,19 @@ void LibrescootBleClient::ota_fail_(const char *why) {
 
 void LibrescootBleClient::ota_finish_(bool ok) {
   this->ota_producer_run_ = false;  // ask the download task to stop; buffer freed in ota_step_
+  // Flush the final partial window into the lifetime byte counter and the target-transferred
+  // sensor, then park the two speed sensors at 0 (a transfer is no longer running).
+  if (this->ota_rate_ms_ != 0 && this->ota_acked_ > this->ota_rate_last_ack_)
+    this->ota_ble_bytes_total_v_ += (double) (this->ota_acked_ - this->ota_rate_last_ack_);
+  if (this->ota_ble_bytes_total_ != nullptr)
+    this->ota_ble_bytes_total_->publish_state((float) this->ota_ble_bytes_total_v_);
+  if (this->ota_target_transferred_ != nullptr)
+    this->ota_target_transferred_->publish_state((float) this->ota_acked_);
+  if (this->ota_dl_speed_ != nullptr)
+    this->ota_dl_speed_->publish_state(0.0f);
+  if (this->ota_ul_speed_ != nullptr)
+    this->ota_ul_speed_->publish_state(0.0f);
+  this->ota_rate_ms_ = 0;
   // Report the bytes actually moved THIS session (acked minus the resume offset) — otherwise a
   // near-complete resume shows a nonsense kB/s (the resumed bytes weren't transferred now).
   if (this->ota_start_ms_ != 0 && this->ota_acked_ > this->ota_resume_) {
@@ -720,6 +835,16 @@ void LibrescootBleClient::ota_finish_(bool ok) {
 
   if (!ok)
     this->ota_jobs_.clear();  // a failure or abort stops the whole MDB+DBC sequence
+
+  // Safety: if an auto-update-triggered install ends in a terminal failure (bad delta base, abort,
+  // scooter error), switch OTA Auto Update OFF so it never retries the same broken update overnight.
+  if (!ok && this->ota_auto_update_ && this->ota_auto_check_pending_) {
+    ESP_LOGW(OTAG, "auto-update: install failed — switching OTA Auto Update off (no unattended retry)");
+    this->ota_auto_update_ = false;
+    this->ota_auto_check_pending_ = false;
+    if (this->auto_update_sw_ != nullptr)
+      this->auto_update_sw_->publish_state(false);
+  }
 
   if (ok && !this->ota_jobs_.empty()) {
     // More components queued (DBC after MDB) — keep the progress bar; the next one starts.

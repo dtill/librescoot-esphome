@@ -36,7 +36,7 @@ enum class BtnAction : uint8_t {
   PAIR,
 };
 enum class SelKind : uint8_t { BLINKER, USB_MODE, LINK_MODE, OTA_CHANNEL, OTA_METHOD, OTA_SOURCE };
-enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, PM_SCHED_HIB };
+enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE };
 enum class TxtKind : uint8_t {
   COMMAND, NAV_DEST, CELLULAR_APN, PM_CRON, PM_DURATION, SYSTIME_ISO, OTA_SOURCE_URL, OTA_VERSION
 };
@@ -178,6 +178,12 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void set_cbb_cell(sensor::Sensor *s) { cbb_cell_ = s; }
   void set_odometer(sensor::Sensor *s) { odometer_ = s; }
   void set_rssi(sensor::Sensor *s) { rssi_ = s; }
+  void set_ota_dl_speed(sensor::Sensor *s) { ota_dl_speed_ = s; }
+  void set_ota_ul_speed(sensor::Sensor *s) { ota_ul_speed_ = s; }
+  void set_ota_ble_bytes_total(sensor::Sensor *s) { ota_ble_bytes_total_ = s; }
+  void set_ota_target_transferred(sensor::Sensor *s) { ota_target_transferred_ = s; }
+  void set_ota_selfheal_resumes(sensor::Sensor *s) { ota_selfheal_resumes_ = s; }
+  void set_ota_auto_resume(bool b) { this->ota_auto_resume_ = b; }
 
   void set_bat1_present(binary_sensor::BinarySensor *b) { bat1_present_ = b; }
   void set_bat2_present(binary_sensor::BinarySensor *b) { bat2_present_ = b; }
@@ -227,12 +233,15 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void set_alarm_enabled(LibrescootSwitch *s) { alarm_enabled_ = s; }
   void set_alarm_armed(LibrescootSwitch *s) { alarm_armed_ = s; }
   void set_pm_sched_hib(LibrescootSwitch *s) { pm_sched_hib_ = s; }
+  void set_stage_only_switch(LibrescootSwitch *s) { stage_only_sw_ = s; }
+  void set_auto_update_switch(LibrescootSwitch *s) { auto_update_sw_ = s; }
 
   void set_command_text(text::Text *t) { command_text_ = t; }
   void set_apn_text(text::Text *t) { apn_text_ = t; }
   void set_pm_cron_text(text::Text *t) { pm_cron_text_ = t; }
   void set_pm_duration_text(text::Text *t) { pm_duration_text_ = t; }
   void set_ota_source_url_text(text::Text *t) { ota_source_url_text_ = t; }
+  void set_ota_version_text(text::Text *t) { ota_version_text_ = t; }
   void set_scooter_lock(LibrescootLock *l) { scooter_lock_ = l; }
   void set_mdb_update(LibrescootUpdate *u) { mdb_update_ = u; }
   void set_dbc_update(LibrescootUpdate *u) { dbc_update_ = u; }
@@ -261,6 +270,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void set_use_cert_bundle(bool b) { this->use_cert_bundle_ = b; }
   void set_update_check_interval(uint32_t ms) { this->update_check_interval_ = ms; }
   void set_link_interval_ms(uint32_t ms) { this->link_interval_ms_ = ms; }
+  void set_auto_hold_ms(uint32_t ms) { this->auto_hold_ms_ = ms; }
   void ota_start(const std::string &url, const std::string &sha256_hex, uint32_t size,
                  const std::string &bundle_id, uint8_t component);
   void ota_user_abort();
@@ -311,9 +321,14 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void ota_http_tls_(esp_http_client_config_t *cfg);
   void apply_check_result_();              // main-loop: push task result to the entities
   void refresh_update_availability_();     // recompute MDB/DBC available from known versions
+  void ota_auto_update_tick_();            // OTA Auto Update: install the next offered update / self-off
+  std::string gh_successor_(const std::string &from) const;  // adjacent next release from gh_tags_
+  bool ota_offers_allowed_() const;        // scooter in range AND a link mode that will connect
+  void ota_prefill_version_text_(const std::string &tag);  // show the offered target in OTA Version
 
   // --- OTA transfer engine ---
   void ota_step_();                        // BLE consumer, driven from loop()
+  void ota_publish_rates_();               // 10 s throughput/byte sensors, only while streaming
   void ota_send_data_();                   // send windowed DATA chunks from the ring buffer
   void ota_handle_status_(uint8_t *data, uint16_t len);  // OTA_STATUS dispatch into the FSM
   bool ota_write_data_(uint32_t offset, const uint8_t *data, uint16_t len);
@@ -353,6 +368,10 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   uint32_t lock_suppress_until_{0};
   std::string link_mode_str_{"auto"};
   uint32_t yield_until_ms_{0};  // in "auto": hold the link released until this time (phone handoff)
+  // "auto" proactive yield: hold a healthy link this long, then drop it briefly (the same
+  // LINK_YIELD_MS window) so a phone / other central gets a turn. 0 = never yield proactively.
+  uint32_t auto_hold_ms_{180000};
+  uint32_t auto_hold_until_ms_{0};  // when the current auto hold expires and we proactively release
   ESPPreferenceObject link_pref_;
   // "interval" link mode: stay disconnected, but every link_interval_ms_ connect, refresh every
   // sensor once (on_connected_ forces a full read) for a short dwell, then release the link again.
@@ -381,6 +400,23 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   sensor::Sensor *aux_voltage_{nullptr}, *aux_level_{nullptr}, *cbb_level_{nullptr};
   sensor::Sensor *cbb_remaining_{nullptr}, *cbb_full_{nullptr}, *cbb_cell_{nullptr};
   sensor::Sensor *odometer_{nullptr}, *rssi_{nullptr};
+  sensor::Sensor *ota_dl_speed_{nullptr}, *ota_ul_speed_{nullptr};
+  sensor::Sensor *ota_ble_bytes_total_{nullptr}, *ota_target_transferred_{nullptr};
+  sensor::Sensor *ota_selfheal_resumes_{nullptr};
+  // Self-heal: auto-resume a transfer-phase failure from the staged offset instead of aborting.
+  bool ota_auto_resume_{true};        // YAML ota_auto_resume (default on)
+  uint16_t ota_selfheal_count_{0};    // consecutive auto-resumes (reset on real progress); bounded
+  uint32_t ota_selfheal_at_ms_{0};    // earliest millis() to re-kick the job (backoff; 0 = none)
+  uint32_t ota_selfheal_anchor_{0};   // ota_acked_ at the last streak reset (progress detector)
+  double ota_selfheal_total_{0};      // lifetime auto-resumes (HA total_increasing)
+  // Rolling-rate state for the OTA throughput sensors (10 s cadence, only while transferring).
+  uint32_t ota_rate_ms_{0};         // last sample time; 0 = re-baseline on next tick (start/resume)
+  uint32_t ota_rate_last_prod_{0};  // ota_produced_ snapshot at last sample
+  uint32_t ota_rate_last_ack_{0};   // ota_acked_ snapshot at last sample
+  double ota_ble_bytes_total_v_{0}; // lifetime acked bytes (monotonic; HA total_increasing)
+  float ota_ul_ema_bpms_{0};        // EMA of the BLE upload rate (bytes/ms), drives OTA Upload ETA
+  uint32_t ota_log_ms_{0};          // 1 s ESP-log cadence for live speeds (separate from the 10 s sensors)
+  uint32_t ota_log_last_prod_{0}, ota_log_last_ack_{0};
 
   binary_sensor::BinarySensor *bat1_present_{nullptr}, *bat2_present_{nullptr};
   binary_sensor::BinarySensor *nav_active_{nullptr}, *ums_status_{nullptr};
@@ -461,8 +497,10 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void apply_ota_source_(const std::string &mode, bool persist);  // set mode → url, publish, persist
   std::string ota_method_str_{"delta"};  // delta (default) or full (.mender image)
   LibrescootSwitch *alarm_enabled_{nullptr}, *alarm_armed_{nullptr}, *pm_sched_hib_{nullptr};
+  LibrescootSwitch *stage_only_sw_{nullptr}, *auto_update_sw_{nullptr};
   text::Text *command_text_{nullptr}, *apn_text_{nullptr}, *pm_cron_text_{nullptr}, *pm_duration_text_{nullptr};
   text::Text *ota_source_url_text_{nullptr};
+  text::Text *ota_version_text_{nullptr};  // prefilled with the offered target while none is pinned
   LibrescootLock *scooter_lock_{nullptr};
   LibrescootUpdate *mdb_update_{nullptr}, *dbc_update_{nullptr};
   LibrescootUpdate *ota_active_update_{nullptr};  // the component's entity currently installing
@@ -474,9 +512,32 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   std::string channel_{"nightly"};        // reflected from the running MDB version
   std::string gh_channel_;                // snapshot for the worker task
   std::string gh_current_tag_;            // installed MDB version (tag form) snapshot, for the range
-  std::string gh_latest_tag_;             // result written by the task
-  std::string gh_summary_;                // release notes: every release from installed → latest
-  uint32_t gh_mdb_size_{0}, gh_dbc_size_{0};  // asset sizes for the chosen method (summary line)
+  std::string gh_current_dbc_tag_;        // installed DBC version (tag form) snapshot, for the range
+  std::string gh_method_;                 // "delta"/"full" snapshot for the worker
+  std::string gh_latest_tag_;             // channel latest (result written by the task)
+  std::string gh_summary_;                // legacy aggregate (installed MDB → latest); kept for compat
+  // Per-component target + changelog computed by the worker: delta → the NEXT release (successor of
+  // that component's installed version) with its single changelog; full → the channel latest with the
+  // aggregated (all-in-between) changelog. Empty target = nothing newer for that component.
+  std::string gh_mdb_target_, gh_dbc_target_;
+  std::string gh_mdb_summary_, gh_dbc_summary_;
+  // The tag each worker-fetched changelog + size actually belongs to. refresh only shows the
+  // changelog/size when this matches the (live, current-method) target — otherwise the body could be
+  // for a different release (e.g. the worker ran while the DBC read "unknown" and fetched the latest).
+  std::string gh_mdb_summary_tag_, gh_dbc_summary_tag_;
+  // Channel tags from the last check (any order). Retained so refresh_update_availability_ computes
+  // the per-component TARGET for the CURRENT method immediately, independent of the worker's method
+  // snapshot (delta → adjacent successor, full → latest). Same worker→main handoff as gh_summary_.
+  std::vector<std::string> gh_tags_;
+  uint32_t gh_mdb_size_{0}, gh_dbc_size_{0};  // asset sizes for each component's target (summary line)
+  // refresh_update_availability_ decision, cached for the auto-update tick (single source of truth).
+  bool ota_mdb_avail_{false}, ota_dbc_avail_{false};
+  // OTA Auto Update: install every offered update unattended, then switch itself off when up to date.
+  bool ota_auto_update_{false};
+  bool ota_auto_check_pending_{false};    // an auto-install fired; wait for a fresh check before "done"
+  uint32_t ota_auto_next_ms_{0};          // periodic auto-update re-evaluation while the switch is on
+  uint32_t next_avail_refresh_ms_{0};     // periodic refresh so a stale changelog/target self-corrects
+  uint32_t sum_recheck_after_ms_{0};      // rate limit for changelog-mismatch rechecks (GitHub 60/h)
   volatile bool gh_running_{false};
   volatile bool gh_done_{false};
   volatile bool gh_ok_{false};

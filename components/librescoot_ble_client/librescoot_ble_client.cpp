@@ -309,6 +309,10 @@ void LibrescootBleClient::setup() {
   // Drives the "interval" link mode (connect → refresh all sensors → release, every N minutes).
   // Also a scheduler timer so it fires while the link is down and loop() is disabled.
   this->set_interval("link_interval", 2000, [this]() { this->service_link_interval_(); });
+  // Re-evaluate what the update entities offer. Also a scheduler timer (not loop()) so an offer is
+  // withdrawn when the scooter leaves range or the link mode changes while the link is down.
+  if (this->mdb_update_ != nullptr || this->dbc_update_ != nullptr)
+    this->set_interval("avail_watch", 15000, [this]() { this->refresh_update_availability_(); });
 
   // Allocate the OTA ring buffer once, while the heap is fresh (a runtime alloc fails on the
   // classic board once TLS has fragmented the heap). HW-adaptive: with PSRAM (S3) use the full
@@ -360,7 +364,22 @@ void LibrescootBleClient::loop() {
   // OTA engine publish their results *here* in loop(), so keep it running while any such work is
   // pending — otherwise a check/transfer started while disconnected would never be applied.
   if (this->gh_running_ || this->gh_done_ || this->ota_state_ != OtaState::IDLE ||
-      this->ota_awaiting_version_ || this->ota_resolve_running_ || !this->ota_jobs_.empty())
+      this->ota_awaiting_version_ || this->ota_resolve_running_ || !this->ota_jobs_.empty() ||
+      this->ota_auto_update_)
+    this->enable_loop();
+
+  // OTA Auto Update: re-evaluate periodically so a step that finished between refresh triggers (e.g.
+  // the scooter returning to idle after a reboot) still advances the chain / self-disables.
+  if (this->ota_auto_update_ && millis() >= this->ota_auto_next_ms_) {
+    this->ota_auto_next_ms_ = millis() + 20000;
+    this->refresh_update_availability_();
+  }
+
+  // While an "auto" yield window is open the client is IDLE, which BLEClientBase's loop() disables —
+  // but the reconnect at yield expiry is serviced here in loop(). Keep loop() alive across the
+  // window (disable_loop() ran just above in BLEClientBase::loop(); re-enabling now wins for this
+  // iteration) so the link actually comes back after the phone's turn.
+  if (this->yield_until_ms_ != 0)
     this->enable_loop();
 
   // Presence + connection (once a second).
@@ -440,6 +459,7 @@ void LibrescootBleClient::loop() {
       if (this->ota_status_ != nullptr)
         this->ota_status_->publish_state("Installed");
       this->ota_settle_update_entity_();
+      this->refresh_();  // re-read every sensor now that the scooter is on the new firmware
     } else if (now >= this->ota_await_until_ms_) {
       ESP_LOGW("ota", "install: new version not confirmed in time; resetting");
       this->ota_awaiting_version_ = false;
@@ -496,6 +516,21 @@ void LibrescootBleClient::loop() {
   if (this->yield_until_ms_ != 0 && now >= this->yield_until_ms_) {
     this->yield_until_ms_ = 0;
     this->apply_link_state_();
+  }
+
+  // "auto" proactive yield: the scooter holds one central at a time, so a healthy link would keep
+  // a phone (or another client) locked out forever. After holding for auto_hold_ms_, drop the link
+  // — the CLOSE_EVT handler releases it for LINK_YIELD_MS before reconnecting, giving others a
+  // window on the free slot. Never interrupt a transfer, a queued action, a command reply, or an
+  // in-progress pairing.
+  if (this->auto_hold_until_ms_ != 0 && now >= this->auto_hold_until_ms_ &&
+      this->link_mode_str_ == "auto" && this->state() == espbt::ClientState::ESTABLISHED &&
+      !this->ota_active_ && !this->ondemand_active_ && !this->cmd_collecting_ &&
+      !this->pairing_armed_()) {
+    this->auto_hold_until_ms_ = 0;
+    ESP_LOGI(TAG, "auto: held %u s, releasing the link so another client can connect",
+             this->auto_hold_ms_ / 1000);
+    this->disconnect();
   }
 
   // Connect-on-demand state machine (runs while connecting too).
@@ -640,8 +675,9 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
       // "auto" link mode: release the link for a grace window on every disconnect so a
       // phone (or any other central) can win the reconnect race and take the scooter.
       // "always" reconnects immediately (base auto_connect); OTA always pins the link up.
-      if (this->link_mode_str_ == "auto" && !this->ota_active_ && !this->pairing_armed_() &&
-          this->get_address() != 0) {
+      // Guard on yield_until_ms_ == 0 so the paired DISCONNECT_EVT + CLOSE_EVT don't both fire this.
+      if (this->link_mode_str_ == "auto" && this->yield_until_ms_ == 0 && !this->ota_active_ &&
+          !this->pairing_armed_() && this->get_address() != 0) {
         this->set_enabled(false);
         this->yield_until_ms_ = millis() + LINK_YIELD_MS;
         ESP_LOGI(TAG, "auto: releasing link for %u s so another app can connect", LINK_YIELD_MS / 1000);
@@ -839,6 +875,11 @@ void LibrescootBleClient::on_connected_() {
   }
   this->last_read_issue_ms_ = 0;
   this->read_in_flight_ = false;
+
+  // Arm the "auto" proactive yield: after auto_hold_ms_ of a healthy link, loop() drops it briefly
+  // so a phone or another central gets a turn. 0 or a non-auto mode leaves it disarmed (failover).
+  this->auto_hold_until_ms_ =
+      (this->auto_hold_ms_ != 0 && this->link_mode_str_ == "auto") ? millis() + this->auto_hold_ms_ : 0;
 
   // Ask the scooter for its current OTA status on every connect. It doesn't reliably notify a
   // "pending reboot" on its own, and we must know it to suppress a bogus "update available"
@@ -1392,10 +1433,16 @@ void LibrescootBleClient::set_mdb_version_(const std::string &v) {
 }
 
 void LibrescootBleClient::set_dbc_version_(const std::string &v) {
+  bool changed = !ieq(v, this->dbc_version_);
   this->dbc_version_ = v;
   if (this->sw_dbc_ != nullptr)
     this->sw_dbc_->publish_state(v);
   this->publish_current_();
+  // The DBC target (delta successor) is relative to the DBC's installed version, so re-run the check
+  // when it changes (e.g. after a DBC install + dashboard reboot) to recompute the next DBC step.
+  if (changed && !v.empty() && !ieq(v, "unknown") && !this->mdb_version_.empty() &&
+      !ieq(this->mdb_version_, "unknown") && (this->mdb_update_ != nullptr || this->dbc_update_ != nullptr))
+    this->next_check_ms_ = millis();
 }
 
 void LibrescootBleClient::publish_current_() {
@@ -1415,6 +1462,11 @@ void LibrescootBleClient::request_update_check() {
   // Snapshot the installed MDB version (GitHub tag form) so the worker can list every release
   // between it and the channel latest — a multi-hop update shows all the skipped changelogs.
   this->gh_current_tag_ = this->mdb_version_.empty() ? "" : version_to_tag(this->mdb_version_);
+  // Snapshot the installed DBC version and the transfer method too: delta resolves the per-component
+  // successor (needs each version), full resolves the latest with the aggregated changelog.
+  this->gh_current_dbc_tag_ = (this->dbc_version_.empty() || ieq(this->dbc_version_, "unknown"))
+                                  ? "" : version_to_tag(this->dbc_version_);
+  this->gh_method_ = this->ota_method_str_;
   this->gh_running_ = true;
   this->gh_done_ = false;
   this->gh_ok_ = false;
@@ -1618,7 +1670,9 @@ void LibrescootBleClient::github_fetch_() {
   const std::string &curtag = this->gh_current_tag_;   // installed MDB version (tag form), may be empty
 
   std::string best;
-  std::string summary;
+  std::string summary;                                 // legacy aggregate (installed MDB → latest)
+  std::string mdb_target, dbc_target, mdb_summary, dbc_summary;
+  const bool full = (this->gh_method_ == "full");
 
   if (stable) {
     // Stable ships one release at a time via /latest; keep the single-release path.
@@ -1644,8 +1698,8 @@ void LibrescootBleClient::github_fetch_() {
     std::string cur_tag, cur_body;
     // Capture enough releases to cover a large multi-hop jump so NO intermediate version's changelog
     // is dropped (a small MAX_REL silently hid the oldest skipped releases entirely).
-    const size_t MAX_REL = 40, PER_BODY = 400;
-    this->github_http_stream_(base + "?per_page=40", [&](char ch) {
+    const size_t MAX_REL = 100, PER_BODY = 300;
+    this->github_http_stream_(base + "?per_page=100", [&](char ch) {
       if (mode == 1) {  // tags have no escapes
         if (ch == '"') mode = 0; else cur_tag += ch;
         return;
@@ -1673,32 +1727,75 @@ void LibrescootBleClient::github_fetch_() {
     for (auto &r : rels)
       if (r.tag > best) best = r.tag;  // newest = channel latest
 
-    // Releases strictly newer than the installed version, up to the latest (newest first).
-    std::vector<const Rel *> inc;
-    for (auto &r : rels) {
-      bool q = curtag.empty() ? (r.tag == best) : (r.tag > curtag && r.tag <= best);
-      if (q) inc.push_back(&r);
+    // Retain the channel tag list so refresh_update_availability_ can compute the current-method
+    // target itself (no dependency on this worker's method snapshot). Build into a local and assign
+    // once so gh_tags_ is never left empty mid-fetch (refresh reads it from the main loop).
+    {
+      std::vector<std::string> tags;
+      tags.reserve(rels.size());
+      for (auto &r : rels)
+        tags.push_back(r.tag);
+      this->gh_tags_ = std::move(tags);
     }
-    if (inc.size() <= 1) {
-      if (!inc.empty()) summary = inc.front()->body;
-    } else {
-      // Header first: how many releases and which are bundled into this jump.
-      summary = std::to_string(inc.size()) + " releases since installed:\n";
-      for (auto *r : inc) summary += "• " + r->tag + "\n";
-      for (auto *r : inc) {
-        summary += "\n### " + r->tag + "\n" + r->body + "\n";
-        // Generous total cap so every skipped release's changelog is included on a multi-hop jump
-        // (the bullet list above always lists ALL versions regardless; this bounds the bodies).
-        if (summary.size() > 7000) { summary += "\n…"; break; }
+
+    // successor(from): the next single delta step. A delta only applies to its immediately-preceding
+    // release, so the step is safe ONLY when `from` is itself within the (contiguous, newest-first)
+    // fetched window — then the smallest tag > from is genuinely adjacent and its delta base == from.
+    // If `from` is older than everything fetched (a far-behind board), we can't guarantee an
+    // applicable delta, so offer nothing for delta (the operator uses `full` instead).
+    auto successor = [&](const std::string &from) -> std::string {
+      if (from.empty()) return best;
+      bool in_window = false;
+      std::string nx;
+      for (auto &r : rels) {
+        if (r.tag == from) in_window = true;
+        if (r.tag > from && (nx.empty() || r.tag < nx)) nx = r.tag;
       }
-    }
+      return in_window ? nx : std::string();
+    };
+    auto single_body = [&](const std::string &t) -> std::string {
+      for (auto &r : rels) if (r.tag == t) return r.body;
+      return std::string();
+    };
+    // aggregate(from): every release newer than `from` up to latest (newest first), bodies bundled.
+    auto aggregate = [&](const std::string &from) -> std::string {
+      std::vector<const Rel *> inc;
+      for (auto &r : rels) {
+        bool q = from.empty() ? (r.tag == best) : (r.tag > from && r.tag <= best);
+        if (q) inc.push_back(&r);
+      }
+      std::string s;
+      if (inc.size() <= 1) { if (!inc.empty()) s = inc.front()->body; return s; }
+      s = std::to_string(inc.size()) + " releases since installed:\n";
+      for (auto *r : inc) s += "• " + r->tag + "\n";
+      for (auto *r : inc) {
+        s += "\n### " + r->tag + "\n" + r->body + "\n";
+        if (s.size() > 7000) { s += "\n…"; break; }
+      }
+      return s;
+    };
+
+    // Full → jump each component to the channel latest with the aggregated (all-in-between) changelog.
+    // Delta → step each component to the successor of ITS OWN installed version, with that single
+    // release's changelog (a delta only applies to the immediately-preceding release).
+    mdb_target = full ? best : successor(this->gh_current_tag_);
+    dbc_target = full ? best : successor(this->gh_current_dbc_tag_);
+    mdb_summary = full ? aggregate(this->gh_current_tag_) : single_body(mdb_target);
+    dbc_summary = full ? aggregate(this->gh_current_dbc_tag_) : single_body(dbc_target);
+    summary = aggregate(this->gh_current_tag_);  // legacy gh_summary_
   }
 
-  // Asset sizes for the chosen release (and, for stable, its body) — from the single-release JSON.
-  if (!best.empty()) {
-    const std::string aext = (this->ota_method_str_ == "full") ? ".mender" : ".delta";
-    const std::string tmdb = "librescoot-unu-mdb-" + best + aext;
-    const std::string tdbc = "librescoot-unu-dbc-" + best + aext;
+  // Asset sizes for each component's target (and, for stable, the release body) — one streamed JSON
+  // per distinct target tag (MDB and DBC targets can differ under delta).
+  const std::string aext = full ? ".mender" : ".delta";
+  uint32_t mdb_sz = 0, dbc_sz = 0;
+  std::string fetched_body;  // the fetched release's full body (for the delta single-changelog / stable)
+  auto fetch_asset = [&](const std::string &tag, bool want_mdb, bool want_dbc) {
+    if (tag.empty())
+      return;
+    fetched_body.clear();
+    const std::string tmdb = "librescoot-unu-mdb-" + tag + aext;
+    const std::string tdbc = "librescoot-unu-dbc-" + tag + aext;
     static const char AN[] = "\"name\":\"";
     static const char AS[] = "\"size\":";
     static const char BN[] = "\"body\":\"";
@@ -1706,8 +1803,7 @@ void LibrescootBleClient::github_fetch_() {
     int acap = 0;  // 0 idle, 1 name, 2 size
     bool bcap = false, bdone = false, esc = false; int uskip = 0;
     std::string aname, asize;
-    uint32_t mdb_sz = 0, dbc_sz = 0;
-    this->github_http_stream_(base + "/tags/" + best, [&](char ch) {
+    this->github_http_stream_(base + "/tags/" + tag, [&](char ch) {
       if (acap == 1) {
         if (ch == '"') acap = 0; else aname += ch;
       } else if (acap == 2) {
@@ -1715,7 +1811,7 @@ void LibrescootBleClient::github_fetch_() {
         else {
           acap = 0;
           uint32_t sz = (uint32_t) strtoul(asize.c_str(), nullptr, 10);
-          if (aname == tmdb) mdb_sz = sz; else if (aname == tdbc) dbc_sz = sz;
+          if (want_mdb && aname == tmdb) mdb_sz = sz; else if (want_dbc && aname == tdbc) dbc_sz = sz;
           asize.clear();
         }
       } else {
@@ -1723,24 +1819,50 @@ void LibrescootBleClient::github_fetch_() {
         if (AN[an] == 0) { acap = 1; aname.clear(); an = as = 0; }
         else { as = (ch == AS[as]) ? as + 1 : (ch == AS[0] ? 1 : 0); if (AS[as] == 0) { acap = 2; asize.clear(); an = as = 0; } }
       }
-      // Stable body extractor (listing channels already built the summary above).
-      if (stable && !bdone) {
+      // Body extractor — capture the full release body (delta shows this single release's changelog;
+      // stable uses it too). Full-method aggregate changelogs are built from the listing above.
+      if (!bdone) {
         if (bcap) {
           if (!esc && uskip == 0 && ch == '"') { bdone = true; bcap = false; }
-          else json_body_char(summary, ch, esc, uskip, 1400);
+          else json_body_char(fetched_body, ch, esc, uskip, 1400);
           return;
         }
         bn = (ch == BN[bn]) ? bn + 1 : (ch == BN[0] ? 1 : 0);
-        if (BN[bn] == 0) { bcap = true; summary.clear(); esc = false; uskip = 0; bn = 0; }
+        if (BN[bn] == 0) { bcap = true; fetched_body.clear(); esc = false; uskip = 0; bn = 0; }
       }
     });
-    if (stable && summary.size() >= 1400) summary += "\n…";
-    this->gh_mdb_size_ = mdb_sz;
-    this->gh_dbc_size_ = dbc_sz;
+    if (fetched_body.size() >= 1400)
+      fetched_body += "\n…";
+  };
+  if (stable) {
+    if (!best.empty())
+      fetch_asset(best, true, true);
+    summary = fetched_body;
+    mdb_target = dbc_target = best;
+    mdb_summary = dbc_summary = summary;
+  } else if (mdb_target == dbc_target) {
+    fetch_asset(mdb_target, true, true);
+    if (!full && !fetched_body.empty())  // delta → this single release's full changelog
+      mdb_summary = dbc_summary = fetched_body;
+  } else {
+    fetch_asset(mdb_target, true, false);
+    if (!full && !fetched_body.empty())
+      mdb_summary = fetched_body;
+    fetch_asset(dbc_target, false, true);
+    if (!full && !fetched_body.empty())
+      dbc_summary = fetched_body;
   }
+  this->gh_mdb_size_ = mdb_sz;
+  this->gh_dbc_size_ = dbc_sz;
 
   this->gh_latest_tag_ = best;
   this->gh_summary_ = summary;
+  this->gh_mdb_target_ = mdb_target;
+  this->gh_dbc_target_ = dbc_target;
+  this->gh_mdb_summary_ = mdb_summary;
+  this->gh_dbc_summary_ = dbc_summary;
+  this->gh_mdb_summary_tag_ = mdb_target;  // the tag this changelog + size actually describe
+  this->gh_dbc_summary_tag_ = dbc_target;
   this->gh_ok_ = !best.empty();
   this->gh_done_ = true;  // consumed on the main loop
 }
@@ -1753,97 +1875,226 @@ void LibrescootBleClient::apply_check_result_() {
   }
   ESP_LOGI(TAG, "update check: latest '%s' for channel '%s'", this->gh_latest_tag_.c_str(),
            this->gh_channel_.c_str());
+  this->ota_auto_check_pending_ = false;  // a fresh check has landed → auto-update may now conclude
   this->refresh_update_availability_();
 }
 
-// Two-phase model (like the phone app): first bring DBC up to match MDB, THEN advance MDB to
-// the channel latest. So while DBC is behind MDB, the DBC "catch up" is offered and MDB is held
-// (shown up to date); once in sync, MDB advances and DBC is gated. The manual "OTA … Install"
-// buttons ignore this gating.
-void LibrescootBleClient::refresh_update_availability_() {
-  const std::string &tag = this->gh_latest_tag_;  // channel latest (GitHub tag form)
-  if (tag.empty())
+// The next release strictly after `from`, for a single delta step. Safe only when `from` is itself
+// within the fetched tag window (its successor is then genuinely adjacent, so the delta base == from);
+// a far-behind version (older than everything fetched) returns "" so no unapplicable delta is offered.
+std::string LibrescootBleClient::gh_successor_(const std::string &from) const {
+  if (from.empty())
+    return this->gh_latest_tag_;
+  bool in_window = false;
+  std::string nx;
+  for (const auto &t : this->gh_tags_) {
+    if (t == from)
+      in_window = true;
+    if (t > from && (nx.empty() || t < nx))
+      nx = t;
+  }
+  return in_window ? nx : std::string();
+}
+
+// An update may only be OFFERED when the scooter could actually receive it: it must be in range
+// (connected, or an advertisement heard within the presence window — it need not be connected right
+// now) AND the link mode must be one that will connect on its own ("always"/"auto"/"interval").
+// In "scan"/"disconnect" the component deliberately never takes the link, so an offer could not be
+// acted on; out of range the cached versions are stale and must not drive an offer either.
+bool LibrescootBleClient::ota_offers_allowed_() const {
+  const std::string &m = this->link_mode_str_;
+  if (!(m == "always" || m == "auto" || m == "interval"))
+    return false;
+  if (this->state() == espbt::ClientState::ESTABLISHED)
+    return true;
+  // last_adv_ms_ == 0 means "never heard" — not in range (millis() is small right after boot, so a
+  // plain age test would read as fresh).
+  return this->last_adv_ms_ != 0 && (millis() - this->last_adv_ms_) < this->presence_timeout_ms_;
+}
+
+// Show the currently offered target in the OTA Version text so an install can be triggered without
+// looking the tag up. Only while the user has NOT pinned a version (an empty ota_target_version_):
+// this is display only — the pin itself stays empty so the install keeps following the live target.
+void LibrescootBleClient::ota_prefill_version_text_(const std::string &tag) {
+  if (this->ota_version_text_ == nullptr || !this->ota_target_version_.empty())
     return;
-  const std::string method = this->ota_method_str_;
-  // While a component is transferring/installing/awaiting its reboot — OR the scooter itself
-  // reports an install/pending-reboot — leave the entities as "up to date"; don't offer an
-  // update that's already on its way. `ota_scooter_busy_` also covers the case where the ESP
-  // rebooted but the scooter is still pending its own reboot.
-  // Only offer updates when the scooter's OTA state is explicitly IDLE (phase 0x06). Any other
-  // value — including "unknown" before we've heard back, and "pending reboot" — suppresses the
-  // offer (HA derives "available" from latest != installed and ignores our state enum, so we
-  // publish latest == current to truly hide it). The OTA Status text still shows the phase.
-  if (this->ota_scooter_phase_ != 0x06) {
-    if (this->mdb_update_ != nullptr && !this->mdb_version_.empty()) {
+  if (this->ota_version_text_->state != tag)
+    this->ota_version_text_->publish_state(tag);
+}
+
+// Availability model, method-dependent:
+//   delta → DBC-first: step DBC to the successor of ITS version until DBC == MDB, THEN step MDB to
+//           its own successor (one delta at a time; a delta only applies to the preceding release).
+//   full  → MDB-first: bring MDB to the channel latest, THEN bring DBC to the channel latest.
+// The per-component target + changelog come from the worker (gh_mdb_target_ / gh_dbc_target_ etc.).
+// The manual "OTA … Install" buttons ignore this gating; auto-update (OTA Auto Update) honours it.
+void LibrescootBleClient::refresh_update_availability_() {
+  const std::string &latest = this->gh_latest_tag_;  // channel latest (GitHub tag form)
+  if (latest.empty())
+    return;
+  const std::string &method = this->ota_method_str_;
+  const bool full = (method == "full");
+  // Only offer while the scooter's OTA phase is explicitly IDLE (0x06). Anything else — "unknown"
+  // before we've heard back, installing, pending-reboot — suppresses the offer (HA derives
+  // "available" from latest != installed, so we publish latest == current to truly hide it).
+  // ...and only when the scooter is actually reachable (in range + a connecting link mode).
+  if (this->ota_scooter_phase_ != 0x06 || !this->ota_offers_allowed_()) {
+    this->ota_mdb_avail_ = this->ota_dbc_avail_ = false;
+    this->ota_prefill_version_text_("");  // nothing offered → don't leave a stale tag in the field
+    // Leave the entity that is actively installing ALONE — it must keep its INSTALLING state,
+    // progress bar and target version so Home Assistant keeps showing it as "installing" until the
+    // new version is confirmed (`set_available(false)` would flip it to NO_UPDATE and drop it out of
+    // the updates overview mid-install). Only the other, idle entity is squelched to up-to-date.
+    if (this->mdb_update_ != nullptr && this->ota_active_update_ != this->mdb_update_ &&
+        !this->mdb_version_.empty()) {
       this->mdb_update_->set_latest(this->mdb_version_, "LibreScoot MDB", "", "");
       this->mdb_update_->set_available(false);
     }
-    if (this->dbc_update_ != nullptr && !this->dbc_version_.empty()) {
+    if (this->dbc_update_ != nullptr && this->ota_active_update_ != this->dbc_update_ &&
+        !this->dbc_version_.empty()) {
       this->dbc_update_->set_latest(this->dbc_version_, "LibreScoot DBC", "", "");
       this->dbc_update_->set_available(false);
     }
     return;
   }
   bool busy = this->ota_awaiting_version_ || this->ota_state_ != OtaState::IDLE;
-  // A version of "unknown" is NOT a real installed version — the scooter reports it for the DBC
-  // while in stand-by (the dashboard is off). Never offer an update against it, or HA would show
-  // "unknown → <latest>" and prompt an install. Treated exactly like a missing version.
+  // "unknown" is not a real installed version (DBC reports it while the dashboard is off) — treat
+  // it as missing so no bogus "unknown → <target>" offer appears.
   bool have_mdb = !this->mdb_version_.empty() && !ieq(this->mdb_version_, "unknown");
   bool have_dbc = !this->dbc_version_.empty() && !ieq(this->dbc_version_, "unknown");
   bool dbc_behind_mdb = have_mdb && have_dbc && !ieq(this->dbc_version_, this->mdb_version_);
-  uint32_t total = this->gh_mdb_size_ + this->gh_dbc_size_;
-  std::string tot = total ? ("  ·  total (MDB+DBC): " + fmt_size(total)) : "";
+  bool mdb_at_latest = have_mdb && ieq(this->mdb_version_, latest);
+  // Compute the target for the CURRENT method right here (independent of the worker's snapshot):
+  // full → the channel latest; delta → the adjacent successor of that component's installed version.
+  std::string mtar = full ? latest : this->gh_successor_(have_mdb ? version_to_tag(this->mdb_version_) : "");
+  std::string dtar = full ? latest : this->gh_successor_(have_dbc ? version_to_tag(this->dbc_version_) : "");
+  this->gh_mdb_target_ = mtar;  // keep in sync so perform_update + the auto-update tick agree
+  this->gh_dbc_target_ = dtar;
 
-  // MDB → channel latest, but only when DBC has caught up (DBC-first).
-  if (this->mdb_update_ != nullptr && !(busy && this->ota_active_update_ == this->mdb_update_)) {
-    if (!have_mdb) {
-      // Installed version unknown → publish latest == current so no update is offered.
-      if (!this->mdb_version_.empty()) {
-        this->mdb_update_->set_latest(this->mdb_version_, "LibreScoot MDB", "", "");
-        this->mdb_update_->set_available(false);
-      }
-    } else {
-      bool avail = !ieq(this->mdb_version_, tag) && !dbc_behind_mdb;
-      std::string url = "https://github.com/" + this->github_repo_ + "/releases/tag/" + tag;
-      std::string sum = this->gh_summary_;
-      if (avail && this->gh_mdb_size_)
-        sum = "**MDB:** " + fmt_size(this->gh_mdb_size_) + "  ·  est. " + fmt_est_time(this->gh_mdb_size_) +
-              " (" + method + ")" + tot + (sum.empty() ? "" : "\n\n" + sum);
-      this->mdb_update_->set_latest(avail ? tag : this->mdb_version_, "LibreScoot MDB", avail ? url : "", sum);
-      this->mdb_update_->set_available(avail);
-    }
+  bool mdb_avail, dbc_avail;
+  if (full) {
+    mdb_avail = have_mdb && !mtar.empty() && !ieq(this->mdb_version_, mtar);
+    dbc_avail = have_dbc && !dtar.empty() && !ieq(this->dbc_version_, dtar) && mdb_at_latest;
+  } else {
+    dbc_avail = have_dbc && dbc_behind_mdb && !dtar.empty();
+    mdb_avail = have_mdb && !dbc_behind_mdb && !mtar.empty() && !ieq(this->mdb_version_, mtar);
   }
 
-  // DBC → align to whatever MDB currently runs (target = MDB version).
-  if (this->dbc_update_ != nullptr && !(busy && this->ota_active_update_ == this->dbc_update_)) {
-    if (!have_dbc) {
-      // DBC version unknown (typically: scooter in stand-by) → never offer; latest == current.
-      if (!this->dbc_version_.empty()) {
-        this->dbc_update_->set_latest(this->dbc_version_, "LibreScoot DBC", "", "");
-        this->dbc_update_->set_available(false);
-      }
-    } else {
-      bool avail = dbc_behind_mdb;
-      bool to_latest = avail && ieq(this->mdb_version_, tag);  // MDB already at latest -> size known
-      std::string target = avail ? this->mdb_version_ : this->dbc_version_;
-      std::string url = to_latest ? ("https://github.com/" + this->github_repo_ + "/releases/tag/" + tag) : "";
-      std::string sum;
-      if (to_latest && this->gh_dbc_size_)
-        sum = "**DBC:** " + fmt_size(this->gh_dbc_size_) + "  ·  est. " + fmt_est_time(this->gh_dbc_size_) +
-              " (" + method + ")" + tot + (this->gh_summary_.empty() ? "" : "\n\n" + this->gh_summary_);
-      else if (avail)
-        sum = "DBC → align to MDB (" + this->mdb_version_ + ")";
-      this->dbc_update_->set_latest(target, "LibreScoot DBC", url, sum);
-      this->dbc_update_->set_available(avail);
+  auto rel_url = [&](const std::string &t) {
+    return "https://github.com/" + this->github_repo_ + "/releases/tag/" + t;
+  };
+  // Header block, one item per line (markdown hard breaks). The time is the estimated BLE UPLOAD
+  // time (transfer only — the on-scooter install/reboot is separate and not estimated here).
+  auto sum_line = [&](const char *label, const std::string &tgt, uint32_t sz, const std::string &notes) {
+    std::string s = std::string("**") + label + " → " + tgt + "**";
+    if (sz) {
+      s += "  \nUpload method: " + method;
+      s += "  \nUpload size: " + fmt_size(sz);
+      s += "  \nUpload time (est.): " + fmt_est_time(sz);
     }
+    if (!notes.empty())
+      s += "\n\n" + notes;
+    return s;
+  };
+
+  // Only show the worker's changelog + size when they describe the SHOWN target; otherwise the body
+  // could be for another release (e.g. the check ran while the DBC read "unknown"). On a mismatch,
+  // omit the body/size and re-run the check ONCE to fetch the right ones — it self-limits (once the
+  // worker fetches this target the tags match and the trigger stops), and gh_tags_ is assigned
+  // atomically so the re-check no longer leaves it momentarily empty.
+  static const std::string EMPTY;
+  // "ok" = the changelog+size belong to the shown target AND actually have content. A matched-but-
+  // empty result (e.g. the target's /tags fetch failed during a heavy check) also counts as stale.
+  const bool mdb_sum_ok = !mtar.empty() && ieq(mtar, this->gh_mdb_summary_tag_) &&
+                          (!this->gh_mdb_summary_.empty() || this->gh_mdb_size_ > 0);
+  const bool dbc_sum_ok = !dtar.empty() && ieq(dtar, this->gh_dbc_summary_tag_) &&
+                          (!this->gh_dbc_summary_.empty() || this->gh_dbc_size_ > 0);
+  // Rate limited: this is re-evaluated on a 15 s timer, and a changelog that never matches (e.g. the
+  // /tags fetch keeps failing) must not hammer the GitHub API — unauthenticated is 60 requests/hour.
+  const uint32_t now_ms = millis();
+  if (((mdb_avail && !mdb_sum_ok) || (dbc_avail && !dbc_sum_ok)) && !this->gh_running_ &&
+      !this->mdb_version_.empty() && !ieq(this->mdb_version_, "unknown") &&
+      (this->sum_recheck_after_ms_ == 0 || now_ms >= this->sum_recheck_after_ms_)) {
+    this->sum_recheck_after_ms_ = now_ms + 120000;  // at most one changelog re-fetch every 2 min
+    this->request_update_check();  // fetch the matching changelog; it enable_loop()s to apply itself
+  }
+
+  if (this->mdb_update_ != nullptr && !(busy && this->ota_active_update_ == this->mdb_update_)) {
+    if (mdb_avail)
+      this->mdb_update_->set_latest(mtar, "LibreScoot MDB", rel_url(mtar),
+                                    sum_line("MDB", mtar, mdb_sum_ok ? this->gh_mdb_size_ : 0,
+                                             mdb_sum_ok ? this->gh_mdb_summary_ : EMPTY));
+    else if (!this->mdb_version_.empty())
+      this->mdb_update_->set_latest(this->mdb_version_, "LibreScoot MDB", "", "");
+    this->mdb_update_->set_available(mdb_avail);
+  }
+  if (this->dbc_update_ != nullptr && !(busy && this->ota_active_update_ == this->dbc_update_)) {
+    if (dbc_avail)
+      this->dbc_update_->set_latest(dtar, "LibreScoot DBC", rel_url(dtar),
+                                    sum_line("DBC", dtar, dbc_sum_ok ? this->gh_dbc_size_ : 0,
+                                             dbc_sum_ok ? this->gh_dbc_summary_ : EMPTY));
+    else if (!this->dbc_version_.empty())
+      this->dbc_update_->set_latest(this->dbc_version_, "LibreScoot DBC", "", "");
+    this->dbc_update_->set_available(dbc_avail);
+  }
+
+  this->ota_mdb_avail_ = mdb_avail;
+  this->ota_dbc_avail_ = dbc_avail;
+  // Prefill OTA Version with whichever target is currently offered (only one is, by design).
+  this->ota_prefill_version_text_(dbc_avail ? dtar : (mdb_avail ? mtar : std::string()));
+  this->ota_auto_update_tick_();  // OTA Auto Update: install the next offered update / self-off
+}
+
+// OTA Auto Update: while the switch is on, install whatever an update entity would currently offer
+// (honouring the delta DBC-first / full MDB-first ordering baked into refresh_update_availability_),
+// one at a time, waiting out each install's reboot. When nothing is left after a fresh GitHub check,
+// switch itself back off. Called at the end of every refresh_update_availability_ and periodically.
+void LibrescootBleClient::ota_auto_update_tick_() {
+  if (!this->ota_auto_update_)
+    return;
+  // Gate hard: only act with the scooter fully idle + connected, the engine free, and versions known.
+  // These gates also make us wait out an install's reboot before the next step.
+  if (this->ota_scooter_phase_ != 0x06)
+    return;  // scooter installing / pending-reboot / unknown
+  if (this->ota_state_ != OtaState::IDLE || this->ota_awaiting_version_ || this->ota_resolve_running_ ||
+      !this->ota_jobs_.empty())
+    return;  // an install is already in flight
+  if (this->state() != espbt::ClientState::ESTABLISHED)
+    return;
+  // Status must be a settled operating state — never mid-boot. An MDB install reboots the scooter
+  // (Status → "booting" → back to stand-by/parked); only step forward once it has settled.
+  const std::string st = (this->status_ != nullptr) ? this->status_->state : std::string();
+  if (!(ieq(st, "parked") || ieq(st, "stand-by") || ieq(st, "ready-to-drive")))
+    return;
+
+  // Pick what an update entity would offer right now (cached decision = single source of truth).
+  int comp = this->ota_dbc_avail_ ? 1 : (this->ota_mdb_avail_ ? 0 : -1);
+  if (comp >= 0) {
+    const std::string &tgt = (comp == 1) ? this->gh_dbc_target_ : this->gh_mdb_target_;
+    ESP_LOGW(TAG, "auto-update: installing %s → %s", comp == 1 ? "DBC" : "MDB", tgt.c_str());
+    this->ota_auto_check_pending_ = true;  // an install fired → require a fresh check before "done"
+    this->ota_target_version_.clear();     // auto mode uses the per-component target, not a manual pin
+    this->perform_update((uint8_t) comp, false);
+    return;
+  }
+
+  // Nothing offered → conclude "all up to date" only after a fresh check has completed since the last
+  // auto-install (ota_auto_check_pending_ is cleared in apply_check_result_), then switch off.
+  if (!this->ota_auto_check_pending_ && this->gh_ok_) {
+    ESP_LOGI(TAG, "auto-update: everything up to date — switching OTA Auto Update off");
+    this->ota_auto_update_ = false;
+    if (this->auto_update_sw_ != nullptr)
+      this->auto_update_sw_->publish_state(false);
   }
 }
 
 void LibrescootBleClient::ota_settle_update_entity_() {
-  // Clear the installing component's progress bar, then re-evaluate availability from the
-  // versions we know — no online check (the scheduled check runs on its own timer).
+  // Clear the installing component's progress bar, drop the "active install" marker (so the
+  // idle-gate stops protecting it), then re-evaluate availability from the versions we know —
+  // no online check (the scheduled check runs on its own timer).
   if (this->ota_active_update_ != nullptr)
     this->ota_active_update_->clear_progress(false);
+  this->ota_active_update_ = nullptr;
   this->refresh_update_availability_();
 }
 
@@ -1864,11 +2115,16 @@ void LibrescootBleClient::perform_update(uint8_t component, bool force) {
   }
   this->ota_cancel_ = false;
   this->ota_resume_count_ = 0;
+  this->ota_selfheal_count_ = 0;   // fresh user-initiated install: reset the auto-resume streak
+  this->ota_selfheal_at_ms_ = 0;
   this->ota_install_component_ = component;
   this->enable_loop();  // the OTA engine is driven from loop(); keep it running (see loop()).
-  // Target: the OTA Version text if the user set one, else — for MDB the channel latest, for
-  // DBC the MDB's currently-installed version (bring DBC up to match the board it runs on).
+  // Target: the OTA Version text if the user set one, else the per-component target the availability
+  // logic computed (delta → the successor of that component's installed version; full → the channel
+  // latest). Fall back to older heuristics if the check hasn't produced a target yet.
   std::string tag = this->ota_target_version_;
+  if (tag.empty())
+    tag = (component == 1) ? this->gh_dbc_target_ : this->gh_mdb_target_;
   if (tag.empty())
     tag = (component == 1) ? version_to_tag(this->mdb_version_) : this->gh_latest_tag_;
   if (tag.empty()) {
@@ -1986,8 +2242,18 @@ void LibrescootBleClient::on_select(LibrescootSelect *sel, const std::string &va
     case SelKind::OTA_METHOD:
       // Transfer method for the next install: "delta" (small patch, default) or "full"
       // (complete .mender image, hundreds of MB — an overnight transfer on this hardware).
+      // The proposed target + changelog differ by method (delta → next release, full → latest), so
+      // re-run the update check so the entities and per-component targets reflect the new choice.
       this->ota_method_str_ = value;
       sel->publish_state(value);
+      // The target is recomputed from the retained tag list for the new method immediately; a
+      // background re-check just refreshes the changelog + asset sizes for the new method.
+      this->refresh_update_availability_();
+      if (!this->mdb_version_.empty() && !ieq(this->mdb_version_, "unknown") &&
+          (this->mdb_update_ != nullptr || this->dbc_update_ != nullptr)) {
+        this->enable_loop();
+        this->next_check_ms_ = millis();
+      }
       break;
     case SelKind::OTA_SOURCE:
       // Byte source for the OTA download: "direct GitHub" (the ESP fetches from GitHub itself) or
@@ -2015,6 +2281,30 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
                                : "set:pm.scheduled-hibernate-enabled false");
       if (this->pm_sched_hib_ != nullptr)
         this->pm_sched_hib_->publish_state(state);
+      break;
+    case SwKind::STAGE_ONLY:
+      // Runtime test flag (no scooter write): transfers run fully but stop before COMPLETE.
+      this->stage_only_ = state;
+      if (this->stage_only_sw_ != nullptr)
+        this->stage_only_sw_->publish_state(state);
+      ESP_LOGI(TAG, "stage_only %s", state ? "ON (transfers stop before COMPLETE)" : "OFF");
+      break;
+    case SwKind::AUTO_UPDATE:
+      // Install every offered update unattended (per the availability rules), then switch itself off
+      // once everything is up to date after a fresh GitHub check.
+      this->ota_auto_update_ = state;
+      if (this->auto_update_sw_ != nullptr)
+        this->auto_update_sw_->publish_state(state);
+      ESP_LOGI(TAG, "OTA Auto Update %s", state ? "ON" : "off");
+      if (state) {
+        this->ota_auto_check_pending_ = false;
+        this->ota_auto_next_ms_ = millis();
+        this->enable_loop();
+        // Force a fresh check first so decisions use current data, then evaluate.
+        if (!this->mdb_version_.empty() && !ieq(this->mdb_version_, "unknown"))
+          this->next_check_ms_ = millis();
+        this->refresh_update_availability_();
+      }
       break;
   }
 }
@@ -2063,9 +2353,11 @@ void LibrescootBleClient::on_text(TxtKind k, const std::string &value) {
       break;
     }
     case TxtKind::OTA_VERSION:
-      // Target release tag for OTA Update; blank = use the latest resolved release. Verified
-      // against GitHub when the transfer is triggered (the resolve queries this exact tag).
+      // Target release tag for OTA Update; blank = follow the offered target (which is prefilled
+      // here for convenience). Verified against GitHub when the transfer is triggered.
       this->ota_target_version_ = value;
+      if (this->ota_version_text_ != nullptr)
+        this->ota_version_text_->publish_state(value);  // echo the pin back (HA showed no state)
       break;
     case TxtKind::SYSTIME_ISO: {
       int y, mo, d, h, mi, se;

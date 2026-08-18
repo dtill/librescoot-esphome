@@ -61,6 +61,7 @@ librescoot_ble_client:
 | `stage_only` | bool, `false` | `true` = every transfer stops before `COMPLETE` (nothing installed). |
 | `presence_timeout` | time, `60s` | **BLE Presence** stays Home if an advert was seen within this window. |
 | `link_interval` | time, `5min` | For the **`interval`** BLE Link Mode: how often to connect, refresh every sensor once, then release the link again. |
+| `link_auto_hold` | time, `3min` | For the **`auto`** BLE Link Mode: hold the connection this long, then release it for ~20 s so a phone / other central gets a turn on the single slot. `0s` = pure failover (never yield proactively). |
 | `ota_source_default` | `github` / `relay`, optional | Default OTA byte source. Omitted → **chip-based** (ESP32-S3 → `github`, every other chip → `relay`). The runtime **OTA Source** select overrides it and is persisted in NVS. |
 | `use_cert_bundle` | bool, `false` | Validate GitHub HTTPS against the ESP-IDF **Mozilla bundle** instead of the pinned roots (auto-enables `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`). Use on **PSRAM boards** for autonomous direct-GitHub downloads. |
 | `ca_certificate` | string, optional | Explicit PEM root/chain for GitHub HTTPS (alternative to the bundle). |
@@ -183,7 +184,7 @@ and every polled characteristic is read once immediately on connect.
 | :--- | :--- |
 | `disconnect` | Stay disconnected. |
 | `scan` | Stay disconnected and scan for scooter advertisements (used by the HA "find scooter" flow). |
-| `auto` | Stay connected, but release the link for ~20 s after each disconnect so a phone app can take over. |
+| `auto` | Stay connected, but let go periodically: after holding for `link_auto_hold` (default **3 min**) the link is dropped for a ~20 s window so a phone (or any other central) can take the scooter's single slot; it also releases for that window after any disconnect. Set `link_auto_hold: 0s` for pure failover (hold until the link drops on its own). |
 | `always` | Stay connected; reconnect immediately. |
 | `interval` | Stay disconnected, but every `link_interval` (default **5 min**) connect, refresh **every** sensor once, then release the link again — low duty cycle, periodic fresh readings. |
 
@@ -200,10 +201,12 @@ PSRAM board, since the classic can't do the RSA-4096 CDN handshake). If neither 
 integration you get a clear "install the HA integration or use an S3+PSRAM board" hint rather than
 a mid-transfer failure.
 
-**Link modes.** `always` keeps the link up and reconnects immediately. `auto` keeps it up
-but, on every disconnect, *releases* it for a 20 s grace window so a phone (or any other
-central) can win the reconnect race and take the scooter. `scan` keeps only the scanner
-running (presence, no connection); `disconnect` releases the radio entirely.
+**Link modes.** `always` keeps the link up and reconnects immediately. `auto` also keeps it up,
+but the scooter accepts only **one** central at a time, so `auto` deliberately *lets go*: after
+holding for `link_auto_hold` it drops the link for a ~20 s window (and does the same after any
+disconnect) so a phone (or any other central) can win the reconnect race and take the scooter,
+then it reconnects. `scan` keeps only the scanner running (presence, no connection); `disconnect`
+releases the radio entirely.
 
 **Connect-on-demand.** In `scan`/`disconnect` (or during an `auto` yield) the link is down,
 but triggering any control entity still works: the component transparently brings the link

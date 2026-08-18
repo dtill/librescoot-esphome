@@ -75,11 +75,12 @@ OtaAbortAction = librescoot_ns.class_("OtaAbortAction", automation.Action)
 
 CONF_TIME_ID = "time_id"
 CONF_PASSKEY = "passkey"
-CONF_STAGE_ONLY = "stage_only"
+CONF_OTA_AUTO_RESUME = "ota_auto_resume"
 CONF_PRESENCE_TIMEOUT = "presence_timeout"
 CONF_GITHUB_REPO = "github_repo"
 CONF_UPDATE_INTERVAL = "update_check_interval"
 CONF_LINK_INTERVAL = "link_interval"
+CONF_LINK_AUTO_HOLD = "link_auto_hold"
 # DEFAULT OTA byte source ("github"/"relay"); distinct key from the `ota_source` select entity.
 CONF_OTA_SOURCE_DEFAULT = "ota_source_default"
 CONF_FIRMWARE_SOURCE = "firmware_source"
@@ -97,13 +98,25 @@ SENSORS = {
     "battery_2_soc": ("set_bat2_soc", dict(unit_of_measurement="%", accuracy_decimals=0, device_class="battery", state_class="measurement", icon="mdi:battery")),
     "battery_2_cycles": ("set_bat2_cycles", dict(accuracy_decimals=0, state_class="measurement", icon="mdi:battery-sync", entity_category="diagnostic")),
     "aux_voltage": ("set_aux_voltage", dict(unit_of_measurement="V", accuracy_decimals=2, state_class="measurement", icon="mdi:lightning-bolt", entity_category="diagnostic")),
-    "aux_level": ("set_aux_level", dict(unit_of_measurement="%", accuracy_decimals=0, device_class="battery", icon="mdi:battery", entity_category="diagnostic")),
-    "cbb_level": ("set_cbb_level", dict(unit_of_measurement="%", accuracy_decimals=0, device_class="battery", icon="mdi:battery-bluetooth", entity_category="diagnostic")),
+    # No device_class="battery" on the auxiliary batteries: Home Assistant's device-level
+    # battery badge picks the first battery-class %-sensor it finds, so only the traction
+    # batteries (battery_1_soc, then battery_2_soc) stay eligible and the badge tracks
+    # Battery 1 SoC. These keep their % unit and battery icon; they just don't drive the badge.
+    "aux_level": ("set_aux_level", dict(unit_of_measurement="%", accuracy_decimals=0, state_class="measurement", icon="mdi:battery", entity_category="diagnostic")),
+    "cbb_level": ("set_cbb_level", dict(unit_of_measurement="%", accuracy_decimals=0, state_class="measurement", icon="mdi:battery-bluetooth", entity_category="diagnostic")),
     "cbb_remaining": ("set_cbb_remaining", dict(unit_of_measurement="Ah", accuracy_decimals=3, state_class="measurement", icon="mdi:battery-70", entity_category="diagnostic")),
     "cbb_full": ("set_cbb_full", dict(unit_of_measurement="Ah", accuracy_decimals=3, state_class="measurement", icon="mdi:battery", entity_category="diagnostic")),
     "cbb_cell": ("set_cbb_cell", dict(unit_of_measurement="V", accuracy_decimals=3, device_class="voltage", state_class="measurement", icon="mdi:sine-wave", entity_category="diagnostic")),
     "odometer": ("set_odometer", dict(unit_of_measurement="km", accuracy_decimals=3, state_class="total_increasing", icon="mdi:counter")),
     "rssi": ("set_rssi", dict(unit_of_measurement="dBm", accuracy_decimals=0, device_class="signal_strength", state_class="measurement", icon="mdi:signal-variant", entity_category="diagnostic")),
+    # OTA throughput/byte sensors, measured from the transfer itself (not from the scooter's
+    # OTA_STATUS char). The two speeds publish only every 10 s while a transfer is running.
+    "ota_download_speed": ("set_ota_dl_speed", dict(unit_of_measurement="kB/s", accuracy_decimals=2, state_class="measurement", icon="mdi:download-network", entity_category="diagnostic")),
+    "ota_ble_upload_speed": ("set_ota_ul_speed", dict(unit_of_measurement="kB/s", accuracy_decimals=2, state_class="measurement", icon="mdi:upload-network", entity_category="diagnostic")),
+    "ota_ble_bytes_total": ("set_ota_ble_bytes_total", dict(unit_of_measurement="B", accuracy_decimals=0, state_class="total_increasing", icon="mdi:counter", entity_category="diagnostic")),
+    "ota_target_transferred": ("set_ota_target_transferred", dict(unit_of_measurement="B", accuracy_decimals=0, state_class="measurement", icon="mdi:progress-upload", entity_category="diagnostic")),
+    # Lifetime count of self-heal auto-resumes (a transfer-phase failure recovered without aborting).
+    "ota_auto_resume_count": ("set_ota_selfheal_resumes", dict(accuracy_decimals=0, state_class="total_increasing", icon="mdi:backup-restore", entity_category="diagnostic")),
 }
 
 BINARY_SENSORS = {
@@ -159,6 +172,10 @@ SWITCHES = {
     "alarm_enabled": ("set_alarm_enabled", SwKind.ALARM_ENABLED, None, "mdi:alarm-light"),
     "alarm_armed": ("set_alarm_armed", SwKind.ALARM_ARMED, None, "mdi:shield-lock"),
     "pm_scheduled_hibernate_enabled": ("set_pm_sched_hib", SwKind.PM_SCHED_HIB, "config", "mdi:calendar-clock"),
+    # Runtime OTA controls (no scooter write). switch_schema defaults restore_mode to ALWAYS_OFF, so
+    # both always start OFF every boot — auto-update can never restore ON and install unattended.
+    "ota_stage_only": ("set_stage_only_switch", SwKind.STAGE_ONLY, "config", "mdi:package-variant-closed"),
+    "ota_auto_update": ("set_auto_update_switch", SwKind.AUTO_UPDATE, "config", "mdi:auto-download"),
 }
 
 BUTTONS = {
@@ -190,7 +207,7 @@ TEXTS = {
     "pm_scheduled_hibernate_duration": ("set_pm_duration_text", TxtKind.PM_DURATION, 0, 32, "config", "mdi:timer-sand"),
     "system_time_iso": (None, TxtKind.SYSTIME_ISO, 0, 32, "diagnostic", "mdi:clock-edit-outline"),
     "ota_source_url": ("set_ota_source_url_text", TxtKind.OTA_SOURCE_URL, 0, 200, "diagnostic", "mdi:link-variant"),
-    "ota_version": (None, TxtKind.OTA_VERSION, 0, 64, "diagnostic", "mdi:tag-outline"),
+    "ota_version": ("set_ota_version_text", TxtKind.OTA_VERSION, 0, 64, "diagnostic", "mdi:tag-outline"),
 }
 
 
@@ -242,7 +259,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_MAC_ADDRESS): cv.mac_address,
             cv.Optional(CONF_TIME_ID): cv.use_id(time.RealTimeClock),
             # OTA test flag: when true, transfers stop before COMPLETE (nothing is installed).
-            cv.Optional(CONF_STAGE_ONLY, default=False): cv.boolean,
+            cv.Optional(CONF_OTA_AUTO_RESUME, default=True): cv.boolean,
             # GitHub repo (owner/name) the firmware releases come from.
             cv.Optional(CONF_GITHUB_REPO, default="librescoot/librescoot"): cv.string,
             # How often to poll GitHub for a newer release.
@@ -251,6 +268,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PRESENCE_TIMEOUT, default="60s"): cv.positive_time_period_milliseconds,
             # "interval" BLE Link Mode: how often to connect, refresh every sensor once, then release.
             cv.Optional(CONF_LINK_INTERVAL, default="5min"): cv.positive_time_period_milliseconds,
+            # "auto" BLE Link Mode: hold the connection this long, then briefly drop it (~20 s) so a
+            # phone or any other central gets a turn on the scooter's single slot. 0 = never yield
+            # proactively (pure failover: hold until the link drops on its own).
+            cv.Optional(CONF_LINK_AUTO_HOLD, default="3min"): cv.positive_time_period_milliseconds,
             # OTA byte source default. Omitted → chip-based (ESP32-S3 → direct GitHub, else HA relay).
             cv.Optional(CONF_OTA_SOURCE_DEFAULT): cv.one_of("github", "relay", lower=True),
             # Compile-time default byte source for the OTA transfer (e.g. a local mirror). The
@@ -285,7 +306,7 @@ async def to_code(config):
     cg.add(var.set_address(config[CONF_MAC_ADDRESS].as_hex))
     cg.add(var.set_auto_connect(True))
 
-    cg.add(var.set_stage_only(config[CONF_STAGE_ONLY]))
+    cg.add(var.set_ota_auto_resume(config[CONF_OTA_AUTO_RESUME]))
     cg.add(var.set_github_repo(config[CONF_GITHUB_REPO]))
     # OTA byte source DEFAULT: YAML `ota_source:` wins; else chip-based — ESP32-S3 (PSRAM, can do the
     # GitHub-CDN TLS) defaults to direct GitHub, every other chip defaults to the HA relay.
@@ -308,6 +329,7 @@ async def to_code(config):
     cg.add(var.set_scooter_filter(config[CONF_SCOOTER_FILTER]))
     cg.add(var.set_update_check_interval(config[CONF_UPDATE_INTERVAL]))
     cg.add(var.set_link_interval_ms(config[CONF_LINK_INTERVAL]))
+    cg.add(var.set_auto_hold_ms(config[CONF_LINK_AUTO_HOLD]))
     cg.add(var.set_presence_timeout(config[CONF_PRESENCE_TIMEOUT]))
     if CONF_TIME_ID in config:
         cg.add(var.set_time(await cg.get_variable(config[CONF_TIME_ID])))

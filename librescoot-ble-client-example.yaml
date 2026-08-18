@@ -129,15 +129,17 @@ librescoot_ble_client:
   id: librescoot_ble_client_hub
   mac_address: ${ble_mac}
   time_id: sntp_time
+  # "auto" link mode: hold the scooter's single connection this long, then drop it briefly (~20 s)
+  # so a phone or another BLE client gets a turn on the single slot. 0s = never yield proactively
+  # (pure failover). Default 3min; raise it to reduce reconnect churn at marginal range.
+  link_auto_hold: 3min
   # --- OTA settings ---------------------------------------------------------
   # Autonomous, no Home Assistant relay: the S3 has the PSRAM headroom to do the RSA-4096 CDN
   # TLS handshake, so it downloads firmware straight from GitHub. use_cert_bundle validates
   # api.github.com + objects.githubusercontent.com against the Mozilla roots (auto-enables the
   # CONFIG_MBEDTLS_CERTIFICATE_BUNDLE sdkconfig) — no pinned cert baked into the component.
   use_cert_bundle: true
-  # Test board: stop every transfer before COMPLETE, so nothing is actually installed. Flip to
-  # false for a real install.
-  stage_only: false
+  # (stage_only is now the "OTA Stage Only" switch, default off — see the switch entities below)
   # ca_certificate: |                      # alternative to the bundle: explicit PEM root(s)
   #   -----BEGIN CERTIFICATE----- ...
   # firmware_source: "http://192.168.178.71:8000"   # compile-time default byte source (mirror)
@@ -272,6 +274,14 @@ librescoot_ble_client:
     name: "Alarm Enabled"
   alarm_armed:
     name: "Alarm Armed"
+  # OTA control switches (always start OFF each boot; no scooter write).
+  # OTA Stage Only: transfers run fully but stop before COMPLETE (staging test, nothing installed).
+  ota_stage_only:
+    name: "OTA Stage Only"
+  # OTA Auto Update: install every offered update unattended (delta = next release, DBC-first; full =
+  # latest, MDB-first), waiting out each reboot, then switch itself off when everything is up to date.
+  ota_auto_update:
+    name: "OTA Auto Update"
   alarm_start:
     name: "Alarm Start"
   alarm_stop:
@@ -335,6 +345,19 @@ librescoot_ble_client:
   # status cadence: every 5 s, or 60 s / 5 min for larger bundles).
   ota_eta:
     name: "OTA Upload ETA"
+  # Live throughput/byte sensors measured from the transfer itself (not the scooter's OTA_STATUS).
+  # The two speeds publish every 10 s while a transfer runs, and park at 0 when it ends.
+  ota_download_speed:
+    name: "OTA Speed Download"
+  ota_ble_upload_speed:
+    name: "OTA Speed BLE Upload"
+  ota_ble_bytes_total:
+    name: "OTA BLE Bytes Total"
+  ota_target_transferred:
+    name: "OTA Target Transferred"
+  # Self-heal: how often a transfer-phase failure auto-resumed instead of aborting the update.
+  ota_auto_resume_count:
+    name: "OTA Auto-Resume Count"
   ota_status_request:
     name: "OTA Status Request"
   ota_abort:
