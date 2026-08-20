@@ -33,12 +33,13 @@ enum class BtnAction : uint8_t {
   SEATBOX_OPEN, HIBERNATE, WAKEUP, REBOOT, REBOOT_HARD, REMOVE_BOND,
   OTA_STATUS_REQ, OTA_ABORT, SYSTIME_SYNC, RESTART_ESP,
   ALARM_ARM, ALARM_DISARM, ALARM_START, ALARM_STOP, NAV_CLEAR, CANCEL_HIBERNATE, REFRESH, OTA_MDB_UPDATE, OTA_DBC_UPDATE,
-  PAIR,
+  PAIR, PASSKEY_SEND,
 };
 enum class SelKind : uint8_t { BLINKER, USB_MODE, LINK_MODE, OTA_CHANNEL, OTA_METHOD, OTA_SOURCE };
 enum class SwKind : uint8_t { ALARM_ENABLED, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE };
 enum class TxtKind : uint8_t {
-  COMMAND, NAV_DEST, CELLULAR_APN, PM_CRON, PM_DURATION, SYSTIME_ISO, OTA_SOURCE_URL, OTA_VERSION
+  COMMAND, NAV_DEST, CELLULAR_APN, PM_CRON, PM_DURATION, SYSTIME_ISO, OTA_SOURCE_URL, OTA_VERSION,
+  BLE_PASSKEY
 };
 
 // Characteristics we read from, notify on, or write to.
@@ -254,6 +255,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void set_pm_duration_text(text::Text *t) { pm_duration_text_ = t; }
   void set_ota_source_url_text(text::Text *t) { ota_source_url_text_ = t; }
   void set_ota_version_text(text::Text *t) { ota_version_text_ = t; }
+  void set_ble_passkey_text(text::Text *t) { ble_passkey_text_ = t; }
   void set_scooter_lock(LibrescootLock *l) { scooter_lock_ = l; }
   void set_mdb_update(LibrescootUpdate *u) { mdb_update_ = u; }
   void set_dbc_update(LibrescootUpdate *u) { dbc_update_ = u; }
@@ -496,6 +498,15 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   // Scheduler-driven too: raise "pairing required" only while the CONFIGURED scooter is actually
   // in range (advertising) but we could not bond it (pairing refused/failed → pairing_blocked_).
   void service_pairing_watch_();
+  bool is_bonded_();  // is the configured scooter in the controller's bond list?
+  // A passkey the user has entered, kept briefly so it can answer the NEXT pairing prompt too. The
+  // SMP pairing session times out after ~30 s, which is less time than it takes to walk to the
+  // scooter, read the code off the dashboard and type it into Home Assistant.
+  uint32_t pending_passkey_{0};
+  uint32_t pending_passkey_until_ms_{0};
+  bool pending_passkey_used_{true};  // the stored code answers at most one further prompt
+  bool passkey_req_open_{false};  // a PASSKEY_REQ is outstanding right now
+  uint32_t pair_backoff_until_ms_{0};  // don't re-attempt pairing before this (see auth failures)
   // Can this board actually fetch the firmware bytes? A plain-HTTP source (HA relay / mirror)
   // needs that server reachable; an https source (GitHub) needs a working TLS path (cert bundle,
   // i.e. a PSRAM board — the classic can't do the RSA-4096 CDN handshake).
@@ -528,6 +539,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   text::Text *command_text_{nullptr}, *apn_text_{nullptr}, *pm_cron_text_{nullptr}, *pm_duration_text_{nullptr};
   text::Text *ota_source_url_text_{nullptr};
   text::Text *ota_version_text_{nullptr};  // prefilled with the offered target while none is pinned
+  text::Text *ble_passkey_text_{nullptr};  // type the dashboard code here to answer a pairing prompt
   LibrescootLock *scooter_lock_{nullptr};
   LibrescootUpdate *mdb_update_{nullptr}, *dbc_update_{nullptr};
   LibrescootUpdate *ota_active_update_{nullptr};  // the component's entity currently installing

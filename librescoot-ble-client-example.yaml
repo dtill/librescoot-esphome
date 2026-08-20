@@ -130,21 +130,12 @@ librescoot_ble_client:
   mac_address: ${ble_mac}
   time_id: sntp_time
   # "auto" link mode: hold the scooter's single connection this long, then drop it briefly (~20 s)
-  # so a phone or another BLE client gets a turn on the single slot. 0s = never yield proactively
-  # (pure failover). Default 3min; raise it to reduce reconnect churn at marginal range.
+  # so a phone or another BLE client gets a turn. 0s = pure failover. Raise to reduce reconnect churn.
   link_auto_hold: 3min
-  # --- OTA settings ---------------------------------------------------------
-  # Autonomous, no Home Assistant relay: the S3 has the PSRAM headroom to do the RSA-4096 CDN
-  # TLS handshake, so it downloads firmware straight from GitHub. use_cert_bundle validates
-  # api.github.com + objects.githubusercontent.com against the Mozilla roots (auto-enables the
-  # CONFIG_MBEDTLS_CERTIFICATE_BUNDLE sdkconfig) — no pinned cert baked into the component.
-  use_cert_bundle: true
-  # (stage_only is now the "OTA Stage Only" switch, default off — see the switch entities below)
-  # ca_certificate: |                      # alternative to the bundle: explicit PEM root(s)
-  #   -----BEGIN CERTIFICATE----- ...
-  # firmware_source: "http://192.168.178.71:8000"   # compile-time default byte source (mirror)
+  # --- optional OTA settings (defaults shown) ---
   # github_repo: "librescoot/librescoot"   # owner/name the firmware releases come from
   # update_check_interval: 6h              # how often to poll GitHub for a newer release
+  # (stage_only is now the "OTA Stage Only" switch, default off — see the switch entities below)
 
   # ----- Telemetry (read) ----------------------------------------------------
   status:
@@ -202,9 +193,9 @@ librescoot_ble_client:
   aux_charger:
     name: "Aux Charger"
   ums_status:
-    name: "UMS Status"
+    name: "MDB UMS Status"
   maps_available:
-    name: "Maps Available"
+    name: "Navigation Maps Available"
   navigation_available:
     name: "Navigation Available"
   keycard_count:
@@ -253,7 +244,7 @@ librescoot_ble_client:
   # On = the Home Assistant "Librescoot-BLE-Client" integration is active — the component pings
   # its plain-HTTP OTA relay. Drives whether OTA is possible (else the ESP needs direct-GitHub).
   ha_integration:
-    name: "HA Integration"
+    name: "OTA Source HA Relay"
 
   # ----- Lock & controls -----------------------------------------------------
   scooter_lock:
@@ -261,7 +252,7 @@ librescoot_ble_client:
   blinker:
     name: "Blinker"
   usb_mode:
-    name: "USB Mode"
+    name: "MDB USB Mode"
   seatbox_open:
     name: "Seatbox Open"
   hibernate:
@@ -316,8 +307,8 @@ librescoot_ble_client:
   # (complete .mender image, hundreds of MB — an overnight transfer on this hardware).
   ota_update_method:
     name: "OTA Update Method"
-  # OTA byte source: "direct GitHub" (this ESP fetches from GitHub itself) or "HA relay" (Home
-  # Assistant serves the bytes). Default is chip-based (this S3 → direct GitHub); persisted in NVS.
+  # OTA byte source: "direct GitHub" or "HA relay". Default is chip-based (this ESP32-classic → HA
+  # relay; it can't do the GitHub-CDN RSA-4096 handshake while BLE is active); persisted in NVS.
   ota_source:
     name: "OTA Source"
 
@@ -329,12 +320,12 @@ librescoot_ble_client:
   refresh:
     name: "A-Refresh Sensor States"
   ble_remove_bond:
-    name: "BLE Remove Bond"
+    name: "BLE Pairing Delete"
     disabled_by_default: true
   # Explicitly (re)bond with the scooter. The ESP NEVER pairs on its own — a lost/stale bond just
   # releases the link; press this (or use the HA pairing Repair) to bond intentionally.
   pair_scooter:
-    name: "BLE Pair Scooter"
+    name: "BLE Pairing Start"
   restart_esp:
     name: "Restart ESPHome Device"
 
@@ -391,5 +382,10 @@ librescoot_ble_client:
     name: "OTA DBC Install"
   # Optional specific release tag to install (e.g. nightly-20260724T040816). Leave empty to
   # use the latest release for the selected channel.
+  # Pairing: type the 6-digit code from the scooter dashboard here and submit.
+  ble_passkey:
+    name: "BLE Pairing Passkey"
+  ble_send_code:
+    name: "BLE Pairing Send Passkey"
   ota_version:
     name: "OTA Version"

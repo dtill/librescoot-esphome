@@ -203,6 +203,8 @@ BUTTONS = {
     "reboot_mdb": (BtnAction.REBOOT, "config", "mdi:restart"),
     "reboot_mdb_hard": (BtnAction.REBOOT_HARD, "config", "mdi:restart-alert"),
     "ble_remove_bond": (BtnAction.REMOVE_BOND, "diagnostic", "mdi:bluetooth-off"),
+    # Sends whatever is currently in the BLE Passkey field (submitting the field also sends it).
+    "ble_send_code": (BtnAction.PASSKEY_SEND, "diagnostic", "mdi:send-lock"),
     "pair_scooter": (BtnAction.PAIR, "diagnostic", "mdi:bluetooth-connect"),
     "ota_status_request": (BtnAction.OTA_STATUS_REQ, "diagnostic", "mdi:progress-question"),
     "ota_abort": (BtnAction.OTA_ABORT, "diagnostic", "mdi:cancel"),
@@ -228,6 +230,9 @@ TEXTS = {
     "system_time_iso": (None, TxtKind.SYSTIME_ISO, 0, 32, "config", "mdi:clock-edit-outline"),
     "ota_source_url": ("set_ota_source_url_text", TxtKind.OTA_SOURCE_URL, 0, 200, "diagnostic", "mdi:link-variant"),
     "ota_version": ("set_ota_version_text", TxtKind.OTA_VERSION, 0, 64, "diagnostic", "mdi:tag-outline"),
+    # Pairing: type the code the scooter dashboard shows and submit. Straight to the BLE stack —
+    # the pairing session expires ~30 s after the code appears.
+    "ble_passkey": ("set_ble_passkey_text", TxtKind.BLE_PASSKEY, 0, 8, "diagnostic", "mdi:dialpad"),
 }
 
 

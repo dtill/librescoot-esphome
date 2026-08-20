@@ -30,6 +30,9 @@ static const uint32_t LINK_YIELD_MS = 20000;
 // How long a deliberate pairing stays armed after 'Pair Scooter'. Generous so the user has time to
 // read the passkey off the dashboard and type it into Home Assistant; extended on each PASSKEY_REQ.
 static const uint32_t PAIR_ARM_WINDOW_MS = 300000;  // 5 min
+// Space out pairing retries. Back-to-back attempts (reconnect, fail, reconnect) gain nothing and
+// push the peripheral into SMP rate-limiting, which makes a temporary refusal look permanent.
+static const uint32_t PAIR_RETRY_BACKOFF_MS = 10000;
 // "interval" link mode: how long to stay connected per cycle — long enough for on_connected_ to
 // read every characteristic once (reads are serialised, ~25 chars) plus the on-connect queries.
 static const uint32_t INTERVAL_DWELL_MS = 30000;  // 30 s
@@ -263,6 +266,10 @@ void LibrescootBleClient::setup() {
     this->cmd_last_response_->publish_state("(no command run yet)");
   if (this->command_text_ != nullptr)
     this->command_text_->publish_state("cap:list");
+  // Start empty, not "unknown": this field is typed into under time pressure (the pairing session
+  // expires ~30 s after the scooter shows the code), so it must never need clearing first.
+  if (this->ble_passkey_text_ != nullptr)
+    this->ble_passkey_text_->publish_state("");
   if (this->ota_channel_ != nullptr)
     this->ota_channel_->publish_state("undefined");
   if (this->ota_method_ != nullptr)
@@ -745,6 +752,29 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
   return true;
 }
 
+// Bluedroid reports an SMP failure as BTA_DM_AUTH_FAIL_BASE + <SMP status>, where the base is
+// HCI_ERR_MAX_ERR (0x43) + 10 = 77. The bare number in the log says nothing; the decoded reason
+// distinguishes "you typed the wrong code" from "the scooter refuses to pair at all".
+static const char *auth_fail_reason(uint8_t reason) {
+  switch (reason >= 77 ? reason - 77 : 0xFF) {
+    case 0x01: return "wrong passkey";
+    case 0x03: return "authentication requirements not met";
+    case 0x04: return "confirm value mismatch (wrong passkey)";
+    case 0x05: return "scooter says pairing not supported — it is not in a pairing-capable state "
+                      "(switch it on / wake it, then try again)";
+    case 0x06: return "encryption key size";
+    case 0x08: return "unspecified pairing failure";
+    case 0x09: return "too many attempts — the scooter is rate-limiting pairing, wait a moment";
+    case 0x0A: return "invalid parameters";
+    case 0x10: return "unknown IO capability";
+    case 0x13: return "busy";
+    case 0x14: return "encryption failed";
+    case 0x16: return "no response (SMP timeout)";
+    case 0x19: return "link lost during pairing";
+    default: return "unknown reason";
+  }
+}
+
 void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
   BLEClientBase::gap_event_handler(event, param);
   switch (event) {
@@ -754,6 +784,22 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
       if (this->check_addr(param->ble_security.auth_cmpl.bd_addr)) {
         if (this->pairing_armed_()) {
           this->pair_arm_until_ms_ = millis() + PAIR_ARM_WINDOW_MS;  // keep armed while actively pairing
+          // Already have the code? Answer immediately. The SMP session times out after about 30 s —
+          // far less than it takes to walk to the scooter, read the dashboard and type the code in,
+          // so the first attempt usually expires before the reply arrives and the bond never forms.
+          // Reusing the code the user already entered lets the retry finish inside the window
+          // without them having to do anything again.
+          if (this->pending_passkey_until_ms_ != 0 && millis() < this->pending_passkey_until_ms_ &&
+              !this->pending_passkey_used_) {
+            // Once only. The scooter shows a NEW code for every attempt, so re-sending a stored one
+            // can never succeed after the first try — and each rejected attempt makes it display yet
+            // another code, which is a loop that feeds itself.
+            this->pending_passkey_used_ = true;
+            ESP_LOGI(TAG, "Passkey requested again — replying once with the code already entered");
+            esp_ble_passkey_reply(param->ble_security.auth_cmpl.bd_addr, true, this->pending_passkey_);
+            break;
+          }
+          this->passkey_req_open_ = true;
           ESP_LOGW(TAG, "!!! PIN REQUIRED !!! enter the passkey shown on the scooter dashboard");
           ESP_LOGW(TAG, "    (HA pairing Repair, or the '<node>_passkey_reply' action).");
           if (this->passkey_required_ != nullptr)
@@ -773,23 +819,44 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
       break;
     case ESP_GAP_BLE_AUTH_CMPL_EVT:
       if (this->check_addr(param->ble_security.auth_cmpl.bd_addr)) {
+        this->passkey_req_open_ = false;
         if (param->ble_security.auth_cmpl.success) {
           this->pair_arm_until_ms_ = 0;  // bonded — disarm
           this->pairing_blocked_ = false;
+          this->pending_passkey_until_ms_ = 0;  // bonded; forget the code
+          if (this->ble_passkey_text_ != nullptr)
+            this->ble_passkey_text_->publish_state("");  // spent — leave the field ready, not stale
           if (this->passkey_required_ != nullptr)
             this->passkey_required_->publish_state(false);
         } else if (this->pairing_armed_()) {
           // A deliberate pairing attempt failed (e.g. a wrong code, or a session timeout). Stay
           // armed for the rest of the window so the next PASSKEY_REQ is still honoured and the user
           // can simply try again — do NOT block. (Disarming here was the bug that broke pairing.)
-          ESP_LOGW(TAG, "Pairing attempt failed (reason %d) — still armed, try the passkey again.",
-                   param->ble_security.auth_cmpl.fail_reason);
+          // Back off before the next attempt. Reconnecting immediately produced a burst of pairing
+          // attempts a second apart, which achieves nothing and is exactly what makes a peripheral
+          // start rate-limiting SMP (fail reason "too many attempts") — turning a recoverable
+          // failure into a persistent one.
+          // A code the scooter rejected as wrong is dead — never offer it again, or the retry
+          // answers with the same wrong code and the scooter keeps producing new ones.
+          const uint8_t r = param->ble_security.auth_cmpl.fail_reason;
+          if (r == 77 + 0x01 || r == 77 + 0x04) {  // passkey entry fail / confirm value mismatch
+            this->pending_passkey_until_ms_ = 0;
+            if (this->ble_passkey_text_ != nullptr)
+              this->ble_passkey_text_->publish_state("");
+          }
+          this->pair_backoff_until_ms_ = millis() + PAIR_RETRY_BACKOFF_MS;
+          ESP_LOGW(TAG, "Pairing failed: %s (reason %d) — still armed, retrying in %u s",
+                   auth_fail_reason(param->ble_security.auth_cmpl.fail_reason),
+                   param->ble_security.auth_cmpl.fail_reason, PAIR_RETRY_BACKOFF_MS / 1000);
+          this->set_timeout("pair_backoff", PAIR_RETRY_BACKOFF_MS, [this]() { this->apply_link_state_(); });
+          this->apply_link_state_();
         } else {
           // Unrequested pairing/auth FAILED (lost or stale bond — the scooter no longer knows us).
           // Stop the retry loop: release the link so the scooter isn't spammed with pairing/auth
           // attempts. The user re-bonds deliberately with 'Pair Scooter'.
-          ESP_LOGW(TAG, "Unrequested pairing failed (reason %d) — link released so the scooter isn't "
-                        "spammed. Press 'Pair Scooter' (or the HA pairing Repair) to (re)bond.",
+          ESP_LOGW(TAG, "Unrequested pairing failed: %s (reason %d) — link released so the scooter "
+                        "isn't spammed. Press 'Pair Scooter' (or the HA pairing Repair) to (re)bond.",
+                   auth_fail_reason(param->ble_security.auth_cmpl.fail_reason),
                    param->ble_security.auth_cmpl.fail_reason);
           this->pairing_blocked_ = true;
           this->set_enabled(false);
@@ -1467,7 +1534,15 @@ void LibrescootBleClient::apply_link_state_() {
   // Continuous-link modes keep the connection up; "interval" connects only during its refresh
   // dwell; "scan"/"disconnect" never auto-connect. OTA and an active pairing always pin it up.
   bool continuous = this->link_mode_str_ == "auto" || this->link_mode_str_ == "always";
-  bool want = has_mac && !this->pairing_blocked_ &&
+  // A failed pairing attempt holds the link down briefly (pair_backoff_until_ms_) so retries are
+  // spaced out instead of hammering the scooter's SMP as fast as the link can be reopened.
+  bool backoff = this->pair_backoff_until_ms_ != 0 && millis() < this->pair_backoff_until_ms_;
+  // Never take the link without a bond unless pairing was deliberately armed. Connecting unbonded
+  // makes the scooter start pairing on its own and display a passkey — a code that belongs to a
+  // session we are about to refuse, so it can never be used and only confuses whoever reads it off
+  // the dashboard. With this, a code appears only when pairing was actually requested.
+  bool may_link = this->is_bonded_() || this->pairing_armed_();
+  bool want = has_mac && !this->pairing_blocked_ && !backoff && may_link &&
               (this->ota_active_ || this->interval_refreshing_ || continuous);
   this->set_enabled(want);
 }
@@ -1615,19 +1690,46 @@ void LibrescootBleClient::check_integration_task_(void *arg) {
 // unrequested (re)pair was refused/failed — i.e. the configured scooter is present but not bonded.
 // It clears as soon as the scooter leaves range, gets bonded, or pairing is armed via 'Pair Scooter'.
 // BinarySensor::publish_state only emits on change, so publishing every tick is cheap.
+// Is the configured scooter in the controller's bond list? This is the only authoritative answer.
+// A GATT connection reaching ESTABLISHED does NOT prove a bond — the link opens first and
+// authentication can still fail afterwards — so "connected" was never proof of pairing, which is
+// what let the Home Assistant pairing dialog report success after a pairing that never completed.
+bool LibrescootBleClient::is_bonded_() {
+  if (this->get_address() == 0)
+    return false;
+  int num = esp_ble_get_bond_device_num();
+  if (num <= 0)
+    return false;
+  if (num > 8)
+    num = 8;  // the scooter is the only device this ever bonds with; a longer list can't be ours
+  auto *list = (esp_ble_bond_dev_t *) malloc(sizeof(esp_ble_bond_dev_t) * num);
+  if (list == nullptr)
+    return false;
+  bool found = false;
+  if (esp_ble_get_bond_device_list(&num, list) == ESP_OK) {
+    for (int i = 0; i < num && !found; i++)
+      found = this->check_addr(list[i].bd_addr);
+  }
+  free(list);
+  return found;
+}
+
 void LibrescootBleClient::service_pairing_watch_() {
   if (this->pairing_required_sensor_ == nullptr)
     return;
   const uint32_t now = millis();
   bool configured = this->get_address() != 0;
   bool in_range = configured && (now - this->last_adv_ms_ < this->presence_timeout_ms_);
-  // Tri-state, never falsely "OK": a live (encrypted) connection is the ONLY proof of a valid bond,
-  // so OK is published solely while connected. In range but unbonded → Problem. Anything else (out
-  // of range, or simply not connected yet this session) is genuinely unknown — publish nothing
-  // certain, mark the state missing so HA shows "unknown" rather than a reassuring OK.
-  if (this->connected()) {
+  // Tri-state, never falsely "OK": OK requires a live connection AND an actual bond in the
+  // controller's bond list. Connection alone is not proof — the GATT link is established before
+  // authentication, so it stays up for a while even when pairing fails. In range but not bonded (or
+  // bonded and refused) → Problem. Anything else (out of range, or simply not connected yet this
+  // session) is genuinely unknown: mark the state missing so Home Assistant shows "unknown" rather
+  // than a reassuring OK.
+  const bool bonded = this->is_bonded_();
+  if (this->connected() && bonded && !this->pairing_blocked_) {
     this->pairing_required_sensor_->publish_state(false);
-  } else if (in_range && this->pairing_blocked_) {
+  } else if (in_range && (this->pairing_blocked_ || !bonded)) {
     this->pairing_required_sensor_->publish_state(true);
   } else {
     this->pairing_required_sensor_->invalidate_state();
@@ -2295,6 +2397,16 @@ void LibrescootBleClient::on_button(BtnAction a) {
     case BtnAction::REMOVE_BOND:
       esp_ble_remove_bond_device(this->get_remote_bda());
       break;
+    case BtnAction::PASSKEY_SEND:
+      // Send the code held in the BLE Passkey field. Submitting the field already sends it; this is
+      // the explicit second trigger, for a retry or for a caller that fills the field and then
+      // presses (the Home Assistant pairing dialog drives exactly this pair of entities).
+      if (this->pending_passkey_until_ms_ == 0) {
+        ESP_LOGW(TAG, "BLE Send Code: no passkey entered — type the dashboard code into BLE Passkey first");
+        break;
+      }
+      this->passkey_reply(this->pending_passkey_);
+      break;
     case BtnAction::PAIR:
       // Deliberate (re)pairing: clear any stale bond for a clean slate, arm the passkey flow for a
       // generous window, and reconnect so the scooter can bond. Disarmed once bonding succeeds or
@@ -2304,6 +2416,10 @@ void LibrescootBleClient::on_button(BtnAction a) {
       esp_ble_remove_bond_device(this->get_remote_bda());
       this->pair_arm_until_ms_ = millis() + PAIR_ARM_WINDOW_MS;
       this->pairing_blocked_ = false;
+      // A deliberate fresh start: forget a previously entered code so the scooter's new one is
+      // asked for, rather than silently re-sending one that may have been mistyped.
+      this->pending_passkey_until_ms_ = 0;
+      this->pair_backoff_until_ms_ = 0;  // the user asked for it now, not after a backoff
       this->apply_link_state_();
       break;
     case BtnAction::OTA_STATUS_REQ: {
@@ -2497,6 +2613,26 @@ void LibrescootBleClient::on_text(TxtKind k, const std::string &value) {
       if (this->ota_version_text_ != nullptr)
         this->ota_version_text_->publish_state(this->ota_target_version_);  // echo what will be used
       break;
+    case TxtKind::BLE_PASSKEY: {
+      // Holds the code shown on the scooter dashboard. Entering it does NOT send: 'BLE Send Code'
+      // does. Typing digits and pressing one button is the whole flow, and the value stays visible
+      // so it can be sent again if the pairing session expired before the button was pressed.
+      std::string digits;
+      for (char c : value)
+        if (c >= '0' && c <= '9')
+          digits += c;
+      if (digits.empty() || digits.size() > 6) {
+        ESP_LOGW(TAG, "BLE Passkey: expected the 6 digits from the scooter dashboard, got '%s'", value.c_str());
+        break;
+      }
+      this->pending_passkey_ = (uint32_t) strtoul(digits.c_str(), nullptr, 10);
+      this->pending_passkey_until_ms_ = millis() + PAIR_ARM_WINDOW_MS;
+      this->pending_passkey_used_ = false;
+      if (this->ble_passkey_text_ != nullptr)
+        this->ble_passkey_text_->publish_state(digits);  // keep it visible for 'BLE Send Code'
+      ESP_LOGI(TAG, "BLE Passkey %s stored — press 'BLE Send Code' to send it", digits.c_str());
+      break;
+    }
     case TxtKind::SYSTIME_ISO: {
       int y, mo, d, h, mi, se;
       if (sscanf(value.c_str(), "%d-%d-%dT%d:%d:%dZ", &y, &mo, &d, &h, &mi, &se) != 6) {
@@ -2526,8 +2662,16 @@ void LibrescootBleClient::on_lock(bool lock_it) {
 void LibrescootBleClient::passkey_reply(uint32_t passkey) {
   if (passkey > 999999)
     return;
+  // Keep the code for a few minutes: if this reply is already too late for the current SMP session
+  // (it times out after ~30 s), the next PASSKEY_REQ is answered from here instead of asking the
+  // user again. Also keeps the pairing window armed for that long.
+  this->pending_passkey_ = passkey;
+  this->pending_passkey_until_ms_ = millis() + PAIR_ARM_WINDOW_MS;
+  this->pending_passkey_used_ = true;  // this call IS the send; the auto-reply is for the retry only
+  this->pair_arm_until_ms_ = millis() + PAIR_ARM_WINDOW_MS;
   ESP_LOGI(TAG, "Sending passkey %06lu", (unsigned long) passkey);
   esp_ble_passkey_reply(this->get_remote_bda(), true, passkey);
+  this->passkey_req_open_ = false;
   // Optimistically clear the prompt; a wrong code triggers a fresh PASSKEY_REQ that re-sets it.
   if (this->passkey_required_ != nullptr)
     this->passkey_required_->publish_state(false);
