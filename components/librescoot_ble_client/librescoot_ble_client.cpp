@@ -217,7 +217,7 @@ void LibrescootBleClient::build_char_table_() {
 
   bool uses_ext = command_text_ || cmd_response_ || cmd_last_response_ || keycard_count_ || sw_dbc_ ||
                   maps_available_ || nav_available_ || apn_text_ || pm_sched_hib_ || pm_cron_text_ ||
-                  pm_duration_text_ || usb_mode_ || ota_channel_ || alarm_enabled_ || alarm_armed_;
+                  pm_duration_text_ || usb_mode_ || ota_channel_ || alarm_enabled_;
   if (uses_ext) {
     add(CharId::CMD_RESPONSE, SVC_EXT, CH_EXT_RESP, true, 0);
     add(CharId::EXT_CMD, SVC_EXT, CH_EXT, false, 0);
@@ -311,8 +311,22 @@ void LibrescootBleClient::setup() {
   this->set_interval("link_interval", 2000, [this]() { this->service_link_interval_(); });
   // Re-evaluate what the update entities offer. Also a scheduler timer (not loop()) so an offer is
   // withdrawn when the scooter leaves range or the link mode changes while the link is down.
-  if (this->mdb_update_ != nullptr || this->dbc_update_ != nullptr)
+  if (this->mdb_update_ != nullptr || this->dbc_update_ != nullptr) {
     this->set_interval("avail_watch", 15000, [this]() { this->refresh_update_availability_(); });
+    // Before the first check the entities are still in their default state, which Home Assistant
+    // shows as an available update with an empty target. Park them right away.
+    this->squelch_updates_();
+    // The idle-gate only opens once the scooter has reported its OTA phase, so a reply that never
+    // arrives means no update is ever offered. Keep asking while it is unknown — from the
+    // scheduler, not loop(), which is disabled exactly when the link sits connected and idle.
+    this->set_interval("ota_phase", 15000, [this]() {
+      if (this->ota_scooter_phase_ != 0xFF || this->state() != espbt::ClientState::ESTABLISHED ||
+          this->find_char_(CharId::OTA_CONTROL) == nullptr)
+        return;
+      const uint8_t d[] = {0x05};  // STATUS_REQ — read-only
+      this->write_raw_(CharId::OTA_CONTROL, d, sizeof(d));
+    });
+  }
 
   // Allocate the OTA ring buffer once, while the heap is fresh (a runtime alloc fails on the
   // classic board once TLS has fragmented the heap). HW-adaptive: with PSRAM (S3) use the full
@@ -432,7 +446,40 @@ void LibrescootBleClient::loop() {
       };
       bool mdb = this->ota_install_component_ == 0;
       bool ok = mdb ? this->rs_mdb_ok_ : this->rs_dbc_ok_;
-      if (ok) {
+      // A delta only applies to the exact release it was generated against, and the scooter does not
+      // check that — it assumes the running version is the base and fails late, after the whole
+      // patch run. rs_delta_base_ is what the archive itself says; refuse the transfer when it does
+      // not match what this board is running. An unreadable base (empty) never blocks: it is a
+      // failed probe, not evidence of a mismatch.
+      const std::string installed = version_to_tag(mdb ? this->mdb_version_ : this->dbc_version_);
+      const bool base_mismatch =
+          ok && !this->rs_delta_base_.empty() && !ieq(this->rs_delta_base_, installed);
+      // Staging is deliberately exempt: nothing is installed, so parking a delta on the scooter that
+      // does not apply *yet* is a legitimate thing to want. It stays a warning there; only a real
+      // install is refused.
+      if (base_mismatch && this->stage_only_) {
+        ESP_LOGW("ota", "%s delta %s patches %s, but the scooter runs %s — staging it anyway "
+                        "(OTA Stage Only is on, so nothing will be installed)",
+                 mdb ? "MDB" : "DBC", this->rs_tag_.c_str(), this->rs_delta_base_.c_str(),
+                 installed.empty() ? "(unknown)" : installed.c_str());
+      }
+      if (base_mismatch && !this->stage_only_) {
+        ESP_LOGW("ota", "install: %s delta %s patches %s, but the scooter runs %s — refusing",
+                 mdb ? "MDB" : "DBC", this->rs_tag_.c_str(), this->rs_delta_base_.c_str(),
+                 installed.empty() ? "(unknown)" : installed.c_str());
+        if (this->ota_status_ != nullptr)
+          this->ota_status_->publish_state("Error: delta needs " + this->rs_delta_base_);
+        // Same reasoning as a terminal install failure: unattended mode must not retry a delta that
+        // cannot apply, or it would re-resolve it against GitHub every tick.
+        if (this->ota_auto_update_) {
+          ESP_LOGW("ota", "auto-update: delta base mismatch — switching OTA Auto Update off");
+          this->ota_auto_update_ = false;
+          this->ota_auto_check_pending_ = false;
+          if (this->auto_update_sw_ != nullptr)
+            this->auto_update_sw_->publish_state(false);
+        }
+        this->ota_settle_update_entity_();
+      } else if (ok) {
         const std::string &nm = mdb ? this->rs_mdb_name_ : this->rs_dbc_name_;
         const std::string &sha = mdb ? this->rs_mdb_sha_ : this->rs_dbc_sha_;
         uint32_t sz = mdb ? this->rs_mdb_size_ : this->rs_dbc_size_;
@@ -495,18 +542,6 @@ void LibrescootBleClient::loop() {
       if (this->reboot_required_ != nullptr)
         this->reboot_required_->publish_state(true);
       ESP_LOGW(TAG, "scooter pending-reboot for >20 min — manual restart may be needed");
-    }
-  }
-
-  // If the OTA phase never resolved (0xFF) — e.g. the on-connect STATUS_REQ was missed on a flaky
-  // link — keep asking every 15 s while connected. Otherwise the idle-gate stays shut and a real,
-  // available update is never offered until someone presses STATUS_REQ by hand.
-  if (this->ota_scooter_phase_ == 0xFF && this->state() == espbt::ClientState::ESTABLISHED &&
-      this->find_char_(CharId::OTA_CONTROL) != nullptr) {
-    if (this->ota_status_retry_ms_ == 0 || now - this->ota_status_retry_ms_ >= 15000) {
-      this->ota_status_retry_ms_ = now;
-      const uint8_t d[] = {0x05};  // STATUS_REQ — read-only
-      this->write_raw_(CharId::OTA_CONTROL, d, sizeof(d));
     }
   }
 
@@ -628,7 +663,11 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
       for (auto &e : this->chars_) {
         auto *chr = this->get_characteristic(e.service, e.chr);
         if (chr == nullptr) {
+          // Not every firmware exposes every documented characteristic. Say so once per connect:
+          // otherwise the entity just sits at "unknown" forever with nothing to explain it.
           e.handle = 0;
+          ESP_LOGW(TAG, "characteristic %s absent from the scooter's GATT database — its entity "
+                        "stays unknown", e.chr.to_string().c_str());
           continue;
         }
         e.handle = chr->handle;
@@ -887,7 +926,6 @@ void LibrescootBleClient::on_connected_() {
   if (this->find_char_(CharId::OTA_CONTROL) != nullptr) {
     const uint8_t d[] = {0x05};  // STATUS_REQ
     this->write_raw_(CharId::OTA_CONTROL, d, sizeof(d));
-    this->ota_status_retry_ms_ = millis();  // first unknown-phase retry waits 15 s after this one
   }
 
   // Queue the read-only on-connect queries (only those with a target entity).
@@ -908,6 +946,12 @@ void LibrescootBleClient::on_connected_() {
     this->pending_queries_.push_back("status:maps-available");
   if (this->nav_available_ != nullptr)
     this->pending_queries_.push_back("status:navigation-available");
+  if (this->alarm_enabled_ != nullptr)
+    this->pending_queries_.push_back("get:alarm.enabled");
+  // The LTC4020 charger's own GATT service (9a590120) is not in this firmware's database, but the
+  // same state is readable over the extended-command channel.
+  if (this->aux_charger_ != nullptr)
+    this->pending_queries_.push_back("ltc:status");
   if (this->apn_text_ != nullptr)
     this->pending_queries_.push_back("get:cellular.apn");
   if (this->pm_sched_hib_ != nullptr)
@@ -1041,10 +1085,6 @@ void LibrescootBleClient::handle_char_value_(CharId id, uint8_t *v, uint16_t len
       if (this->aux_charge_ != nullptr)
         this->aux_charge_->publish_state(clean_str_(v, len));
       break;
-    case CharId::CBB_CHARGE:
-      if (this->cbb_charge_ != nullptr)
-        this->cbb_charge_->publish_state(clean_str_(v, len));
-      break;
     case CharId::STATUS: {
       std::string s = clean_str_(v, len);
       if (this->status_ != nullptr)
@@ -1096,6 +1136,12 @@ void LibrescootBleClient::parse_cmd_response_(const std::string &line) {
   } else if (line.rfind("status:navigation-available:", 0) == 0) {
     if (this->nav_available_ != nullptr)
       this->nav_available_->publish_state(line.find(":true") != std::string::npos);
+  } else if (line.rfind("ltc:status:", 0) == 0) {
+    if (this->aux_charger_ != nullptr)
+      this->aux_charger_->publish_state(!ieq(line.substr(11), "off"));
+  } else if (line.rfind("get:alarm.enabled:", 0) == 0) {
+    if (this->alarm_enabled_ != nullptr)
+      this->alarm_enabled_->publish_state(line.find(":true") != std::string::npos);
   } else if (line.rfind("get:cellular.apn:", 0) == 0) {
     if (this->apn_text_ != nullptr)
       this->apn_text_->publish_state(line.substr(17));
@@ -1377,6 +1423,17 @@ void LibrescootBleClient::apply_link_state_() {
 
 void LibrescootBleClient::apply_ota_source_(const std::string &mode, bool persist) {
   this->ota_source_mode_ = (mode == "github") ? "github" : "relay";
+#ifndef LSC_DIRECT_GITHUB
+  // Not built for this board: the GitHub-CDN TLS session does not fit next to the BLE stack in
+  // internal RAM. A stale NVS value or an out-of-date Home Assistant entity can still ask for it,
+  // so fall back rather than run into a handshake this board cannot complete.
+  if (this->ota_source_mode_ == "github") {
+    ESP_LOGE(TAG, "OTA byte source 'direct GitHub' needs a board with PSRAM (e.g. an ESP32-S3 "
+                  "N16R8) — falling back to 'HA relay' and letting the Home Assistant integration "
+                  "serve the firmware bytes");
+    this->ota_source_mode_ = "relay";
+  }
+#endif
   if (this->ota_source_mode_ == "github") {
     // github mode owns the URL — point it straight at the GitHub download base.
     this->ota_source_url_ = this->github_base_();
@@ -1643,6 +1700,13 @@ bool LibrescootBleClient::github_http_stream_(const std::string &url,
 }
 
 // Append one JSON-string char (escape-decoded) to dst, capped at cap. Returns false once full.
+// How much release-note text a board is willing to hold (set from the YAML codegen: a PSRAM
+// board can afford considerably more). Home Assistant renders all of it — its 255-character
+// limit applies to release_summary, not to the release notes the ESPHome integration serves.
+#ifndef LSC_CHANGELOG_MAX
+#define LSC_CHANGELOG_MAX 7000
+#endif
+
 static void json_body_char(std::string &dst, char ch, bool &esc, int &uskip, size_t cap) {
   if (uskip > 0) { uskip--; return; }  // swallow the 4 hex digits of a \uXXXX escape
   if (esc) {
@@ -1770,7 +1834,7 @@ void LibrescootBleClient::github_fetch_() {
       for (auto *r : inc) s += "• " + r->tag + "\n";
       for (auto *r : inc) {
         s += "\n### " + r->tag + "\n" + r->body + "\n";
-        if (s.size() > 7000) { s += "\n…"; break; }
+        if (s.size() > LSC_CHANGELOG_MAX) { s += "\n…"; break; }
       }
       return s;
     };
@@ -1824,14 +1888,14 @@ void LibrescootBleClient::github_fetch_() {
       if (!bdone) {
         if (bcap) {
           if (!esc && uskip == 0 && ch == '"') { bdone = true; bcap = false; }
-          else json_body_char(fetched_body, ch, esc, uskip, 1400);
+          else json_body_char(fetched_body, ch, esc, uskip, LSC_CHANGELOG_MAX);
           return;
         }
         bn = (ch == BN[bn]) ? bn + 1 : (ch == BN[0] ? 1 : 0);
         if (BN[bn] == 0) { bcap = true; fetched_body.clear(); esc = false; uskip = 0; bn = 0; }
       }
     });
-    if (fetched_body.size() >= 1400)
+    if (fetched_body.size() >= LSC_CHANGELOG_MAX)
       fetched_body += "\n…";
   };
   if (stable) {
@@ -1928,10 +1992,32 @@ void LibrescootBleClient::ota_prefill_version_text_(const std::string &tag) {
 //   full  → MDB-first: bring MDB to the channel latest, THEN bring DBC to the channel latest.
 // The per-component target + changelog come from the worker (gh_mdb_target_ / gh_dbc_target_ etc.).
 // The manual "OTA … Install" buttons ignore this gating; auto-update (OTA Auto Update) honours it.
+// Park an update entity at "no update", whether or not the installed version is known yet. Home
+// Assistant derives "an update is available" from latest != current, so an entity left in its
+// default state — no current, no latest — surfaces as an offer with an empty target. Publishing
+// latest == current (or an explicit empty pair when even that is unknown) is what actually hides it.
+static void squelch_update_(LibrescootUpdate *u, const std::string &installed, const char *title) {
+  if (u == nullptr)
+    return;
+  bool known = !installed.empty() && !ieq(installed, "unknown");
+  u->set_latest(known ? installed : std::string(), title, "", "");
+  u->set_available(false);
+}
+
+void LibrescootBleClient::squelch_updates_() {
+  squelch_update_(this->mdb_update_, this->mdb_version_, "LibreScoot MDB");
+  squelch_update_(this->dbc_update_, this->dbc_version_, "LibreScoot DBC");
+}
+
 void LibrescootBleClient::refresh_update_availability_() {
   const std::string &latest = this->gh_latest_tag_;  // channel latest (GitHub tag form)
-  if (latest.empty())
+  if (latest.empty()) {
+    // No successful update check yet — say "nothing to offer" rather than leaving the entities in
+    // their default state, which Home Assistant renders as an available update with no target.
+    if (this->ota_active_update_ == nullptr)
+      this->squelch_updates_();
     return;
+  }
   const std::string &method = this->ota_method_str_;
   const bool full = (method == "full");
   // Only offer while the scooter's OTA phase is explicitly IDLE (0x06). Anything else — "unknown"
@@ -1945,16 +2031,10 @@ void LibrescootBleClient::refresh_update_availability_() {
     // progress bar and target version so Home Assistant keeps showing it as "installing" until the
     // new version is confirmed (`set_available(false)` would flip it to NO_UPDATE and drop it out of
     // the updates overview mid-install). Only the other, idle entity is squelched to up-to-date.
-    if (this->mdb_update_ != nullptr && this->ota_active_update_ != this->mdb_update_ &&
-        !this->mdb_version_.empty()) {
-      this->mdb_update_->set_latest(this->mdb_version_, "LibreScoot MDB", "", "");
-      this->mdb_update_->set_available(false);
-    }
-    if (this->dbc_update_ != nullptr && this->ota_active_update_ != this->dbc_update_ &&
-        !this->dbc_version_.empty()) {
-      this->dbc_update_->set_latest(this->dbc_version_, "LibreScoot DBC", "", "");
-      this->dbc_update_->set_available(false);
-    }
+    if (this->ota_active_update_ != this->mdb_update_)
+      squelch_update_(this->mdb_update_, this->mdb_version_, "LibreScoot MDB");
+    if (this->ota_active_update_ != this->dbc_update_)
+      squelch_update_(this->dbc_update_, this->dbc_version_, "LibreScoot DBC");
     return;
   }
   bool busy = this->ota_awaiting_version_ || this->ota_state_ != OtaState::IDLE;
@@ -2198,6 +2278,11 @@ void LibrescootBleClient::on_button(BtnAction a) {
       // Manual DBC install — always available; target = OTA Version if set, else the MDB version.
       this->perform_update(1, true);
       break;
+    // Arm/disarm are buttons, not a switch: the scooter exposes no way to read the armed state
+    // (no alarm status command, and get:alarm.armed answers "unknown key"), so a switch could only
+    // ever show what was last asked for, not what is.
+    case BtnAction::ALARM_ARM: this->run_command_("alarm:arm"); break;
+    case BtnAction::ALARM_DISARM: this->run_command_("alarm:disarm"); break;
     case BtnAction::ALARM_START: this->run_command_("alarm:start"); break;
     case BtnAction::ALARM_STOP: this->run_command_("alarm:stop"); break;
     case BtnAction::NAV_CLEAR: this->run_command_("nav:clear"); break;
@@ -2268,13 +2353,11 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
   switch (k) {
     case SwKind::ALARM_ENABLED:
       this->run_command_(state ? "alarm:enable" : "alarm:disable");
+      // Show the requested state at once so the UI doesn't lag, then ask the scooter what it
+      // actually is — the setting is readable, so this switch reports the truth rather than a wish.
       if (this->alarm_enabled_ != nullptr)
         this->alarm_enabled_->publish_state(state);
-      break;
-    case SwKind::ALARM_ARMED:
-      this->run_command_(state ? "alarm:arm" : "alarm:disarm");
-      if (this->alarm_armed_ != nullptr)
-        this->alarm_armed_->publish_state(state);
+      this->pending_queries_.push_back("get:alarm.enabled");
       break;
     case SwKind::PM_SCHED_HIB:
       this->run_command_(state ? "set:pm.scheduled-hibernate-enabled true"

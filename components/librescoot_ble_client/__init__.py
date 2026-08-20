@@ -11,6 +11,7 @@ BLE plumbing that must stay in the YAML (shared, stack-level settings):
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
+from esphome.core import CORE
 from esphome import automation
 from esphome.components import (
     binary_sensor,
@@ -124,6 +125,9 @@ BINARY_SENSORS = {
     "battery_2_present": ("set_bat2_present", dict(device_class="plug", icon="mdi:battery-check", entity_category="diagnostic")),
     "navigation_active": ("set_nav_active", dict(icon="mdi:navigation-variant", entity_category="diagnostic")),
     "ums_status": ("set_ums_status", dict(icon="mdi:usb-flash-drive", entity_category="diagnostic")),
+    # LTC4020 auxiliary charger, read-only. Its GATT service (9a590120) is absent on current
+    # firmware, so the state is read with the "ltc:status" extended command instead.
+    "aux_charger": ("set_aux_charger", dict(icon="mdi:car-battery", entity_category="diagnostic")),
     "maps_available": ("set_maps_available", dict(icon="mdi:map-check", entity_category="diagnostic")),
     "navigation_available": ("set_nav_available", dict(icon="mdi:navigation-outline", entity_category="diagnostic")),
     "ble_connection": ("set_ble_connection", dict(device_class="connectivity", icon="mdi:bluetooth", entity_category="diagnostic")),
@@ -165,17 +169,31 @@ SELECTS = {
     "ble_link_mode": ("set_link_mode", SelKind.LINK_MODE, ["disconnect", "scan", "auto", "always", "interval"], "diagnostic", "mdi:bluetooth-connect"),
     "ota_channel": ("set_ota_channel", SelKind.OTA_CHANNEL, ["undefined", "stable", "testing", "nightly"], "diagnostic", "mdi:update"),
     "ota_update_method": ("set_ota_method", SelKind.OTA_METHOD, ["delta", "full"], "diagnostic", "mdi:package-variant"),
+    # "direct GitHub" is only offered on a board with PSRAM — see _direct_github_ok().
     "ota_source": ("set_ota_source_select", SelKind.OTA_SOURCE, ["HA relay", "direct GitHub"], "config", "mdi:cloud-download"),
 }
 
+def _direct_github_ok() -> bool:
+    """Can this board fetch the firmware bytes straight from GitHub?
+
+    That means a TLS session to the release CDN alongside BLE and WiFi, which only fits on a board
+    with PSRAM; on internal RAM alone the handshake competes with the Bluetooth stack. Boards without
+    it use the Home Assistant relay, so the option is not compiled in at all.
+    """
+    return "psram" in CORE.config
+
+
+# yaml_key -> (setter, kind_enum, entity_category, icon, restore_mode)
+# restore_mode "DISABLED" is mandatory for anything that commands the scooter: ALWAYS_OFF issues a
+# write_state(false) during setup, which for these would mean sending a command to the vehicle on
+# every boot. DISABLED leaves the state to whatever the scooter reports.
 SWITCHES = {
-    "alarm_enabled": ("set_alarm_enabled", SwKind.ALARM_ENABLED, None, "mdi:alarm-light"),
-    "alarm_armed": ("set_alarm_armed", SwKind.ALARM_ARMED, None, "mdi:shield-lock"),
-    "pm_scheduled_hibernate_enabled": ("set_pm_sched_hib", SwKind.PM_SCHED_HIB, "config", "mdi:calendar-clock"),
-    # Runtime OTA controls (no scooter write). switch_schema defaults restore_mode to ALWAYS_OFF, so
-    # both always start OFF every boot — auto-update can never restore ON and install unattended.
-    "ota_stage_only": ("set_stage_only_switch", SwKind.STAGE_ONLY, "config", "mdi:package-variant-closed"),
-    "ota_auto_update": ("set_auto_update_switch", SwKind.AUTO_UPDATE, "config", "mdi:auto-download"),
+    "alarm_enabled": ("set_alarm_enabled", SwKind.ALARM_ENABLED, None, "mdi:alarm-light", "DISABLED"),
+    "pm_scheduled_hibernate_enabled": ("set_pm_sched_hib", SwKind.PM_SCHED_HIB, "config", "mdi:calendar-clock", "DISABLED"),
+    # Runtime OTA controls (no scooter write, just local flags), so ALWAYS_OFF is right here: both
+    # start OFF every boot and auto-update can never restore ON and install unattended.
+    "ota_stage_only": ("set_stage_only_switch", SwKind.STAGE_ONLY, "diagnostic", "mdi:package-variant-closed", "ALWAYS_OFF"),
+    "ota_auto_update": ("set_auto_update_switch", SwKind.AUTO_UPDATE, "diagnostic", "mdi:auto-download", "ALWAYS_OFF"),
 }
 
 BUTTONS = {
@@ -184,14 +202,16 @@ BUTTONS = {
     "wakeup": (BtnAction.WAKEUP, None, "mdi:power"),
     "reboot_mdb": (BtnAction.REBOOT, "config", "mdi:restart"),
     "reboot_mdb_hard": (BtnAction.REBOOT_HARD, "config", "mdi:restart-alert"),
-    "ble_remove_bond": (BtnAction.REMOVE_BOND, "config", "mdi:bluetooth-off"),
-    "pair_scooter": (BtnAction.PAIR, "config", "mdi:bluetooth-connect"),
+    "ble_remove_bond": (BtnAction.REMOVE_BOND, "diagnostic", "mdi:bluetooth-off"),
+    "pair_scooter": (BtnAction.PAIR, "diagnostic", "mdi:bluetooth-connect"),
     "ota_status_request": (BtnAction.OTA_STATUS_REQ, "diagnostic", "mdi:progress-question"),
     "ota_abort": (BtnAction.OTA_ABORT, "diagnostic", "mdi:cancel"),
     "ota_mdb_update": (BtnAction.OTA_MDB_UPDATE, "diagnostic", "mdi:cloud-download"),
     "ota_dbc_update": (BtnAction.OTA_DBC_UPDATE, "diagnostic", "mdi:cloud-download"),
-    "system_time_sync": (BtnAction.SYSTIME_SYNC, "diagnostic", "mdi:clock-check"),
+    "system_time_sync": (BtnAction.SYSTIME_SYNC, "config", "mdi:clock-check"),
     "restart_esp": (BtnAction.RESTART_ESP, "config", "mdi:restart"),
+    "alarm_arm": (BtnAction.ALARM_ARM, None, "mdi:shield-lock"),
+    "alarm_disarm": (BtnAction.ALARM_DISARM, None, "mdi:shield-off"),
     "alarm_start": (BtnAction.ALARM_START, None, "mdi:alarm-light-outline"),
     "alarm_stop": (BtnAction.ALARM_STOP, None, "mdi:alarm-off"),
     "navigation_clear": (BtnAction.NAV_CLEAR, "diagnostic", "mdi:map-marker-off"),
@@ -205,7 +225,7 @@ TEXTS = {
     "cellular_apn": ("set_apn_text", TxtKind.CELLULAR_APN, 0, 64, "config", "mdi:sim"),
     "pm_scheduled_hibernate_cron": ("set_pm_cron_text", TxtKind.PM_CRON, 0, 64, "config", "mdi:calendar-clock"),
     "pm_scheduled_hibernate_duration": ("set_pm_duration_text", TxtKind.PM_DURATION, 0, 32, "config", "mdi:timer-sand"),
-    "system_time_iso": (None, TxtKind.SYSTIME_ISO, 0, 32, "diagnostic", "mdi:clock-edit-outline"),
+    "system_time_iso": (None, TxtKind.SYSTIME_ISO, 0, 32, "config", "mdi:clock-edit-outline"),
     "ota_source_url": ("set_ota_source_url_text", TxtKind.OTA_SOURCE_URL, 0, 200, "diagnostic", "mdi:link-variant"),
     "ota_version": ("set_ota_version_text", TxtKind.OTA_VERSION, 0, 64, "diagnostic", "mdi:tag-outline"),
 }
@@ -232,7 +252,10 @@ _ENTITY_SCHEMAS.update(
     {cv.Optional(k): select.select_schema(LibrescootSelect, **_ekw(ec, icon)) for k, (_s, _kd, _o, ec, icon) in SELECTS.items()}
 )
 _ENTITY_SCHEMAS.update(
-    {cv.Optional(k): switch.switch_schema(LibrescootSwitch, **_ekw(ec, icon)) for k, (_s, _kd, ec, icon) in SWITCHES.items()}
+    {
+        cv.Optional(k): switch.switch_schema(LibrescootSwitch, default_restore_mode=rm, **_ekw(ec, icon))
+        for k, (_s, _kd, ec, icon, rm) in SWITCHES.items()
+    }
 )
 _ENTITY_SCHEMAS.update(
     {cv.Optional(k): button.button_schema(LibrescootButton, **_ekw(ec, icon)) for k, (_a, ec, icon) in BUTTONS.items()}
@@ -317,6 +340,18 @@ async def to_code(config):
             _ota_src_default = "github" if esp32.get_esp32_variant() == "ESP32S3" else "relay"
         except Exception:  # noqa: BLE001 - be safe if the variant can't be determined
             _ota_src_default = "relay"
+    # Release notes are passed through to Home Assistant uncapped, so the limit is the board's RAM:
+    # the text is held per component plus a copy in each update entity.
+    cg.add_define("LSC_CHANGELOG_MAX", 16000 if _direct_github_ok() else 7000)
+    if not _direct_github_ok():
+        if _ota_src_default == "github":
+            raise cv.Invalid(
+                "ota_source_default: 'github' needs a board with PSRAM. Add `psram:` (an ESP32-S3 "
+                "N16R8 or similar), or use 'relay' and let the Home Assistant integration serve the "
+                "firmware bytes."
+            )
+    else:
+        cg.add_define("LSC_DIRECT_GITHUB")
     cg.add(var.set_ota_source_default(_ota_src_default))
     if CONF_FIRMWARE_SOURCE in config:  # after set_github_repo (which sets the default source)
         cg.add(var.set_firmware_source(config[CONF_FIRMWARE_SOURCE]))
@@ -348,13 +383,15 @@ async def to_code(config):
     # --- selects ---
     for key, (setter, kind, options, _ec, _icon) in SELECTS.items():
         if key in config:
+            if key == "ota_source" and not _direct_github_ok():
+                options = [o for o in options if o != "direct GitHub"]
             sel = await select.new_select(config[key], options=options)
             await cg.register_parented(sel, var)
             cg.add(sel.set_kind(kind))
             cg.add(getattr(var, setter)(sel))
 
     # --- switches ---
-    for key, (setter, kind, _ec, _icon) in SWITCHES.items():
+    for key, (setter, kind, _ec, _icon, _rm) in SWITCHES.items():
         if key in config:
             sw = await switch.new_switch(config[key])
             await cg.register_parented(sw, var)

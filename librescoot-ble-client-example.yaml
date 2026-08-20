@@ -197,6 +197,10 @@ librescoot_ble_client:
 
   navigation_active:
     name: "Navigation Active"
+  # LTC4020 aux charger state, read with the "ltc:status" extended command on connect
+  # (its GATT service 9a590120 is not exposed by the current firmware).
+  aux_charger:
+    name: "Aux Charger"
   ums_status:
     name: "UMS Status"
   maps_available:
@@ -225,19 +229,19 @@ librescoot_ble_client:
   # asking for the pairing passkey; enter it with the passkey_reply action (or, with the HA
   # integration, its Repair dialog). Turns OFF once bonding succeeds.
   passkey_required:
-    name: "Passkey Required"
+    name: "BLE Passkey Required"
   # Problem sensor (device_class: problem). ON only when the configured scooter is in range
   # (advertising) but not bonded — i.e. an unrequested (re)pair was refused because the bond was
   # lost. Never fires just because the scooter is away or momentarily disconnected. The HA
   # integration turns this into a Repair that starts the pairing flow. Clears on bond / out of range.
   pairing_required:
-    name: "Pairing Required"
+    name: "BLE Pairing Required"
   # Problem sensor (device_class: problem). ON when the scooter has sat in "pending reboot" for
   # >20 min — a firmware install finished but the reboot that applies it hasn't happened (or the
   # BLE status latched stale). Press "Reboot MDB" to clear it (the HA integration offers this as a
   # Repair). Turns OFF as soon as the scooter leaves pending-reboot.
   reboot_required:
-    name: "Reboot Required"
+    name: "OTA Reboot Required"
   rssi:
     name: "BLE RSSI"
   ble_link_mode:
@@ -245,7 +249,7 @@ librescoot_ble_client:
   # The scooter MAC this ESP is configured for (its `mac_address`), always shown — the HA
   # integration reads it to preselect/show the connected scooter without scanning.
   scooter_mac:
-    name: "Scooter MAC"
+    name: "BLE Scooter nRF MAC"
   # On = the Home Assistant "Librescoot-BLE-Client" integration is active — the component pings
   # its plain-HTTP OTA relay. Drives whether OTA is possible (else the ESP needs direct-GitHub).
   ha_integration:
@@ -270,10 +274,9 @@ librescoot_ble_client:
     name: "Reboot MDB (hard)"
 
   # ----- Alarm & navigation --------------------------------------------------
+  # Reflects the scooter's real alarm.enabled setting (read on connect and after each toggle).
   alarm_enabled:
     name: "Alarm Enabled"
-  alarm_armed:
-    name: "Alarm Armed"
   # OTA control switches (always start OFF each boot; no scooter write).
   # OTA Stage Only: transfers run fully but stop before COMPLETE (staging test, nothing installed).
   ota_stage_only:
@@ -282,6 +285,11 @@ librescoot_ble_client:
   # latest, MDB-first), waiting out each reboot, then switch itself off when everything is up to date.
   ota_auto_update:
     name: "OTA Auto Update"
+  # Arm/disarm are buttons: the scooter offers no way to read the armed state back.
+  alarm_arm:
+    name: "Alarm Arm"
+  alarm_disarm:
+    name: "Alarm Disarm"
   alarm_start:
     name: "Alarm Start"
   alarm_stop:
@@ -326,7 +334,7 @@ librescoot_ble_client:
   # Explicitly (re)bond with the scooter. The ESP NEVER pairs on its own — a lost/stale bond just
   # releases the link; press this (or use the HA pairing Repair) to bond intentionally.
   pair_scooter:
-    name: "Pair Scooter"
+    name: "BLE Pair Scooter"
   restart_esp:
     name: "Restart ESPHome Device"
 

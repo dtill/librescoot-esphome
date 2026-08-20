@@ -14,6 +14,8 @@
 
 #include "sdkconfig.h"
 #include "esp_http_client.h"
+#include "esp_heap_caps.h"
+#include "miniz.h"  // tinfl_* live in ROM on both ESP32 and ESP32-S3 — inflate costs no flash
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
@@ -139,6 +141,14 @@ void LibrescootBleClient::ota_user_abort() {
     return;
   ESP_LOGW(OTAG, "user abort");
   bool was_awaiting = this->ota_awaiting_version_;
+  // ota_active_ (which pins the BLE link while the scooter installs) is derived purely from
+  // incoming OTA_STATUS notifications. If the ABORT_ACK never arrives — a dropped link, a scooter
+  // that stays quiet — it stays latched and the link is held even in a mode that should release it.
+  // The user asked to stop, so drop the pin here instead of waiting to be told.
+  if (this->ota_active_) {
+    this->ota_active_ = false;
+    this->apply_link_state_();
+  }
   this->ota_jobs_.clear();               // don't start the next queued component (e.g. DBC)
   this->ota_cancel_ = true;              // discard a resolve result that may still be in flight
   this->ota_awaiting_version_ = false;   // stop waiting for the post-install reboot/version
@@ -488,6 +498,26 @@ void LibrescootBleClient::ota_producer_task_(void *arg) {
   vTaskDelete(nullptr);
 }
 
+// Open a request and follow redirects by hand: the streaming API (open + fetch_headers, as opposed
+// to esp_http_client_perform) does not auto-follow, and both GitHub asset URLs and the HA relay 302
+// to the signed CDN URL. Returns the final HTTP status, or -1 if the connection could not be opened.
+static int http_open_following_(esp_http_client_handle_t c) {
+  if (esp_http_client_open(c, 0) != ESP_OK)
+    return -1;
+  esp_http_client_fetch_headers(c);
+  int status = esp_http_client_get_status_code(c);
+  for (int redir = 0; (status == 301 || status == 302 || status == 307 || status == 308) && redir < 5;
+       redir++) {
+    esp_http_client_set_redirection(c);  // reads Location into the client URL
+    esp_http_client_close(c);
+    if (esp_http_client_open(c, 0) != ESP_OK)
+      return -1;
+    esp_http_client_fetch_headers(c);
+    status = esp_http_client_get_status_code(c);
+  }
+  return status;
+}
+
 void LibrescootBleClient::ota_producer_() {
   esp_http_client_config_t cfg = {};
   cfg.url = this->ota_url_.c_str();
@@ -507,20 +537,8 @@ void LibrescootBleClient::ota_producer_() {
   esp_http_client_set_header(c, "Range", range);
 
   bool ok = false;
-  if (esp_http_client_open(c, 0) == ESP_OK) {
-    esp_http_client_fetch_headers(c);
-    int status = esp_http_client_get_status_code(c);
-    // The streaming API does not auto-follow redirects; GitHub 302s to the signed CDN URL.
-    for (int redir = 0; (status == 301 || status == 302 || status == 307 || status == 308) && redir < 5; redir++) {
-      esp_http_client_set_redirection(c);  // reads Location into the client URL
-      esp_http_client_close(c);
-      if (esp_http_client_open(c, 0) != ESP_OK) {
-        status = -1;
-        break;
-      }
-      esp_http_client_fetch_headers(c);
-      status = esp_http_client_get_status_code(c);
-    }
+  {
+    int status = http_open_following_(c);
     if (status == 200 || status == 206) {
       int idle = 0;
       while (this->ota_producer_run_ && this->ota_produced_ < this->ota_total_) {
@@ -550,16 +568,255 @@ void LibrescootBleClient::ota_producer_() {
         }
       }
       ok = this->ota_produced_ >= this->ota_total_;
+      // Only a *stream* that ends by itself is worth a warning: when the consumer stops the
+      // transfer it clears ota_producer_run_, and the short read is then the intended shutdown.
+      if (!ok && this->ota_producer_run_)
+        ESP_LOGW(OTAG, "download ended early: %u/%u B (complete=%d)", (unsigned) this->ota_produced_,
+                 (unsigned) this->ota_total_, (int) esp_http_client_is_complete_data_received(c));
+    } else if (status < 0) {
+      ESP_LOGW(OTAG, "download connection failed");
     } else {
       ESP_LOGW(OTAG, "download HTTP %d", status);
     }
-  } else {
-    ESP_LOGW(OTAG, "download connection failed");
   }
   esp_http_client_close(c);
   esp_http_client_cleanup(c);
   this->ota_http_ok_ = ok;
   this->ota_producer_done_ = true;
+}
+
+// ---------------------------------------------------------------------------
+// Delta pre-flight: which release does this .delta patch against?
+// ---------------------------------------------------------------------------
+// A .delta is a gzip'd tar whose first regular member is metadata.json, carrying
+// "old_artifact_name" — the exact release the patch was generated against. The scooter does not
+// check it: it assumes the running version IS that release, applies the patch, and only notices
+// the mismatch at the very end as a checksum failure. Reading it here costs one ranged GET of the
+// archive head and turns a doomed multi-minute transfer into an immediate, explicit refusal.
+
+// 4 kB of the archive inflates to ~15 kB, and the tar carries PAX headers before every member, so
+// metadata.json's body sits around offset 3–4.5 kB — the 16 kB window keeps a wide margin for
+// further members appearing ahead of it.
+static const size_t DELTA_PROBE_BYTES = 4096;
+static const size_t DELTA_INFLATE_CAP = 8192;
+// The inflate state alone is ~11 kB and a board without PSRAM runs the BLE stack, WiFi and this
+// request out of one small heap. The probe is a safeguard, not a requirement: below this much free
+// heap it is skipped rather than risk starving the stack that is about to stream the update.
+static const size_t DELTA_PROBE_HEAP_MIN = 44 * 1024;
+
+// Skip the gzip framing (RFC 1952): 10 fixed bytes, then the optional FEXTRA/FNAME/FCOMMENT/FHCRC
+// fields selected by the flag byte. What follows is the raw deflate stream tinfl consumes.
+static const uint8_t *gz_deflate_start_(const uint8_t *in, size_t len) {
+  if (len < 18 || in[0] != 0x1F || in[1] != 0x8B || in[2] != 0x08)
+    return nullptr;
+  uint8_t flg = in[3];
+  size_t p = 10;
+  if (flg & 0x04) {  // FEXTRA
+    if (p + 2 > len)
+      return nullptr;
+    p += 2 + ((size_t) in[p] | ((size_t) in[p + 1] << 8));
+  }
+  if (flg & 0x08)  // FNAME
+    while (p < len && in[p++] != 0) {
+    }
+  if (flg & 0x10)  // FCOMMENT
+    while (p < len && in[p++] != 0) {
+    }
+  if (flg & 0x02)  // FHCRC
+    p += 2;
+  return p < len ? in + p : nullptr;
+}
+
+// Inflate the head of a deliberately truncated deflate stream. HAS_MORE_INPUT is what makes the
+// truncation clean: tinfl then reports "needs more input" and keeps the bytes it already produced,
+// instead of treating the missing tail as corrupt. Returns the number of bytes written.
+// Prefer PSRAM for these transient blocks so the internal heap the BLE stack needs is untouched;
+// on a board without it this is a plain malloc.
+static void *probe_alloc_(size_t n) {
+  void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return p != nullptr ? p : malloc(n);
+}
+
+static size_t inflate_head_(const uint8_t *deflate, size_t in_len, uint8_t *out, size_t out_cap) {
+  auto *d = (tinfl_decompressor *) probe_alloc_(sizeof(tinfl_decompressor));
+  if (d == nullptr) {
+    ESP_LOGW(OTAG, "delta probe: out of memory for the %u B inflate state", (unsigned) sizeof(*d));
+    return 0;
+  }
+  tinfl_init(d);
+  size_t in_sz = in_len, out_sz = out_cap;
+  tinfl_status st = tinfl_decompress(d, deflate, &in_sz, out, out, &out_sz,
+                                     TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF | TINFL_FLAG_HAS_MORE_INPUT);
+  heap_caps_free(d);
+  bool usable = st == TINFL_STATUS_DONE || st == TINFL_STATUS_NEEDS_MORE_INPUT ||
+                st == TINFL_STATUS_HAS_MORE_OUTPUT;
+  return usable ? out_sz : 0;
+}
+
+// Walk the tar members in an inflated archive head and return the "old_artifact_name" from
+// metadata.json, with the "release-" prefix stripped so it compares against a release tag. PAX
+// headers (./@PaxHeader, one before each real member) simply do not match the name and are skipped
+// like any other member.
+static std::string delta_base_from_tar_(const uint8_t *tar, size_t len) {
+  static const char WANT[] = "metadata.json";
+  static const size_t WANT_LEN = sizeof(WANT) - 1;
+  for (size_t p = 0; p + 512 <= len;) {
+    const char *name = (const char *) tar + p;
+    if (name[0] == '\0')
+      break;  // end-of-archive padding
+    size_t nlen = strnlen(name, 100);
+    char oct[13];
+    memcpy(oct, tar + p + 124, 12);
+    oct[12] = '\0';
+    size_t size = (size_t) strtoul(oct, nullptr, 8);
+    p += 512;
+    if (nlen >= WANT_LEN && memcmp(name + nlen - WANT_LEN, WANT, WANT_LEN) == 0) {
+      if (p + size > len)
+        return "";  // the member did not fit in the range we asked for
+      const std::string js((const char *) tar + p, size);
+      size_t k = js.find("\"old_artifact_name\"");
+      if (k == std::string::npos)
+        return "";
+      k = js.find('"', js.find(':', k) + 1);
+      if (k == std::string::npos)
+        return "";
+      size_t e = js.find('"', ++k);
+      if (e == std::string::npos)
+        return "";
+      std::string v = js.substr(k, e - k);
+      if (v.rfind("release-", 0) == 0)
+        v = v.substr(8);
+      return v;
+    }
+    p += (size + 511) & ~(size_t) 511;
+  }
+  return "";
+}
+
+// Ask the Home Assistant relay for the base instead of reading the archive here. It fetches the
+// same bytes anyway, has the memory to decompress them, and answers a short tag — so a board with
+// only internal RAM gets the check too. Empty means "could not tell", never "mismatch".
+std::string LibrescootBleClient::ota_delta_base_relay_(const std::string &url) {
+  // http://host:port/ota/<secret>/<tag>/<file> -> .../base/<secret>/<tag>/<file>, the same
+  // rewrite the scan endpoint uses.
+  std::string q = url;
+  size_t p = q.find("/ota/");
+  if (p == std::string::npos)
+    return "";
+  q.replace(p, 5, "/base/");
+
+  esp_http_client_config_t cfg = {};
+  cfg.url = q.c_str();
+  cfg.timeout_ms = 20000;  // the relay may have to fetch from GitHub before it can answer
+  cfg.buffer_size = 512;
+  cfg.buffer_size_tx = 1024;
+  esp_http_client_handle_t c = esp_http_client_init(&cfg);
+  if (c == nullptr)
+    return "";
+  esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
+
+  std::string base;
+  int status = http_open_following_(c);
+  if (status == 200) {
+    char buf[80];
+    int r = esp_http_client_read(c, buf, sizeof(buf) - 1);
+    if (r > 0) {
+      buf[r] = '\0';
+      base.assign(buf);
+      while (!base.empty() && (base.back() == '\n' || base.back() == '\r' || base.back() == ' '))
+        base.pop_back();
+    }
+  } else if (status != 204) {
+    // 204 is the relay saying "I could not determine it" — expected, not worth a warning.
+    ESP_LOGW(OTAG, "delta base via relay: HTTP %d", status);
+  }
+  esp_http_client_close(c);
+  esp_http_client_cleanup(c);
+  ESP_LOGD(OTAG, "delta base via relay: '%s'", base.c_str());
+  return base;
+}
+
+std::string LibrescootBleClient::ota_delta_base_(const std::string &url) {
+  // A plain-HTTP source is the HA relay, which can answer this directly; https means GitHub, where
+  // the archive has to be read here.
+  if (url.rfind("http://", 0) == 0)
+    return this->ota_delta_base_relay_(url);
+  return this->ota_delta_base_onchip_(url);
+}
+
+std::string LibrescootBleClient::ota_delta_base_onchip_(const std::string &url) {
+  size_t heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  if (heap < DELTA_PROBE_HEAP_MIN) {
+    ESP_LOGW(OTAG, "delta probe: skipped, only %u B heap free", (unsigned) heap);
+    return "";
+  }
+  esp_http_client_config_t cfg = {};
+  cfg.url = url.c_str();
+  if (url.rfind("https", 0) == 0)
+    this->ota_http_tls_(&cfg);
+  cfg.timeout_ms = 15000;
+  cfg.buffer_size = 4096;
+  cfg.buffer_size_tx = 4096;  // the CDN redirect target is a ~1 kB signed URL (see ota_producer_)
+  esp_http_client_handle_t c = esp_http_client_init(&cfg);
+  esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
+  esp_http_client_set_header(c, "Range", "bytes=0-4095");
+
+  std::string base;
+  {
+    // Same request path as the transfer itself, redirects included — the asset URL 302s to the CDN.
+    int status = http_open_following_(c);
+    ESP_LOGD(OTAG, "delta probe: status=%d free heap %u B (largest block %u B)", status,
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    // 206 is what both GitHub and the relay answer; a 200 (range ignored) is fine too — we simply
+    // stop reading after the head.
+    if (status == 200 || status == 206) {
+      auto *raw = (uint8_t *) probe_alloc_(DELTA_PROBE_BYTES);
+      if (raw == nullptr) {
+        ESP_LOGW(OTAG, "delta probe: out of memory for the %u B read buffer", (unsigned) DELTA_PROBE_BYTES);
+      } else {
+        size_t got = 0;
+        for (int empty = 0; got < DELTA_PROBE_BYTES && empty < 5;) {
+          int r = esp_http_client_read(c, (char *) raw + got, DELTA_PROBE_BYTES - got);
+          if (r > 0) {
+            got += (size_t) r;
+            empty = 0;
+          } else if (r == 0) {
+            empty++;  // nothing available yet — a short head would read as "base unknown"
+            vTaskDelay(pdMS_TO_TICKS(20));
+          } else {
+            break;
+          }
+        }
+        const uint8_t *df = gz_deflate_start_(raw, got);
+        size_t inflated = 0;
+        if (df != nullptr) {
+          // The generous window is a margin, not a requirement — metadata.json's body ends around
+          // 4.5 kB, so an internal-RAM-only board falls back rather than skipping the check.
+          size_t cap = DELTA_INFLATE_CAP;
+          auto *inf = (uint8_t *) probe_alloc_(cap);
+          if (inf == nullptr) {
+            ESP_LOGW(OTAG, "delta probe: out of memory for the inflate window");
+          } else {
+            inflated = inflate_head_(df, got - (size_t)(df - raw), inf, cap);
+            base = delta_base_from_tar_(inf, inflated);
+            heap_caps_free(inf);
+          }
+        }
+        ESP_LOGD(OTAG, "delta probe: http=%d got=%u gzhdr=%d inflated=%u base='%s'", status,
+                 (unsigned) got, df != nullptr ? (int) (df - raw) : -1, (unsigned) inflated,
+                 base.c_str());
+        heap_caps_free(raw);
+      }
+    } else if (status < 0) {
+      ESP_LOGW(OTAG, "delta probe: connection failed");
+    } else {
+      ESP_LOGW(OTAG, "delta probe: HTTP %d", status);
+    }
+  }
+  esp_http_client_close(c);
+  esp_http_client_cleanup(c);
+  return base;
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +927,19 @@ void LibrescootBleClient::ota_resolve_() {
 
   ESP_LOGI(OTAG, "resolve: MDB %s DBC %s", this->rs_mdb_ok_ ? this->rs_mdb_name_.c_str() : "(none)",
            this->rs_dbc_ok_ ? this->rs_dbc_name_.c_str() : "(none)");
+
+  // Delta pre-flight, for the one component this install is for (see ota_delta_base_). Full images
+  // carry no base requirement, so they are not probed.
+  this->rs_delta_base_.clear();
+  if (this->ota_method_str_ != "full") {
+    bool mdb = this->ota_install_component_ == 0;
+    if (mdb ? this->rs_mdb_ok_ : this->rs_dbc_ok_) {
+      const std::string &nm = mdb ? this->rs_mdb_name_ : this->rs_dbc_name_;
+      this->rs_delta_base_ = this->ota_delta_base_(this->rs_source_ + "/" + this->rs_tag_ + "/" + nm);
+      ESP_LOGI(OTAG, "resolve: %s delta patches %s", comp_name(this->ota_install_component_),
+               this->rs_delta_base_.empty() ? "(base unknown)" : this->rs_delta_base_.c_str());
+    }
+  }
   this->ota_resolve_done_ = true;
 }
 
@@ -844,6 +1114,15 @@ void LibrescootBleClient::ota_finish_(bool ok) {
     this->ota_auto_check_pending_ = false;
     if (this->auto_update_sw_ != nullptr)
       this->auto_update_sw_->publish_state(false);
+  }
+
+  // Same latch as on a user abort: ota_active_ pins the BLE link and is only ever cleared by an
+  // incoming OTA_STATUS. When a failure ends the whole sequence — nothing queued, no self-heal
+  // retry pending — there is nothing left to hold the link for, so release it rather than wait for
+  // a notification that may never come. A pending retry keeps the pin: the resume needs the link.
+  if (!ok && this->ota_active_ && this->ota_jobs_.empty() && this->ota_selfheal_at_ms_ == 0) {
+    this->ota_active_ = false;
+    this->apply_link_state_();
   }
 
   if (ok && !this->ota_jobs_.empty()) {

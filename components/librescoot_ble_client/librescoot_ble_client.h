@@ -32,11 +32,11 @@ namespace espbt = esphome::esp32_ble_tracker;
 enum class BtnAction : uint8_t {
   SEATBOX_OPEN, HIBERNATE, WAKEUP, REBOOT, REBOOT_HARD, REMOVE_BOND,
   OTA_STATUS_REQ, OTA_ABORT, SYSTIME_SYNC, RESTART_ESP,
-  ALARM_START, ALARM_STOP, NAV_CLEAR, CANCEL_HIBERNATE, REFRESH, OTA_MDB_UPDATE, OTA_DBC_UPDATE,
+  ALARM_ARM, ALARM_DISARM, ALARM_START, ALARM_STOP, NAV_CLEAR, CANCEL_HIBERNATE, REFRESH, OTA_MDB_UPDATE, OTA_DBC_UPDATE,
   PAIR,
 };
 enum class SelKind : uint8_t { BLINKER, USB_MODE, LINK_MODE, OTA_CHANNEL, OTA_METHOD, OTA_SOURCE };
-enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE };
+enum class SwKind : uint8_t { ALARM_ENABLED, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE };
 enum class TxtKind : uint8_t {
   COMMAND, NAV_DEST, CELLULAR_APN, PM_CRON, PM_DURATION, SYSTIME_ISO, OTA_SOURCE_URL, OTA_VERSION
 };
@@ -103,6 +103,13 @@ class LibrescootUpdate : public update::UpdateEntity, public Parented<Librescoot
   void perform(bool force) override;
   void set_current(const std::string &v) {
     this->update_info_.current_version = v;
+    // Home Assistant derives "an update is available" from latest != installed. A version learned
+    // over BLE arrives long before the first GitHub check has a target, so publishing it on its own
+    // shows up as an offer with an empty target. Keep the two equal until a real target exists.
+    if (this->update_info_.latest_version.empty()) {
+      this->update_info_.latest_version = v;
+      this->state_ = update::UPDATE_STATE_NO_UPDATE;
+    }
     this->publish_state();
   }
   void set_latest(const std::string &latest, const std::string &title, const std::string &url,
@@ -188,6 +195,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void set_bat1_present(binary_sensor::BinarySensor *b) { bat1_present_ = b; }
   void set_bat2_present(binary_sensor::BinarySensor *b) { bat2_present_ = b; }
   void set_nav_active(binary_sensor::BinarySensor *b) { nav_active_ = b; }
+  void set_aux_charger(binary_sensor::BinarySensor *b) { aux_charger_ = b; }
   void set_ums_status(binary_sensor::BinarySensor *b) { ums_status_ = b; }
   void set_maps_available(binary_sensor::BinarySensor *b) { maps_available_ = b; }
   void set_nav_available(binary_sensor::BinarySensor *b) { nav_available_ = b; }
@@ -231,7 +239,6 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void set_ota_source_default(const std::string &m) { this->ota_source_default_ = m; }
 
   void set_alarm_enabled(LibrescootSwitch *s) { alarm_enabled_ = s; }
-  void set_alarm_armed(LibrescootSwitch *s) { alarm_armed_ = s; }
   void set_pm_sched_hib(LibrescootSwitch *s) { pm_sched_hib_ = s; }
   void set_stage_only_switch(LibrescootSwitch *s) { stage_only_sw_ = s; }
   void set_auto_update_switch(LibrescootSwitch *s) { auto_update_sw_ = s; }
@@ -321,6 +328,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void ota_http_tls_(esp_http_client_config_t *cfg);
   void apply_check_result_();              // main-loop: push task result to the entities
   void refresh_update_availability_();     // recompute MDB/DBC available from known versions
+  void squelch_updates_();                 // park both update entities at "no update"
   void ota_auto_update_tick_();            // OTA Auto Update: install the next offered update / self-off
   std::string gh_successor_(const std::string &from) const;  // adjacent next release from gh_tags_
   bool ota_offers_allowed_() const;        // scooter in range AND a link mode that will connect
@@ -342,6 +350,12 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void ota_producer_();                    // HTTP producer, runs in its own task
   // Install path: resolve the delta assets for the latest release, then transfer MDB + DBC.
   void ota_resolve_();                     // runs in its own task (GitHub asset metadata)
+  // The release a .delta patches against; empty when it could not be determined. Blocking — worker
+  // task only. Dispatches to whichever route the byte source offers: the Home Assistant relay reads
+  // the archive itself (no cost here, works on any board), a direct GitHub source is read on-chip.
+  std::string ota_delta_base_(const std::string &url);
+  std::string ota_delta_base_relay_(const std::string &url);
+  std::string ota_delta_base_onchip_(const std::string &url);
   static void ota_resolve_task_(void *arg);
   void ota_kick_next_job_();               // start the next queued transfer when idle
   void ota_begin_await_version_();         // after install: wait for the reboot + new version
@@ -419,7 +433,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   uint32_t ota_log_last_prod_{0}, ota_log_last_ack_{0};
 
   binary_sensor::BinarySensor *bat1_present_{nullptr}, *bat2_present_{nullptr};
-  binary_sensor::BinarySensor *nav_active_{nullptr}, *ums_status_{nullptr};
+  binary_sensor::BinarySensor *nav_active_{nullptr}, *ums_status_{nullptr}, *aux_charger_{nullptr};
   binary_sensor::BinarySensor *maps_available_{nullptr}, *nav_available_{nullptr};
   binary_sensor::BinarySensor *ble_connection_{nullptr}, *ble_presence_{nullptr};
   uint32_t presence_timeout_ms_{60000};  // "Home" if an advert was seen within this window
@@ -496,7 +510,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   std::string github_base_() const { return "https://github.com/" + this->github_repo_ + "/releases/download"; }
   void apply_ota_source_(const std::string &mode, bool persist);  // set mode → url, publish, persist
   std::string ota_method_str_{"delta"};  // delta (default) or full (.mender image)
-  LibrescootSwitch *alarm_enabled_{nullptr}, *alarm_armed_{nullptr}, *pm_sched_hib_{nullptr};
+  LibrescootSwitch *alarm_enabled_{nullptr}, *pm_sched_hib_{nullptr};
   LibrescootSwitch *stage_only_sw_{nullptr}, *auto_update_sw_{nullptr};
   text::Text *command_text_{nullptr}, *apn_text_{nullptr}, *pm_cron_text_{nullptr}, *pm_duration_text_{nullptr};
   text::Text *ota_source_url_text_{nullptr};
@@ -594,6 +608,9 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   volatile bool ota_resolve_done_{false};
   volatile bool ota_cancel_{false};      // abort requested while a resolve is in flight
   bool rs_mdb_ok_{false}, rs_dbc_ok_{false};
+  // The release a resolved .delta patches against, read from the archive before transferring
+  // it. Empty when the target is a full image or the base could not be read.
+  std::string rs_delta_base_;
   // After the last component's install is queued, stay "installing" until the scooter reboots
   // and BLE reports the new version — or the user aborts the wait.
   bool ota_awaiting_version_{false};
@@ -603,7 +620,6 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   // offered when this is 0x06 (idle); any other value — including unknown — suppresses them and
   // shows the ongoing status instead. Requested via STATUS_REQ on every connect.
   uint8_t ota_scooter_phase_{0xFF};
-  uint32_t ota_status_retry_ms_{0};  // re-ask STATUS_REQ while the phase is still unknown (0xFF)
   // Stuck-pending-reboot watchdog: when the phase has been pending-reboot (0x02) continuously for
   // >20 min, raise reboot_required_ so the HA integration can offer a manual restart. Re-requests
   // STATUS_REQ every 30 s while pending so a clear (or a genuinely-needed reboot) is caught.
