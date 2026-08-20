@@ -1247,6 +1247,7 @@ void LibrescootBleClient::ota_begin_await_version_() {
   this->ota_awaiting_version_ = true;
   this->ota_await_tag_ = this->rs_tag_;
   this->ota_await_until_ms_ = millis() + 30UL * 60 * 1000;  // safety cap; user can abort sooner
+  this->ota_await_poll_ms_ = millis() + 15000;  // then re-ask the version every 15 s until it moves
   if (this->ota_active_update_ != nullptr)
     this->ota_active_update_->set_progress(100.0f);  // stay in "installing" until the reboot confirms
   if (this->ota_status_ != nullptr)

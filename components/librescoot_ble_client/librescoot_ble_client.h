@@ -641,6 +641,8 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   bool ota_awaiting_version_{false};
   std::string ota_await_tag_;
   uint32_t ota_await_until_ms_{0};
+  uint32_t ota_await_poll_ms_{0};          // next re-request of the installed component's version
+  void ota_request_installed_version_();   // ask the scooter what the installed component runs now
   // Last INSTALL_PROGRESS phase the scooter reported (0xFF = not asked yet). Updates are only
   // offered when this is 0x06 (idle); any other value — including unknown — suppresses them and
   // shows the ongoing status instead. Requested via STATUS_REQ on every connect.

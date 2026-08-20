@@ -521,6 +521,11 @@ void LibrescootBleClient::loop() {
       ESP_LOGW("ota", "install: new version not confirmed in time; resetting");
       this->ota_awaiting_version_ = false;
       this->ota_settle_update_entity_();
+    } else if (now >= this->ota_await_poll_ms_) {
+      // Keep asking until it changes — this is what releases the update entity from "installing
+      // 100 %"; without it the entity waits for a reconnect that may never come.
+      this->ota_await_poll_ms_ = now + 15000;
+      this->ota_request_installed_version_();
     }
   }
 
@@ -978,6 +983,35 @@ void LibrescootBleClient::on_connected_() {
   if (this->pm_duration_text_ != nullptr)
     this->pending_queries_.push_back("get:pm.scheduled-hibernate-duration");
   this->next_query_ms_ = millis() + 3000;
+}
+
+// Ask the scooter, right now, which version the component we just installed is running. The two
+// versions arrive by very different routes and neither refreshes on its own quickly enough for an
+// install to be confirmed: MDB is a polled characteristic on a 30 minute interval, and DBC is only
+// readable through the extended-command channel, which is queried on connect. If the scooter never
+// drops the link across the install (a DBC image that "applies on next power-on" does not reboot
+// it), nothing re-reads either of them and the update entity sits at 100 % indefinitely.
+void LibrescootBleClient::ota_request_installed_version_() {
+  if (this->state() != espbt::ClientState::ESTABLISHED)
+    return;
+  if (this->ota_install_component_ == 0) {
+    auto *e = this->find_char_(CharId::SW_MDB);
+    if (e != nullptr && e->handle != 0) {
+      e->force = true;  // the read rotation retries a forced read until it succeeds
+      e->tries = 0;
+      e->last_ms = millis() - 1200;  // due immediately
+    }
+    return;
+  }
+  for (const auto &q : this->pending_queries_)
+    if (q == "status:version:dbc")
+      return;  // already queued
+  const bool was_idle = this->pending_queries_.empty();
+  this->pending_queries_.push_back("status:version:dbc");
+  // Send it straight away only when nothing else is queued; otherwise let the existing spacing
+  // run — the command channel is shared and crowding it is what fails first at weak signal.
+  if (was_idle && this->next_query_ms_ > millis())
+    this->next_query_ms_ = millis();
 }
 
 void LibrescootBleClient::refresh_() {
@@ -2219,7 +2253,7 @@ void LibrescootBleClient::perform_update(uint8_t component, bool force) {
   // Target: the OTA Version text if the user set one, else the per-component target the availability
   // logic computed (delta → the successor of that component's installed version; full → the channel
   // latest). Fall back to older heuristics if the check hasn't produced a target yet.
-  std::string tag = this->ota_target_version_;
+  std::string tag = version_to_tag(this->ota_target_version_);  // pin may predate the normalisation
   if (tag.empty())
     tag = (component == 1) ? this->gh_dbc_target_ : this->gh_mdb_target_;
   if (tag.empty())
@@ -2455,9 +2489,13 @@ void LibrescootBleClient::on_text(TxtKind k, const std::string &value) {
     case TxtKind::OTA_VERSION:
       // Target release tag for OTA Update; blank = follow the offered target (which is prefilled
       // here for convenience). Verified against GitHub when the transfer is triggered.
-      this->ota_target_version_ = value;
+      // Normalise the timestamp separator: GitHub's tag lookup is case sensitive and the release
+      // tags carry an uppercase 'T', while the scooter reports its versions with a lowercase 't' —
+      // which is exactly the form anyone copies out of the SW MDB / SW DBC sensors. Without this a
+      // pasted version fails the resolve with "version not found" even though the release exists.
+      this->ota_target_version_ = version_to_tag(value);
       if (this->ota_version_text_ != nullptr)
-        this->ota_version_text_->publish_state(value);  // echo the pin back (HA showed no state)
+        this->ota_version_text_->publish_state(this->ota_target_version_);  // echo what will be used
       break;
     case TxtKind::SYSTIME_ISO: {
       int y, mo, d, h, mi, se;
