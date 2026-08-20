@@ -93,7 +93,13 @@ void LibrescootBleClient::ota_start(const std::string &url, const std::string &s
   this->ota_log_ms_ = 0;       // re-baseline the 1 s speed log
   this->ota_start_ms_ = this->ota_last_ack_ms_ = this->ota_last_send_ms_ = 0;
   this->ota_last_report_ms_ = 0;
-  this->ota_send_gap_ms_ = 6;  // start fast; back off adaptively on rewinds
+  // Pacing is learned per link, not per session: a resume of the same job keeps the gap the
+  // previous attempts backed off to, so a weak link is not re-flooded at full speed every time.
+  // A fresh transfer starts from what the signal suggests — 6 ms saturates a good link, but at
+  // weak RSSI that burst is dropped on the air, and since the losses show up as a dead link rather
+  // than a REWIND, starting fast means never converging.
+  if (this->ota_selfheal_count_ == 0)
+    this->ota_send_gap_ms_ = (this->last_rssi_dbm_ != 0 && this->last_rssi_dbm_ < -75) ? 24 : 6;
   this->ota_producer_done_ = true;  // no producer yet
   this->ota_install_pct_ = this->ota_install_sub_ = 0;
   // Split the progress bar by time: upload (size / ~8 kB/s) vs the on-scooter install (~10 min).
@@ -122,14 +128,22 @@ void LibrescootBleClient::ota_start(const std::string &url, const std::string &s
   }
   // chunk = min(240, ATT_MTU - 3 (ATT hdr) - 4 (offset hdr)); confirmed/limited by START_ACK.
   uint16_t mtu = this->att_mtu_ > this->mtu_ ? this->att_mtu_ : this->mtu_;
-  this->ota_chunk_ = 240;
+  this->ota_chunk_ = OTA_CHUNK_MAX;
   if (mtu >= 27 && (uint16_t)(mtu - 7) < this->ota_chunk_)
     this->ota_chunk_ = mtu - 7;
+  // Apply what this link was last seen to carry. A brand new transfer starts one step above it, so
+  // a link that has since improved (or a different scooter) climbs back to the full chunk instead
+  // of being stuck at a size some bad afternoon taught it.
+  uint16_t limit = this->ota_chunk_limit_;
+  if (this->ota_selfheal_count_ == 0 && this->ota_resume_count_ == 0 && limit < OTA_CHUNK_MAX)
+    limit *= 2;
+  if (limit < this->ota_chunk_)
+    this->ota_chunk_ = limit;
 
   bool eff_stage = this->stage_only_;
-  ESP_LOGI(OTAG, "START %s %s size=%u chunk=%u bundle='%s'",
+  ESP_LOGI(OTAG, "START %s %s size=%u chunk=%u gap=%ums bundle='%s'",
            comp_name(component), eff_stage ? "(stage-only)" : "(install)", (unsigned) size,
-           this->ota_chunk_, bundle_id.c_str());
+           this->ota_chunk_, this->ota_send_gap_ms_, bundle_id.c_str());
   this->ota_set_state_(OtaState::STARTING);
   this->ota_send_start_();
 }
@@ -216,6 +230,13 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       if (this->ota_window_chunks_ > ring_chunks)
         this->ota_window_chunks_ = ring_chunks;
       this->ota_ack_every_ = ack_every ? ack_every : 16;
+      // Slow start. The scooter permits a 64-chunk window, but filling it in one burst is what a
+      // weak link cannot survive: write-without-response has no flow control, so the whole window
+      // goes to the controller at once, the connection goes silent and dies on its supervision
+      // timeout before a single ACK comes back. Open with a small window and widen it only as
+      // ACKs actually arrive.
+      if (this->ota_window_open_ > this->ota_window_chunks_ || this->ota_window_open_ < 4)
+        this->ota_window_open_ = 8;
       this->ota_resume_ = resume;
       this->ota_selfheal_anchor_ = resume;  // progress detector baseline for the self-heal streak
       this->ota_acked_ = this->ota_sent_ = this->ota_produced_ = resume;
@@ -229,9 +250,9 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       this->ota_start_ms_ = millis();
       this->ota_last_ack_ms_ = millis();
       this->ota_set_state_(OtaState::STREAMING);
-      ESP_LOGI(OTAG, "START_ACK: %s resume=%u window=%u ack_every=%u chunk=%u ring=%u",
+      ESP_LOGI(OTAG, "START_ACK: %s resume=%u window=%u (open %u) ack_every=%u chunk=%u ring=%u",
                status == 0x00 ? "resume" : "fresh", (unsigned) resume, this->ota_window_chunks_,
-               this->ota_ack_every_, this->ota_chunk_, (unsigned) this->ota_cap_);
+               this->ota_window_open_, this->ota_ack_every_, this->ota_chunk_, (unsigned) this->ota_cap_);
       break;
     }
     case 0x82: {  // ACK [flags][acked:u32]
@@ -241,6 +262,8 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       uint32_t acked = rd_u32le(&x[2]);
       this->ota_last_ack_ms_ = millis();
       if (rewind) {
+        if (this->ota_window_open_ > 4)
+          this->ota_window_open_ /= 2;  // loss: back off the in-flight window as well as the pacing
         if (++this->ota_rewinds_ > 60) {
           this->ota_fail_("too many rewinds");
           return;
@@ -254,6 +277,8 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       }
       if (acked > this->ota_acked_) {
         this->ota_acked_ = acked;
+        if (!rewind && this->ota_window_open_ < this->ota_window_chunks_)
+          this->ota_window_open_ += 4;  // the link carried that much; allow a little more in flight
         // Real forward progress clears BOTH the rewind self-heal streak and the disconnect-resume
         // streak, so a long transfer over a flaky link (or one that keeps dropping out of range)
         // keeps its full budget as long as it keeps advancing — it only gives up after that many
@@ -341,6 +366,14 @@ void LibrescootBleClient::ota_step_() {
     case OtaState::STREAMING:
       this->ota_send_data_();
       this->ota_publish_rates_();
+      // The ACK timeout measures how long the SCOOTER stays silent with data outstanding — never
+      // how long the HTTP producer needs before its first bytes land. After a resume the ring
+      // buffer starts empty and opening the stream costs a TLS handshake plus a redirect, which
+      // can be seconds: with the clock running from START_ACK that alone burned the whole budget,
+      // so every auto-resume failed again the moment the download finally started (a livelock that
+      // advanced a couple of chunks per cycle).
+      if (this->ota_sent_ <= this->ota_acked_)
+        this->ota_last_ack_ms_ = now;  // nothing in flight -> nothing that could time out
       if (this->ota_sent_ > this->ota_acked_ && now - this->ota_last_ack_ms_ > 5000)
         this->ota_fail_("ACK stalled");
       else if (this->ota_producer_done_ && !this->ota_http_ok_ && this->ota_produced_ < this->ota_total_)
@@ -461,7 +494,7 @@ void LibrescootBleClient::ota_send_data_() {
     return;
   if (this->ota_sent_ >= this->ota_total_)
     return;
-  const uint32_t window_bytes = (uint32_t) this->ota_window_chunks_ * this->ota_chunk_;
+  const uint32_t window_bytes = (uint32_t) this->ota_window_open_ * this->ota_chunk_;
   if (this->ota_sent_ - this->ota_acked_ >= window_bytes)
     return;  // window full — wait for ACKs
   const uint32_t avail = this->ota_produced_ - this->ota_sent_;
@@ -562,7 +595,10 @@ void LibrescootBleClient::ota_producer_() {
 
   bool ok = false;
   {
+    const uint32_t open_ms = millis();
     int status = http_open_following_(c);
+    ESP_LOGD(OTAG, "download: HTTP %d after %u ms (from offset %u)", status,
+             (unsigned) (millis() - open_ms), (unsigned) this->ota_resume_);
     if (status == 200 || status == 206) {
       int idle = 0;
       while (this->ota_producer_run_ && this->ota_produced_ < this->ota_total_) {
@@ -1001,6 +1037,18 @@ void LibrescootBleClient::ota_install_progress_() {
 void LibrescootBleClient::ota_handle_disconnect_() {
   if (this->ota_state_ == OtaState::STARTING || this->ota_state_ == OtaState::STREAMING) {
     this->ota_producer_run_ = false;
+    this->ota_park_rates_();
+    this->ota_note_no_progress_();
+    // A supervision timeout with chunks still unacknowledged is the same evidence a REWIND gives:
+    // more was pushed into the link than it can carry. Widen the pacing here too — on a weak link
+    // the burst kills the connection before any ACK (or REWIND) can come back, so without this the
+    // only feedback path that slows us down never runs.
+    if (this->ota_sent_ > this->ota_acked_) {
+      if (this->ota_send_gap_ms_ < 60)
+        this->ota_send_gap_ms_ += 3;
+      if (this->ota_window_open_ > 4)
+        this->ota_window_open_ /= 2;
+    }
     if (this->ota_have_current_job_ && ++this->ota_resume_count_ <= 40) {
       ESP_LOGW(OTAG, "link dropped mid-transfer — will resume on reconnect (#%d)", this->ota_resume_count_);
       this->ota_jobs_.insert(this->ota_jobs_.begin(), this->ota_current_job_);  // resume this one first
@@ -1063,6 +1111,25 @@ void LibrescootBleClient::ota_progress_() {
            (unsigned) this->ota_acked_, (unsigned) this->ota_total_);
 }
 
+// A whole session with the link up and not one new byte acknowledged is the signature of writes the
+// link cannot deliver at all — at full MTU a DATA write fragments into ~10 link-layer packets, and
+// on a weak link the peripheral wedges on the incomplete reassembly rather than dropping it. Halve
+// the chunk (never below OTA_CHUNK_MIN) and remember it; halving keeps every staged resume offset an
+// exact multiple of the new size, so the transfer picks up where it left off.
+void LibrescootBleClient::ota_note_no_progress_() {
+  // Only when chunks were actually written and none came back acknowledged. A session that died
+  // before the download delivered its first bytes says nothing about the chunk size.
+  if (this->ota_sent_ <= this->ota_resume_ || this->ota_acked_ > this->ota_resume_ ||
+      this->ota_chunk_limit_ <= OTA_CHUNK_MIN)
+    return;
+  this->ota_chunk_limit_ /= 2;
+  if (this->ota_chunk_limit_ < OTA_CHUNK_MIN)
+    this->ota_chunk_limit_ = OTA_CHUNK_MIN;
+  ESP_LOGW(OTAG, "no bytes got through at chunk %u — retrying with %u B chunks", this->ota_chunk_,
+           this->ota_chunk_limit_);
+  this->ota_chunk_pref_.save(&this->ota_chunk_limit_);
+}
+
 void LibrescootBleClient::ota_fail_(const char *why) {
   ESP_LOGE(OTAG, "transfer failed: %s (sent=%u acked=%u/%u)", why, (unsigned) this->ota_sent_,
            (unsigned) this->ota_acked_, (unsigned) this->ota_total_);
@@ -1075,6 +1142,12 @@ void LibrescootBleClient::ota_fail_(const char *why) {
       ++this->ota_selfheal_count_ <= OTA_SELFHEAL_MAX) {
     this->ota_producer_run_ = false;  // stop the download task; ota_start re-inits it on resume
     this->ota_park_rates_();
+    this->ota_note_no_progress_();
+    // A stall with chunks outstanding means the link could not drain what we pushed into it (the
+    // scooter never got far enough to answer with a REWIND). Back the pacing off like a rewind
+    // would, so repeated resumes converge on a rate the link actually sustains.
+    if (this->ota_send_gap_ms_ < 60)
+      this->ota_send_gap_ms_ += 3;
     this->ota_selfheal_total_ += 1.0;
     if (this->ota_selfheal_resumes_ != nullptr)
       this->ota_selfheal_resumes_->publish_state((float) this->ota_selfheal_total_);

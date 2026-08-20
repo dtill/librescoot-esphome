@@ -299,6 +299,10 @@ void LibrescootBleClient::setup() {
   float rate = 0.0f;
   if (this->ota_rate_pref_.load(&rate) && rate > 200.0f && rate < 200000.0f)
     this->ota_rate_bps_ = rate;  // sanity-bounded: a corrupt value must not distort every estimate
+  this->ota_chunk_pref_ = global_preferences->make_preference<uint16_t>(fnv1_hash("librescoot_ble_client_ota_chunk"));
+  uint16_t chunk = 0;
+  if (this->ota_chunk_pref_.load(&chunk) && chunk >= OTA_CHUNK_MIN && chunk <= OTA_CHUNK_MAX)
+    this->ota_chunk_limit_ = chunk;
   this->ota_source_pref_ = global_preferences->make_preference<uint8_t>(fnv1_hash("librescoot_ble_client_ota_source"));
   uint8_t osv;
   std::string osmode = this->ota_source_default_;
@@ -792,9 +796,14 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
         ESP_LOGI(TAG, "Scooter displays passkey: %06lu", (unsigned long) param->ble_security.key_notif.passkey);
       break;
     case ESP_GAP_BLE_READ_RSSI_COMPLETE_EVT:
-      if (this->rssi_ != nullptr && param->read_rssi_cmpl.status == ESP_BT_STATUS_SUCCESS)
-        this->rssi_->publish_state(param->read_rssi_cmpl.rssi);
+      if (param->read_rssi_cmpl.status == ESP_BT_STATUS_SUCCESS) {
+        this->last_rssi_dbm_ = param->read_rssi_cmpl.rssi;
+        if (this->rssi_ != nullptr)
+          this->rssi_->publish_state(param->read_rssi_cmpl.rssi);
+      }
       break;
+    // Note: current ESPHome drops this event in ESP32BLE::gap_event_handler before it reaches any
+    // client, so this branch stays silent — the connection-parameter request itself still applies.
     case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
       ESP_LOGI(TAG, "conn params updated: status=%d interval=%.1f ms latency=%d timeout=%d ms",
                param->update_conn_params.status, param->update_conn_params.conn_int * 1.25f,
@@ -811,6 +820,7 @@ bool LibrescootBleClient::parse_device(const espbt::ESPBTDevice &device) {
     // Publish the advertisement RSSI (throttled) so the signal to the CONFIGURED scooter is visible
     // even while disconnected — the connection-RSSI read only works once connected. Lets the pairing
     // dialog show whether the scooter is actually in range and how strong.
+    this->last_rssi_dbm_ = device.get_rssi();
     if (this->rssi_ != nullptr && millis() - this->last_rssi_pub_ms_ > 3000) {
       this->last_rssi_pub_ms_ = millis();
       this->rssi_->publish_state(device.get_rssi());

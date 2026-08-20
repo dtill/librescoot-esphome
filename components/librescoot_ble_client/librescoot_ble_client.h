@@ -300,6 +300,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   uint32_t last_adv_ms_{0};
   uint32_t last_rssi_pub_ms_{0};  // throttle advert-RSSI publishing for the configured scooter
   uint32_t last_rssi_ms_{0};
+  int8_t last_rssi_dbm_{0};  // most recent RSSI (0 = unknown); seeds the OTA pacing on a weak link
 
   void build_char_table_();
   CharEntry *find_char_(CharId id);
@@ -579,7 +580,19 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   uint8_t ota_sha_[32]{};
   uint32_t ota_total_{0};
   uint16_t ota_chunk_{240};
+  // Largest DATA chunk this link tolerates. A chunk becomes an ATT write of chunk+4 bytes; without
+  // Data Length Extension that write is split into ~27-byte link-layer fragments and ALL of them
+  // must arrive for the peripheral to reassemble it. On a weak link the full-MTU chunk therefore
+  // wedges the connection instead of merely being lost, so this is learned per link and persisted.
+  // Only ever halved while a transfer is in flight: the scooter counts resume offsets in chunks, and
+  // halving keeps every previous offset an exact multiple. Grown back only on a fresh transfer.
+  static constexpr uint16_t OTA_CHUNK_MAX = 240;
+  static constexpr uint16_t OTA_CHUNK_MIN = 60;
+  uint16_t ota_chunk_limit_{OTA_CHUNK_MAX};
+  ESPPreferenceObject ota_chunk_pref_;
+  void ota_note_no_progress_();
   uint16_t ota_window_chunks_{64};
+  uint16_t ota_window_open_{8};  // slow-start: chunks actually allowed in flight, <= ota_window_chunks_
   uint8_t ota_ack_every_{16};
   uint8_t *ota_buf_{nullptr};
   uint32_t ota_cap_{0};
