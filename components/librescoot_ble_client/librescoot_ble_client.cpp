@@ -672,8 +672,9 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
           // Not every firmware exposes every documented characteristic. Say so once per connect:
           // otherwise the entity just sits at "unknown" forever with nothing to explain it.
           e.handle = 0;
+          char uuid_buf[esp32_ble::UUID_STR_LEN];
           ESP_LOGW(TAG, "characteristic %s absent from the scooter's GATT database — its entity "
-                        "stays unknown", e.chr.to_string().c_str());
+                        "stays unknown", e.chr.to_str(uuid_buf));
           continue;
         }
         e.handle = chr->handle;
