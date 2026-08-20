@@ -273,6 +273,11 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
           const uint8_t c = 0x03;  // COMPLETE -> scooter verifies SHA-256 and queues the install
           this->write_now_(CharId::OTA_CONTROL, &c, 1);
           this->ota_set_state_(OtaState::COMPLETING);
+          // The upload is over; only the scooter-side install is still running. Park the speeds now
+          // instead of leaving them frozen at the last streaming value for the whole install.
+          this->ota_park_rates_();
+          if (this->ota_eta_ != nullptr)
+            this->ota_eta_->publish_state("00:00:00");
           ESP_LOGW(OTAG, "all bytes acked -> COMPLETE (installing)");
         }
       }
@@ -422,6 +427,25 @@ void LibrescootBleClient::ota_publish_rates_() {
   this->ota_rate_ms_ = now;
   this->ota_rate_last_prod_ = this->ota_produced_;
   this->ota_rate_last_ack_ = this->ota_acked_;
+}
+
+// Nothing is streaming any more (upload finished and the scooter is installing, a self-heal
+// backoff, or the end of the session): flush the final partial window into the lifetime/target
+// counters and park both speed sensors at 0. Without this they keep displaying the last 10 s
+// window value for as long as the install runs.
+void LibrescootBleClient::ota_park_rates_() {
+  if (this->ota_rate_ms_ != 0 && this->ota_acked_ > this->ota_rate_last_ack_)
+    this->ota_ble_bytes_total_v_ += (double) (this->ota_acked_ - this->ota_rate_last_ack_);
+  if (this->ota_ble_bytes_total_ != nullptr)
+    this->ota_ble_bytes_total_->publish_state((float) this->ota_ble_bytes_total_v_);
+  if (this->ota_target_transferred_ != nullptr)
+    this->ota_target_transferred_->publish_state((float) this->ota_acked_);
+  if (this->ota_dl_speed_ != nullptr)
+    this->ota_dl_speed_->publish_state(0.0f);
+  if (this->ota_ul_speed_ != nullptr)
+    this->ota_ul_speed_->publish_state(0.0f);
+  this->ota_rate_ms_ = 0;  // re-baseline on the next streaming tick (a resume must not be counted)
+  this->ota_log_ms_ = 0;
 }
 
 void LibrescootBleClient::ota_send_data_() {
@@ -1050,11 +1074,7 @@ void LibrescootBleClient::ota_fail_(const char *why) {
   if (this->ota_auto_resume_ && !this->ota_cancel_ && this->ota_have_current_job_ && transfer_phase &&
       ++this->ota_selfheal_count_ <= OTA_SELFHEAL_MAX) {
     this->ota_producer_run_ = false;  // stop the download task; ota_start re-inits it on resume
-    if (this->ota_dl_speed_ != nullptr)
-      this->ota_dl_speed_->publish_state(0.0f);
-    if (this->ota_ul_speed_ != nullptr)
-      this->ota_ul_speed_->publish_state(0.0f);
-    this->ota_rate_ms_ = 0;
+    this->ota_park_rates_();
     this->ota_selfheal_total_ += 1.0;
     if (this->ota_selfheal_resumes_ != nullptr)
       this->ota_selfheal_resumes_->publish_state((float) this->ota_selfheal_total_);
@@ -1076,29 +1096,40 @@ void LibrescootBleClient::ota_fail_(const char *why) {
   this->ota_finish_(false);
 }
 
+// Fold a finished session's throughput into the estimate used for the NEXT transfer. Both an
+// abort and a completed transfer count — the rate they measured is equally real. Short bursts are
+// ignored: the first seconds are dominated by the START handshake and the initial window fill.
+void LibrescootBleClient::ota_learn_rate_(uint32_t moved, uint32_t dt_ms) {
+  static constexpr uint32_t LEARN_MIN_BYTES = 64u * 1024;
+  static constexpr uint32_t LEARN_MIN_MS = 30000;
+  static constexpr float LEARN_WEIGHT = 0.3f;  // damped: one bad-range session shouldn't own it
+  if (moved < LEARN_MIN_BYTES || dt_ms < LEARN_MIN_MS)
+    return;
+  float session = (float) moved * 1000.0f / (float) dt_ms;
+  if (!(session > 200.0f) || session > 200000.0f)
+    return;
+  float updated = this->ota_rate_bps_ * (1.0f - LEARN_WEIGHT) + session * LEARN_WEIGHT;
+  ESP_LOGI(OTAG, "upload rate estimate: %.1f -> %.1f kB/s (this session %.1f)",
+           this->ota_rate_bps_ / 1000.0f, updated / 1000.0f, session / 1000.0f);
+  this->ota_rate_bps_ = updated;
+  this->ota_rate_pref_.save(&updated);
+}
+
 void LibrescootBleClient::ota_finish_(bool ok) {
   this->ota_producer_run_ = false;  // ask the download task to stop; buffer freed in ota_step_
   // Flush the final partial window into the lifetime byte counter and the target-transferred
   // sensor, then park the two speed sensors at 0 (a transfer is no longer running).
-  if (this->ota_rate_ms_ != 0 && this->ota_acked_ > this->ota_rate_last_ack_)
-    this->ota_ble_bytes_total_v_ += (double) (this->ota_acked_ - this->ota_rate_last_ack_);
-  if (this->ota_ble_bytes_total_ != nullptr)
-    this->ota_ble_bytes_total_->publish_state((float) this->ota_ble_bytes_total_v_);
-  if (this->ota_target_transferred_ != nullptr)
-    this->ota_target_transferred_->publish_state((float) this->ota_acked_);
-  if (this->ota_dl_speed_ != nullptr)
-    this->ota_dl_speed_->publish_state(0.0f);
-  if (this->ota_ul_speed_ != nullptr)
-    this->ota_ul_speed_->publish_state(0.0f);
-  this->ota_rate_ms_ = 0;
+  this->ota_park_rates_();
   // Report the bytes actually moved THIS session (acked minus the resume offset) — otherwise a
   // near-complete resume shows a nonsense kB/s (the resumed bytes weren't transferred now).
   if (this->ota_start_ms_ != 0 && this->ota_acked_ > this->ota_resume_) {
     uint32_t dt = millis() - this->ota_start_ms_;
     uint32_t moved = this->ota_acked_ - this->ota_resume_;
-    if (dt > 0)
+    if (dt > 0) {
       ESP_LOGI(OTAG, "%s %s: %u bytes this session in %u ms (%.1f kB/s)", comp_name(this->ota_component_),
                ok ? "done" : "stopped", (unsigned) moved, (unsigned) dt, (float) moved / (float) dt);
+      this->ota_learn_rate_(moved, dt);
+    }
   }
   if (this->ota_eta_ != nullptr)
     this->ota_eta_->publish_state(ok ? "00:00:00" : "--:--:--");

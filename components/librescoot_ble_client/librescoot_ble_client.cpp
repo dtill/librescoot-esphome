@@ -121,8 +121,10 @@ static std::string fmt_size(uint32_t bytes) {
 }
 
 // Rough BLE-OTA transfer estimate at ~12 kB/s (the measured ESP32-classic rate).
-static std::string fmt_est_time(uint32_t total_bytes) {
-  uint32_t secs = total_bytes / 12000u;
+static std::string fmt_est_time(uint32_t total_bytes, float bytes_per_sec) {
+  if (!(bytes_per_sec > 0.0f))
+    bytes_per_sec = OTA_DEFAULT_RATE_BPS;
+  uint32_t secs = (uint32_t) ((float) total_bytes / bytes_per_sec);
   char b[24];
   if (secs >= 3600)
     snprintf(b, sizeof(b), "~%uh %um", (unsigned) (secs / 3600), (unsigned) ((secs % 3600) / 60));
@@ -293,6 +295,10 @@ void LibrescootBleClient::setup() {
   // OTA byte source mode (github/relay): NVS-persisted; else the compile-time default (chip-based or
   // YAML `ota_source:`). github mode reconstructs the URL from github_base_(); relay keeps the
   // persisted/integration URL restored just above.
+  this->ota_rate_pref_ = global_preferences->make_preference<float>(fnv1_hash("librescoot_ble_client_ota_rate"));
+  float rate = 0.0f;
+  if (this->ota_rate_pref_.load(&rate) && rate > 200.0f && rate < 200000.0f)
+    this->ota_rate_bps_ = rate;  // sanity-bounded: a corrupt value must not distort every estimate
   this->ota_source_pref_ = global_preferences->make_preference<uint8_t>(fnv1_hash("librescoot_ble_client_ota_source"));
   uint8_t osv;
   std::string osmode = this->ota_source_default_;
@@ -2070,7 +2076,7 @@ void LibrescootBleClient::refresh_update_availability_() {
     if (sz) {
       s += "  \nUpload method: " + method;
       s += "  \nUpload size: " + fmt_size(sz);
-      s += "  \nUpload time (est.): " + fmt_est_time(sz);
+      s += "  \nUpload time (est.): " + fmt_est_time(sz, this->ota_rate_bps_);
     }
     if (!notes.empty())
       s += "\n\n" + notes;

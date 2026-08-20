@@ -52,6 +52,11 @@ enum class CharId : uint8_t {
   CTRL_CMD, POWER_CMD, EXT_CMD, OTA_CONTROL, OTA_DATA,
 };
 
+// Assumed BLE upload throughput until a transfer has measured one. The link tops out well below
+// what the MTU suggests — writes are paced one chunk per loop iteration and weak-link rewinds cost
+// further — so this is a measured floor, not a theoretical rate.
+static constexpr float OTA_DEFAULT_RATE_BPS = 3700.0f;
+
 // BLE-OTA transfer state (GATT service 9a590500).
 enum class OtaState : uint8_t { IDLE, STARTING, STREAMING, COMPLETING, INSTALLING, DONE, FAILED };
 
@@ -337,6 +342,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   // --- OTA transfer engine ---
   void ota_step_();                        // BLE consumer, driven from loop()
   void ota_publish_rates_();               // 10 s throughput/byte sensors, only while streaming
+  void ota_park_rates_();                  // flush the last window and park the speed sensors at 0
   void ota_send_data_();                   // send windowed DATA chunks from the ring buffer
   void ota_handle_status_(uint8_t *data, uint16_t len);  // OTA_STATUS dispatch into the FSM
   bool ota_write_data_(uint32_t offset, const uint8_t *data, uint16_t len);
@@ -507,6 +513,12 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   std::string ota_source_mode_{"relay"};
   std::string ota_source_default_{"relay"};
   ESPPreferenceObject ota_source_pref_;
+  // Measured BLE upload throughput, used to estimate the transfer time BEFORE one starts. Seeded
+  // with a conservative default and refined from every transfer that ran long enough to be
+  // representative, so the estimate adapts to this board's range and byte source. NVS-persisted.
+  float ota_rate_bps_{OTA_DEFAULT_RATE_BPS};
+  ESPPreferenceObject ota_rate_pref_;
+  void ota_learn_rate_(uint32_t moved, uint32_t dt_ms);
   std::string github_base_() const { return "https://github.com/" + this->github_repo_ + "/releases/download"; }
   void apply_ota_source_(const std::string &mode, bool persist);  // set mode → url, publish, persist
   std::string ota_method_str_{"delta"};  // delta (default) or full (.mender image)
