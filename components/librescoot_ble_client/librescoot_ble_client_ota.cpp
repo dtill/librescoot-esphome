@@ -29,6 +29,11 @@ namespace librescoot_ble_client {
 
 static const char *const OTAG = "ota";
 
+// Asset lookup is a single small HTTPS request, but its handshake competes with WiFi and the
+// BLE stack for internal RAM on a board without PSRAM. A few spaced attempts make it reliable.
+static const int RESOLVE_ATTEMPTS = 4;
+static const uint32_t RESOLVE_RETRY_MS = 3000;
+
 static const char *comp_name(uint8_t c) { return c == 0x01 ? "DBC" : "MDB"; }
 
 static uint16_t u16le(const uint8_t *v) { return (uint16_t) v[0] | ((uint16_t) v[1] << 8); }
@@ -243,7 +248,10 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       this->ota_producer_run_ = true;
       this->ota_producer_done_ = false;
       this->ota_http_ok_ = false;
-      if (xTaskCreate(&LibrescootBleClient::ota_producer_task_, "librescoot_dl", 16384, this, 6, nullptr) != pdPASS) {
+      // 16 kB is only needed when verifying against the Mozilla cert bundle; bytes off the
+      // plain-HTTP relay involve no TLS in this task at all.
+      if (xTaskCreate(&LibrescootBleClient::ota_producer_task_, "librescoot_dl", LSC_GH_TASK_STACK,
+                      this, 6, nullptr) != pdPASS) {
         this->ota_fail_("could not start download task");
         return;
       }
@@ -891,6 +899,7 @@ void LibrescootBleClient::ota_resolve_task_(void *arg) {
 }
 
 void LibrescootBleClient::ota_resolve_() {
+  this->rs_resolved_ = false;  // per run: set only once GitHub has actually answered
   const std::string url =
       "https://api.github.com/repos/" + this->github_repo_ + "/releases/tags/" + this->rs_tag_;
   // "delta" → small patch asset; "full" → complete .mender image (hundreds of MB).
@@ -898,6 +907,13 @@ void LibrescootBleClient::ota_resolve_() {
   const std::string tmdb = "librescoot-unu-mdb-" + this->rs_tag_ + ext;
   const std::string tdbc = "librescoot-unu-dbc-" + this->rs_tag_ + ext;
 
+  // The handshake wants ~4.5 kB; on a board without PSRAM availability depends on what WiFi and
+  // the BLE stack hold at that instant, so the same call succeeds and fails minutes apart.
+  for (int attempt = 1; attempt <= RESOLVE_ATTEMPTS && !this->rs_resolved_; attempt++) {
+  if (attempt > 1) {
+    ESP_LOGW(OTAG, "resolve: retrying (%d/%d)", attempt, RESOLVE_ATTEMPTS);
+    vTaskDelay(pdMS_TO_TICKS(RESOLVE_RETRY_MS));
+  }
   esp_http_client_config_t cfg = {};
   cfg.url = url.c_str();
   this->ota_http_tls_(&cfg);
@@ -905,6 +921,8 @@ void LibrescootBleClient::ota_resolve_() {
   cfg.buffer_size = 1024;
   cfg.buffer_size_tx = 512;
   esp_http_client_handle_t c = esp_http_client_init(&cfg);
+  if (c == nullptr)
+    continue;
   esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
   esp_http_client_set_header(c, "Accept", "application/vnd.github+json");
 
@@ -976,6 +994,7 @@ void LibrescootBleClient::ota_resolve_() {
           if (N_DIG[mD] == 0) { cap = CD; cur_dig.clear(); mN = mS = mD = 0; continue; }
         }
       }
+      this->rs_resolved_ = true;  // GitHub answered; an empty result really means "no such asset"
     } else {
       ESP_LOGW(OTAG, "resolve: HTTP %d", status);
     }
@@ -984,6 +1003,7 @@ void LibrescootBleClient::ota_resolve_() {
   }
   esp_http_client_close(c);
   esp_http_client_cleanup(c);
+  }  // retry loop
 
   ESP_LOGI(OTAG, "resolve: MDB %s DBC %s", this->rs_mdb_ok_ ? this->rs_mdb_name_.c_str() : "(none)",
            this->rs_dbc_ok_ ? this->rs_dbc_name_.c_str() : "(none)");

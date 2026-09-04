@@ -17,6 +17,9 @@
 #include "esphome/components/lock/lock.h"
 #include "esphome/components/update/update_entity.h"
 #include "esphome/components/time/real_time_clock.h"
+#ifdef USE_API
+#include "esphome/components/api/custom_api_device.h"
+#endif
 #include "esp_http_client.h"  // esp_http_client_config_t, for the shared TLS-config helper
 #include <map>
 
@@ -108,6 +111,11 @@ class LibrescootUpdate : public update::UpdateEntity, public Parented<Librescoot
   void check() override;
   void perform(bool force) override;
   void set_current(const std::string &v) {
+    // Publish only on a real change: refresh_update_availability_() runs on a 15 s timer and the
+    // payload (release notes included) is copied per connected API client.
+    const bool need_mirror = this->update_info_.latest_version.empty() && !v.empty();
+    if (v == this->update_info_.current_version && !need_mirror)
+      return;
     this->update_info_.current_version = v;
     // Home Assistant derives "an update is available" from latest != installed. A version learned
     // over BLE arrives long before the first GitHub check has a target, so publishing it on its own
@@ -120,13 +128,36 @@ class LibrescootUpdate : public update::UpdateEntity, public Parented<Librescoot
   }
   void set_latest(const std::string &latest, const std::string &title, const std::string &url,
                   const std::string &summary) {
+    if (latest == this->update_info_.latest_version && title == this->update_info_.title &&
+        url == this->update_info_.release_url && summary == this->update_info_.summary)
+      return;  // nothing new to say; set_available() below then stays quiet too
     this->update_info_.latest_version = latest;
     this->update_info_.title = title;
     this->update_info_.release_url = url;
     this->update_info_.summary = summary;
+    this->info_dirty_ = true;
+  }
+  // No target known (no successful check, scooter busy, or out of contact). The API carries no
+  // state enum for updates, only the versions plus missing_state, so report no state at all.
+  void set_unknown() {
+    if (this->state_ == update::UPDATE_STATE_UNKNOWN && !this->info_dirty_ && !this->has_state())
+      return;
+        this->update_info_.latest_version.clear();
+    this->update_info_.summary.clear();
+    this->update_info_.release_url.clear();
+    this->state_ = update::UPDATE_STATE_UNKNOWN;
+    this->info_dirty_ = false;
+    // UpdateEntity has no invalidate_state(); publish_state() sets the flag, clear it afterwards.
+    this->publish_state();
+    this->set_has_state(false);
+    this->state_callback_.call();  // let Home Assistant pick the cleared state up immediately
   }
   void set_available(bool avail) {
-    this->state_ = avail ? update::UPDATE_STATE_AVAILABLE : update::UPDATE_STATE_NO_UPDATE;
+    const auto st = avail ? update::UPDATE_STATE_AVAILABLE : update::UPDATE_STATE_NO_UPDATE;
+    if (st == this->state_ && !this->info_dirty_)
+      return;
+    this->state_ = st;
+    this->info_dirty_ = false;
     this->publish_state();
   }
   void set_progress(float pct) {
@@ -135,6 +166,7 @@ class LibrescootUpdate : public update::UpdateEntity, public Parented<Librescoot
     this->update_info_.progress = pct;
     this->publish_state();
   }
+  bool info_dirty_{true};  // an unpublished change in latest/title/url/summary
   void clear_progress(bool available) {
     this->update_info_.has_progress = false;
     this->update_info_.progress = 0.0f;
@@ -156,7 +188,11 @@ struct CharEntry {
   uint32_t last_ms{0};
 };
 
-class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
+class LibrescootBleClient : public esp32_ble_client::BLEClientBase
+#ifdef USE_API
+                          , public api::CustomAPIDevice
+#endif
+{
  public:
   void setup() override;
   void loop() override;
@@ -261,7 +297,11 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   void set_dbc_update(LibrescootUpdate *u) { dbc_update_ = u; }
 
   // Update checking (called from the update entity / periodic timer).
-  void request_update_check();
+  // may_release_link: only a scheduled check (or an explicit one from Home Assistant) may drop
+  // the BLE link to free the heap it needs. A background changelog re-fetch must not — it runs
+  // every couple of minutes, which would turn the release into permanent link churn.
+  // user_requested: an explicit "check for updates"; bypasses the link-release spacing.
+  void request_update_check(bool may_release_link = true, bool user_requested = false);
   void perform_update(uint8_t component, bool force);  // 0 = MDB, 1 = DBC (one at a time)
   void update_perform(LibrescootUpdate *u, bool force);  // route an entity's Install to a component
 
@@ -298,7 +338,6 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   bool read_in_flight_{false};
   uint32_t read_issued_ms_{0};
   uint32_t last_read_issue_ms_{0};
-  uint32_t last_pres_pub_ms_{0};
   uint32_t last_adv_ms_{0};
   uint32_t last_rssi_pub_ms_{0};  // throttle advert-RSSI publishing for the configured scooter
   uint32_t last_rssi_ms_{0};
@@ -498,7 +537,16 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   // Scheduler-driven too: raise "pairing required" only while the CONFIGURED scooter is actually
   // in range (advertising) but we could not bond it (pairing refused/failed → pairing_blocked_).
   void service_pairing_watch_();
+  void service_presence_();
   bool is_bonded_();  // is the configured scooter in the controller's bond list?
+  // Apply the SMP parameters required to bond with the scooter (keyboard-only IO, SC + MITM,
+  // bonding). Owned by the component so pairing does not depend on YAML.
+  void apply_security_params_();
+#ifdef USE_API
+  void on_passkey_service_(int32_t pin);  // int32_t: distinct from int on xtensa
+  void on_ota_test_service_(std::string url, int32_t size, std::string bundle, int32_t component);
+  void on_ota_abort_service_();
+#endif
   // A passkey the user has entered, kept briefly so it can answer the NEXT pairing prompt too. The
   // SMP pairing session times out after ~30 s, which is less time than it takes to walk to the
   // scooter, read the code off the dashboard and type it into Home Assistant.
@@ -507,6 +555,17 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   bool pending_passkey_used_{true};  // the stored code answers at most one further prompt
   bool passkey_req_open_{false};  // a PASSKEY_REQ is outstanding right now
   uint32_t pair_backoff_until_ms_{0};  // don't re-attempt pairing before this (see auth failures)
+  uint8_t reauth_fail_count_{0};  // consecutive silent re-encryption failures while bonded
+  bool bond_seen_{false};  // last observed bond-list membership, to log the transition
+  // The update check may release the BLE link on a board whose heap cannot carry both.
+  bool check_link_release_{false};
+  uint32_t check_link_deadline_ms_{0};
+  uint32_t check_release_next_ok_ms_{0};  // earliest next link release, whoever asks
+  uint32_t gh_heap_skip_until_ms_{0};  // suppress repeat skip messages within one backoff
+  void check_release_restore_();
+  // Release notes over the plain-HTTP relay, for boards without heap for a second TLS session.
+  // Returns "" when unavailable.
+  std::string fetch_notes_via_relay_(const std::string &tag);
   // Can this board actually fetch the firmware bytes? A plain-HTTP source (HA relay / mirror)
   // needs that server reachable; an https source (GitHub) needs a working TLS path (cert bundle,
   // i.e. a PSRAM board — the classic can't do the RSA-4096 CDN handshake).
@@ -645,6 +704,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase {
   volatile bool ota_resolve_done_{false};
   volatile bool ota_cancel_{false};      // abort requested while a resolve is in flight
   bool rs_mdb_ok_{false}, rs_dbc_ok_{false};
+  bool rs_resolved_{false};  // GitHub answered the asset lookup (as opposed to being unreachable)
   // The release a resolved .delta patches against, read from the archive before transferring
   // it. Empty when the target is a full image or the base could not be read.
   std::string rs_delta_base_;

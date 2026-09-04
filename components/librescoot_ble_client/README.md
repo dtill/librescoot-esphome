@@ -103,12 +103,13 @@ in the repository root.
 
 ```yaml
 esp32_ble:
-  io_capability: keyboard_only     # required for the scooter's passkey pairing
 esp32_ble_tracker:
 ```
 
-`io_capability: keyboard_only` is a global BLE-stack setting and must be declared here;
-everything else is owned by the component.
+Nothing pairing-related belongs in the YAML. The component applies the passkey capability
+(keyboard-only IO, secure connections with MITM, bonding) to the BLE stack itself, and registers
+the `<node>_passkey_reply` service from C++ — so bonding cannot be broken by an omitted option, and
+it works whether or not an `api:` block is present.
 
 ---
 
@@ -129,7 +130,7 @@ librescoot_ble_client:
 
 | Option | Type | Description |
 | :--- | :--- | :--- |
-| `id` | ID | Component id (used by the `passkey_reply` action). |
+| `id` | ID | Component id (referenced by the component's automation actions). |
 | `mac_address` | MAC, **required** | The scooter's nRF BLE MAC address. |
 | `time_id` | ID, optional | A `time` source (e.g. `sntp`); required only for **System Time sync with ESP** and **System Time Set UTC ISO-8601**. |
 | `github_repo` | string, `librescoot/librescoot` | Owner/name the firmware releases come from. |
@@ -195,19 +196,23 @@ otherwise identical-looking failures:
 | `scooter says pairing not supported — it is not in a pairing-capable state` | The scooter is off or asleep. Switch it on. |
 | `too many attempts — the scooter is rate-limiting pairing` | Back off and wait a moment. |
 
-The `passkey_reply` action still exists for automations and is what the companion integration's
-service wraps:
+The component registers a `<node>_passkey_reply` service by itself whenever an `api:` block is
+present — no YAML wiring, nothing to forget. It takes a single `pin` argument and is what the
+companion integration falls back to when the entities are unavailable:
 
 ```yaml
-api:
-  actions:
-    - action: passkey_reply
-      variables:
-        pin: int
-      then:
-        - librescoot_ble_client.passkey_reply:
-            id: librescoot_ble_client_hub
-            passkey: !lambda "return pin;"
+# Home Assistant → Developer Tools → Actions
+action: esphome.<node>_passkey_reply
+data:
+  pin: 12345
+```
+
+For a YAML automation the `librescoot_ble_client.passkey_reply` action is also available:
+
+```yaml
+- librescoot_ble_client.passkey_reply:
+    id: librescoot_ble_client_hub
+    passkey: 12345
 ```
 
 > Switching to a new ESP chip: press **BLE Pairing Delete** (enable it in HA first) *and*
@@ -430,23 +435,35 @@ notes shown in the HA card aggregate **every** release in between — a header
 newest first — so a jump that skips nightlies still shows what changed at every step. The MDB
 card additionally prepends the download size and an install-time estimate.
 
-#### How availability is decided (two-phase, DBC-first)
+#### What is offered, and in which order
 
-Mirroring the phone app, the component brings the **dashboard up to match the main board
-first**, then advances the main board:
+**Both entities show whatever next step exists for their board**, independent of ordering. Each
+target is that board's own next release: with `delta` the adjacent successor of its installed
+version, with `full` the channel latest. So MDB and DBC can show an update at the same time.
 
-- **DBC update** is offered only when the DBC version is **behind the MDB** — a "catch up to
-  the board" install; its default target is the **MDB's current version** (not the channel
-  latest).
-- **MDB update** is offered only when the MDB is behind the channel latest **and** the DBC has
-  already caught up. While the DBC is behind, the MDB card is held at "up to date".
+**Ordering applies to unattended installation only.** `OTA Auto Update` installs one at a time:
 
-Both offers are additionally **gated on the scooter being idle**: a new update is shown only
-while the scooter's OTA phase is `idle` (`0x06`). Any other phase — "unknown" (before the
-first `STATUS_REQ` reply) or "pending reboot" after an install — hides the offer. Because Home
-Assistant derives "update available" purely from `latest_version != installed_version`, the
-entity publishes `latest == installed` to hide it; the live phase/percent still shows in the
-**OTA Status** text. A `STATUS_REQ` is sent on every connect so the phase is known — and if that
+- `delta` — the DBC steps until it matches the MDB, then the MDB takes its next step.
+- `full` — the MDB reaches the channel latest first, then the DBC follows.
+
+**OTA Version** always shows the target that would be installed next under that order.
+
+Pressing **Install** on either entity installs that board immediately, ordering or not. This is
+safe: the target is that board's adjacent successor, so the delta base matches, and the delta
+pre-flight reads the base out of the archive and refuses a mismatch before any bytes are sent.
+
+Offers are **gated on the scooter being idle**: shown only while the scooter's OTA phase is
+`idle` (`0x06`). Any other phase — "unknown" (before the first `STATUS_REQ` reply) or "pending
+reboot" after an install — withdraws the offer. A `STATUS_REQ` is sent on every connect, and
+re-sent every 15 s while the phase stays `unknown`, so a real update is not hidden behind a
+stuck phase.
+
+**"Up to date" is only claimed when it is true** — when the board is actually at the channel
+latest. When no offer can be made for another reason (no successful check yet, scooter busy, or
+out of contact) the entity reports **no state** instead. Home Assistant derives "update
+available" purely from `latest_version != installed_version`, so publishing `latest == installed`
+is the only way to show no update — and it also reads as "you are current", which would be wrong
+in those cases. A `STATUS_REQ` is sent on every connect so the phase is known — and if that
 reply is missed (e.g. a flaky link) so the phase stays `unknown`, it is **re-requested every 15 s
 while connected** until it resolves, so a genuinely available update isn't left hidden behind a
 stuck `unknown` phase.
@@ -531,9 +548,19 @@ gh release download <tag> -R librescoot/librescoot -p '*mdb*.delta' -p '*dbc*.de
 python3 tools/range_server.py         # Range-capable; python -m http.server does NOT resume
 ```
 
-Then set **`OTA Source URL`** to `http://<host>:8000` and press an install button. The
-`ota_test` / `ota_abort` API actions drive the engine with an explicit
-`url`/`size`/`bundle`/`component` for pure-local testing without GitHub or version comparison.
+Then set **`OTA Source URL`** to `http://<host>:8000` and press an install button. The component
+also registers `esphome.<node>_ota_test` and `esphome.<node>_ota_abort` (no YAML needed), which
+drive the engine with an explicit `url`/`size`/`bundle`/`component` for pure-local testing without
+GitHub or version comparison:
+
+```yaml
+action: esphome.<node>_ota_test
+data:
+  url: "http://<host>:8000/<tag>/<file>.delta"
+  size: 994112
+  bundle: "<file>.delta"
+  component: 1        # 0 = MDB, 1 = DBC
+```
 
 **Certificates.** Instead of the ~100 kB Mozilla bundle, the two exact GitHub root CAs are
 pinned in `github_ca.h` (USERTrust ECC for `api.github.com`, ISRG Root X1 for the

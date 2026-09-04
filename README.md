@@ -42,7 +42,6 @@ external_components:
 
 # BLE stack plumbing (shared, stack-level; stays in the YAML)
 esp32_ble:
-  io_capability: keyboard_only   # required for the scooter's passkey pairing
 esp32_ble_tracker:
 
 librescoot_ble_client:
@@ -79,9 +78,10 @@ reconnects on its own.
 
 **3. Update the scooter's firmware.** Pick a channel (**OTA channel**) and a method
 (**OTA Update Method**: `full` always applies, `delta` is a small patch against the immediately
-preceding release). When a release is available, **OTA MDB Update** / **OTA DBC Update** offer it —
-press **Install**. The scooter's two boards update one at a time and it reboots after each; the
-component waits that out. Nothing is ever installed on its own.
+preceding release). When a release is available, **OTA MDB Update** and **OTA DBC Update** each
+offer their board's next step — press **Install** on either. Unattended installation
+(**OTA Auto Update**) keeps them in order and does one at a time. The scooter reboots after each
+install; the component waits that out. Nothing is ever installed on its own.
 
 #### What you get
 

@@ -3,9 +3,12 @@ LibreScoot / unu Scooter Pro nRF52 and exposes every scooter characteristic as a
 nested entity. The YAML only names the entities it wants; all parsing, the pairing
 flow, the extended-command engine and the OTA diagnostics live in C++.
 
+Bonding is owned by the component, not the YAML: the passkey capability is applied from C++
+(see apply_security_params_) and the `<node>_passkey_reply` service is registered from C++ too,
+so neither an `esp32_ble: io_capability:` line nor an `api: actions:` block is needed for pairing.
+
 BLE plumbing that must stay in the YAML (shared, stack-level settings):
     esp32_ble:
-      io_capability: keyboard_only   # required for the scooter's passkey pairing
     esp32_ble_tracker:
 """
 
@@ -13,6 +16,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.core import CORE
 from esphome import automation
+from esphome import final_validate as fv
 from esphome.components import (
     binary_sensor,
     button,
@@ -50,6 +54,21 @@ AUTO_LOAD = [
     "lock",
     "update",
 ]
+
+def _final_validate(config):
+    """Enable the API's dynamic service registration when an API is configured.
+
+    The component registers its services from C++, which needs that support compiled in. Without an
+    API block there are no services; the entities work either way.
+    """
+    api_config = fv.full_config.get().get("api")
+    if api_config is not None:
+        api_config["custom_services"] = True
+    return config
+
+
+FINAL_VALIDATE_SCHEMA = _final_validate
+
 
 librescoot_ns = cg.esphome_ns.namespace("librescoot_ble_client")
 # The hub IS the BLE client (extends BLEClientBase) — it owns the connection, pairing,
@@ -179,6 +198,15 @@ def _direct_github_ok() -> bool:
     That means a TLS session to the release CDN alongside BLE and WiFi, which only fits on a board
     with PSRAM; on internal RAM alone the handshake competes with the Bluetooth stack. Boards without
     it use the Home Assistant relay, so the option is not compiled in at all.
+    """
+    return "psram" in CORE.config
+
+
+def _heap_rich() -> bool:
+    """Whether this board has RAM to spare beside WiFi and the BLE stack.
+
+    PSRAM is the dividing line; without it the update check's buffers compete with the Bluetooth
+    stack in internal RAM, and a failed allocation aborts the firmware.
     """
     return "psram" in CORE.config
 
@@ -345,9 +373,29 @@ async def to_code(config):
             _ota_src_default = "github" if esp32.get_esp32_variant() == "ESP32S3" else "relay"
         except Exception:  # noqa: BLE001 - be safe if the variant can't be determined
             _ota_src_default = "relay"
-    # Release notes are passed through to Home Assistant uncapped, so the limit is the board's RAM:
-    # the text is held per component plus a copy in each update entity.
-    cg.add_define("LSC_CHANGELOG_MAX", 16000 if _direct_github_ok() else 7000)
+    # Update-check memory budget, sized per board: the parse runs alongside WiFi and the BLE stack
+    # in internal RAM, and a failed allocation aborts the firmware.
+    _rich = _heap_rich()
+    if _rich:
+        cg.add_define("LSC_HEAP_RICH")
+    # Release notes are published as an entity state and copied per subscribed API client. Bodies in
+    # this repo run ~1.5-6.3 kB; a 2.3 kB state exhausted the API server's outgoing buffer on a board
+    # without PSRAM. Do not raise without measuring what the API path carries on that board.
+    cg.add_define("LSC_CHANGELOG_MAX", 16000 if _rich else 1500)
+    # How much of the release listing to pull; the depth serves the "full" method's aggregated
+    # changelog. The delta window is widened separately from /tags.
+    cg.add_define("LSC_GH_PER_PAGE", 100 if _rich else 30)
+    # With PER_BODY 0 a retained release is just its tag string (~50 B), so depth is nearly free.
+    cg.add_define("LSC_GH_MAX_REL", 100 if _rich else 30)
+    # Per-release body kept from the LISTING (for the aggregate changelog). 0 = don't collect any;
+    # the shown target's changelog is fetched separately from /tags/<tag> either way.
+    cg.add_define("LSC_GH_PER_BODY", 300 if _rich else 0)
+    # Worker stack: verifying against the Mozilla cert bundle needs more than a pinned certificate.
+    cg.add_define("LSC_GH_TASK_STACK", 16384 if config[CONF_USE_CERT_BUNDLE] else 8192)
+    # Heap required before the check may start: worker stack plus working set.
+    # A guard, not a guarantee: a single large TLS record can ask for more. Must stay below what the
+    # board reaches with the BLE link released (~41 kB here), or no check can ever run.
+    cg.add_define("LSC_GH_HEAP_MIN", 60000 if _rich else 38000)
     if not _direct_github_ok():
         if _ota_src_default == "github":
             raise cv.Invalid(
