@@ -240,8 +240,15 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       // goes to the controller at once, the connection goes silent and dies on its supervision
       // timeout before a single ACK comes back. Open with a small window and widen it only as
       // ACKs actually arrive.
-      if (this->ota_window_open_ > this->ota_window_chunks_ || this->ota_window_open_ < 4)
-        this->ota_window_open_ = 8;
+      // Never below ack_every: the scooter acknowledges only after that many chunks, so a smaller
+      // in-flight window stops one chunk short of the ACK that would open it again — both sides
+      // then wait for each other and the transfer stands still.
+      uint16_t open_min = this->ota_ack_every_ > 8 ? this->ota_ack_every_ : 8;
+      if (open_min > this->ota_window_chunks_)
+        open_min = this->ota_window_chunks_;
+      if (this->ota_window_open_ > this->ota_window_chunks_ || this->ota_window_open_ < open_min)
+        this->ota_window_open_ = open_min;
+      this->ota_window_min_ = open_min;
       this->ota_resume_ = resume;
       this->ota_selfheal_anchor_ = resume;  // progress detector baseline for the self-heal streak
       this->ota_acked_ = this->ota_sent_ = this->ota_produced_ = resume;
@@ -270,7 +277,7 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       uint32_t acked = rd_u32le(&x[2]);
       this->ota_last_ack_ms_ = millis();
       if (rewind) {
-        if (this->ota_window_open_ > 4)
+        if (this->ota_window_open_ / 2 >= this->ota_window_min_)
           this->ota_window_open_ /= 2;  // loss: back off the in-flight window as well as the pacing
         if (++this->ota_rewinds_ > 60) {
           this->ota_fail_("too many rewinds");
@@ -589,13 +596,22 @@ void LibrescootBleClient::ota_producer_() {
   if (this->ota_url_.rfind("https", 0) == 0)
     this->ota_http_tls_(&cfg);
   cfg.timeout_ms = 8000;
-  cfg.buffer_size = 4096;  // RX: response headers/data (CDN headers are modest)
   // TX buffer holds the request LINE ("GET <path>?<query> HTTP/1.1"). After GitHub's 302 the CDN URL
   // is a long signed objects.githubusercontent.com URL (~1 KB of X-Amz-* query), so the default 512
-  // overflows and esp_http_client fails the request with "Out of buffer" — that was the real cause of
-  // the failed direct download (the metadata fetch has short api.github.com URLs, so it was fine).
-  cfg.buffer_size_tx = 4096;
+  // overflows and esp_http_client fails the request with "Out of buffer". A relay URL is short, and
+  // the smaller buffers leave the heap that the API and the BLE stack need while a transfer runs.
+  const bool direct = this->ota_url_.rfind("https", 0) == 0;
+  cfg.buffer_size = direct ? 4096 : 1024;     // RX: streaming read granularity
+  cfg.buffer_size_tx = direct ? 4096 : 1024;
   esp_http_client_handle_t c = esp_http_client_init(&cfg);
+  if (c == nullptr) {
+    // Out of memory for the client's buffers. Every other call site checks this; without it the
+    // next set_header writes through a null pointer and takes the firmware down.
+    ESP_LOGW(OTAG, "download: could not create the HTTP client (%u B heap free) — will resume",
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    this->ota_producer_done_ = true;
+    return;
+  }
   esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
   char range[48];
   snprintf(range, sizeof(range), "bytes=%u-", (unsigned) this->ota_resume_);
@@ -900,6 +916,12 @@ void LibrescootBleClient::ota_resolve_task_(void *arg) {
 
 void LibrescootBleClient::ota_resolve_() {
   this->rs_resolved_ = false;  // per run: set only once GitHub has actually answered
+  // Nothing else on the network while this runs: a concurrent update-check worker holds a task
+  // stack and its own buffers, and that is what leaves the heap too fragmented for the handshake.
+  // Also gives the BLE link, released just before, time to actually close.
+  for (int w = 0; w < 40 && this->gh_running_; w++)
+    vTaskDelay(pdMS_TO_TICKS(500));
+  vTaskDelay(pdMS_TO_TICKS(1500));
   const std::string url =
       "https://api.github.com/repos/" + this->github_repo_ + "/releases/tags/" + this->rs_tag_;
   // "delta" → small patch asset; "full" → complete .mender image (hundreds of MB).
@@ -925,6 +947,7 @@ void LibrescootBleClient::ota_resolve_() {
     continue;
   esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
   esp_http_client_set_header(c, "Accept", "application/vnd.github+json");
+  this->github_auth_(c, url);
 
   // Scan the release JSON for each delta asset's name/size/digest (they appear in that order
   // within an asset object). browser_download_url is not needed — the URL is built from the
@@ -995,11 +1018,22 @@ void LibrescootBleClient::ota_resolve_() {
         }
       }
       this->rs_resolved_ = true;  // GitHub answered; an empty result really means "no such asset"
+    } else if (status == 401) {
+      ESP_LOGE(OTAG, "resolve: HTTP 401 — GitHub rejected the token (expired, revoked or "
+                     "malformed); check github_token");
+    } else if (status == 403) {
+      ESP_LOGE(OTAG, "resolve: HTTP 403 — %s", this->github_token_.empty()
+                                                   ? "unauthenticated rate limit (60/h) reached"
+                                                   : "token not permitted, or rate limited");
     } else {
       ESP_LOGW(OTAG, "resolve: HTTP %d", status);
     }
   } else {
-    ESP_LOGW(OTAG, "resolve: connection failed");
+    ESP_LOGW(OTAG, "resolve: connection failed — %u B internal heap free, largest block %u B, "
+                   "%u B 8-bit-capable largest",
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   }
   esp_http_client_close(c);
   esp_http_client_cleanup(c);
@@ -1066,7 +1100,7 @@ void LibrescootBleClient::ota_handle_disconnect_() {
     if (this->ota_sent_ > this->ota_acked_) {
       if (this->ota_send_gap_ms_ < 60)
         this->ota_send_gap_ms_ += 3;
-      if (this->ota_window_open_ > 4)
+      if (this->ota_window_open_ / 2 >= this->ota_window_min_)
         this->ota_window_open_ /= 2;
     }
     if (this->ota_have_current_job_ && ++this->ota_resume_count_ <= 40) {
@@ -1093,7 +1127,9 @@ void LibrescootBleClient::ota_set_state_(OtaState s) {
 // Report cadence scales with bundle size so a big transfer doesn't flood the log / HA:
 //   <= 500 kB -> every 5 s,  <= 30 MB -> every 60 s,  > 30 MB -> every 5 min.
 bool LibrescootBleClient::ota_report_due_() {
-  uint32_t interval = 5000;
+  // A progress update carries the entity's whole payload, release notes included, to every
+  // connected client. During a transfer the heap is at its tightest, so keep these sparse.
+  uint32_t interval = 20000;
   if (this->ota_total_ > 30u * 1024 * 1024)
     interval = 300000;
   else if (this->ota_total_ > 500u * 1024)

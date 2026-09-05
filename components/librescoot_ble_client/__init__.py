@@ -98,6 +98,7 @@ CONF_PASSKEY = "passkey"
 CONF_OTA_AUTO_RESUME = "ota_auto_resume"
 CONF_PRESENCE_TIMEOUT = "presence_timeout"
 CONF_GITHUB_REPO = "github_repo"
+CONF_GITHUB_TOKEN = "github_token"
 CONF_UPDATE_INTERVAL = "update_check_interval"
 CONF_LINK_INTERVAL = "link_interval"
 CONF_LINK_AUTO_HOLD = "link_auto_hold"
@@ -318,6 +319,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_OTA_AUTO_RESUME, default=True): cv.boolean,
             # GitHub repo (owner/name) the firmware releases come from.
             cv.Optional(CONF_GITHUB_REPO, default="librescoot/librescoot"): cv.string,
+            # Fine-grained token, public repo, read-only. Raises the GitHub API limit from 60 to
+            # 5000 requests per hour. Sent to api.github.com only.
+            cv.Optional(CONF_GITHUB_TOKEN, default=""): cv.string,
             # How often to poll GitHub for a newer release.
             cv.Optional(CONF_UPDATE_INTERVAL, default="6h"): cv.positive_time_period_milliseconds,
             # "BLE Presence" stays Home if an advert was seen within this window (weak signal).
@@ -364,6 +368,7 @@ async def to_code(config):
 
     cg.add(var.set_ota_auto_resume(config[CONF_OTA_AUTO_RESUME]))
     cg.add(var.set_github_repo(config[CONF_GITHUB_REPO]))
+    cg.add(var.set_github_token(config[CONF_GITHUB_TOKEN]))
     # OTA byte source DEFAULT: YAML `ota_source:` wins; else chip-based — ESP32-S3 (PSRAM, can do the
     # GitHub-CDN TLS) defaults to direct GitHub, every other chip defaults to the HA relay.
     if CONF_OTA_SOURCE_DEFAULT in config:

@@ -147,10 +147,11 @@ class LibrescootUpdate : public update::UpdateEntity, public Parented<Librescoot
     this->update_info_.release_url.clear();
     this->state_ = update::UPDATE_STATE_UNKNOWN;
     this->info_dirty_ = false;
-    // UpdateEntity has no invalidate_state(); publish_state() sets the flag, clear it afterwards.
-    this->publish_state();
+    // Do not publish_state(): it sets has_state and sends, and a state with current set and latest
+    // empty is read as an available update with a blank target. Clear the flag and notify instead,
+    // which sends missing_state.
     this->set_has_state(false);
-    this->state_callback_.call();  // let Home Assistant pick the cleared state up immediately
+    this->state_callback_.call();
   }
   void set_available(bool avail) {
     const auto st = avail ? update::UPDATE_STATE_AVAILABLE : update::UPDATE_STATE_NO_UPDATE;
@@ -307,6 +308,10 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
 
   // BLE-OTA transfer engine.
   void set_stage_only(bool s) { this->stage_only_ = s; }
+  // Optional fine-grained token (public repo, read-only). Raises the GitHub API limit from 60 to
+  // 5000 requests per hour. Sent to api.github.com only — never on the asset URLs, which redirect
+  // to a different host.
+  void set_github_token(const std::string &t) { this->github_token_ = t; }
   void set_github_repo(const std::string &r) {
     this->github_repo_ = r;
     this->ota_source_url_ = "https://github.com/" + r + "/releases/download";
@@ -561,8 +566,27 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   bool check_link_release_{false};
   uint32_t check_link_deadline_ms_{0};
   uint32_t check_release_next_ok_ms_{0};  // earliest next link release, whoever asks
+  // The asset lookup needs a TLS handshake, which on a small board only fits with the BLE link
+  // down. Held only for the resolve; the transfer needs the link back immediately after.
+  bool resolve_link_release_{false};
   uint32_t gh_heap_skip_until_ms_{0};  // suppress repeat skip messages within one backoff
+  uint8_t gh_fail_streak_{0};   // consecutive failed checks; widens the retry backoff
+  bool gh_rate_limited_{false}; // GitHub answered 403/429 during the last check
+  // GitHub's rate-limit headers from the last API response. Component-internal: logged, not
+  // published as an entity.
+  int32_t gh_rate_remaining_{-1};
+  int32_t gh_rate_total_{-1};
+  uint32_t gh_rate_reset_epoch_{0};
+  void github_log_rate_();
+  // Response headers are not retained by esp_http_client, so they are captured as they arrive.
+  static esp_err_t github_http_event_(esp_http_client_event_t *evt);
   void check_release_restore_();
+  // Attach the token to a GitHub API request, if one is configured.
+  void github_auth_(esp_http_client_handle_t c, const std::string &url);
+  // Channel latest + tag list over the plain-HTTP relay, so a board that cannot afford a TLS
+  // session can still run its update check. Fills `latest` and `tags`; false when unavailable.
+  bool fetch_check_via_relay_(const std::string &channel, std::string &latest,
+                              std::vector<std::string> &tags);
   // Release notes over the plain-HTTP relay, for boards without heap for a second TLS session.
   // Returns "" when unavailable.
   std::string fetch_notes_via_relay_(const std::string &tag);
@@ -663,7 +687,8 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   ESPPreferenceObject ota_chunk_pref_;
   void ota_note_no_progress_();
   uint16_t ota_window_chunks_{64};
-  uint16_t ota_window_open_{8};  // slow-start: chunks actually allowed in flight, <= ota_window_chunks_
+  uint16_t ota_window_open_{8};
+  uint16_t ota_window_min_{8};  // floor for the in-flight window: the scooter's ack_every
   uint8_t ota_ack_every_{16};
   uint8_t *ota_buf_{nullptr};
   uint32_t ota_cap_{0};
@@ -687,6 +712,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // --- install path (perform): resolve delta assets, then transfer MDB then DBC ---
   // Byte source base; metadata (size/sha) always comes from the GitHub API. Point this at a
   // local HTTP mirror to drop TLS from the bulk transfer. Layout: <base>/<tag>/<asset_name>.
+  std::string github_token_;
   std::string github_repo_{"librescoot/librescoot"};   // owner/name, configurable in YAML
   std::string ota_source_url_{"https://github.com/librescoot/librescoot/releases/download"};
   std::string ca_cert_;                   // YAML PEM root(s) for HTTPS; empty = built-in GitHub roots

@@ -42,6 +42,13 @@ static const uint32_t REAUTH_RETRY_BACKOFF_MS = 30000;
 // Minimum spacing between two update-check link releases, whatever requested the check. Several
 // callers can request one, including the version-change trigger that fires on every reconnect.
 static const uint32_t CHECK_RELEASE_MIN_GAP_MS = 30 * 60 * 1000UL;
+// Retry spacing after a failed update check. Doubles per consecutive failure; a 403/429 waits out
+// GitHub's hourly window instead.
+static const uint32_t CHECK_RETRY_BASE_MS = 45 * 1000UL;
+static const uint32_t CHECK_RETRY_MAX_MS = 15 * 60 * 1000UL;
+static const uint32_t CHECK_RETRY_RATE_LIMIT_MS = 20 * 60 * 1000UL;
+// Contiguous internal heap the asset lookup's TLS handshake needs, with margin.
+static const size_t RESOLVE_BLOCK_MIN = 10000;
 static const uint8_t REAUTH_FAIL_MAX = 5;
 // "interval" link mode: how long to stay connected per cycle — long enough for on_connected_ to
 // read every characteristic once (reads are serialised, ~25 chars) plus the on-connect queries.
@@ -396,6 +403,9 @@ void LibrescootBleClient::setup() {
 void LibrescootBleClient::dump_config() {
   ESP_LOGCONFIG(TAG, "Librescoot BLE Client:");
   BLEClientBase::dump_config();
+  ESP_LOGCONFIG(TAG, "  GitHub API: %s (limit %s)",
+                this->github_token_.empty() ? "unauthenticated" : "token configured",
+                this->github_token_.empty() ? "60/h" : "5000/h");
   ESP_LOGCONFIG(TAG, "  Characteristics: %u   Link mode: %s", (unsigned) this->chars_.size(),
                 this->link_mode_str_.c_str());
 }
@@ -475,6 +485,11 @@ void LibrescootBleClient::loop() {
   if (this->ota_resolve_done_) {
     this->ota_resolve_done_ = false;
     this->ota_resolve_running_ = false;
+    if (this->resolve_link_release_) {
+      this->resolve_link_release_ = false;
+      ESP_LOGI("ota", "resolve: done — restoring the BLE link");
+      this->apply_link_state_();
+    }
     this->ota_jobs_.clear();
     if (this->ota_cancel_) {
       this->ota_cancel_ = false;  // aborted while the resolve was in flight — discard the result
@@ -1591,7 +1606,8 @@ void LibrescootBleClient::apply_link_state_() {
   // the dashboard. With this, a code appears only when pairing was actually requested.
   bool may_link = this->is_bonded_() || this->pairing_armed_();
   bool want = has_mac && !this->pairing_blocked_ && !backoff && may_link &&
-              !this->check_link_release_ &&  // update check owns the heap for the moment
+              !this->check_link_release_ &&    // update check owns the heap for the moment
+              !this->resolve_link_release_ &&  // asset lookup does, for its handshake
               (this->ota_active_ || this->interval_refreshing_ || continuous);
   this->set_enabled(want);
 }
@@ -1690,6 +1706,9 @@ void LibrescootBleClient::publish_current_() {
 void LibrescootBleClient::request_update_check(bool may_release_link, bool user_requested) {
   if (this->gh_running_)
     return;
+  // An install owns the network and the heap until it is done.
+  if (this->ota_resolve_running_ || this->ota_state_ != OtaState::IDLE || !this->ota_jobs_.empty())
+    return;
   this->gh_channel_ = this->channel_;
   // Snapshot the installed MDB version (GitHub tag form) so the worker can list every release
   // between it and the channel latest — a multi-hop update shows all the skipped changelogs.
@@ -1702,8 +1721,12 @@ void LibrescootBleClient::request_update_check(bool may_release_link, bool user_
   // The parse grows std::strings alongside WiFi and the BLE stack. Builds are without exceptions,
   // so a failed allocation aborts the firmware — decline the check instead.
   const uint32_t now = millis();
+  // Over the relay the check is plain HTTP: no TLS session, so no reason to hand back the BLE link
+  // or to require the heap a handshake would need.
   const size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (free_heap < LSC_GH_HEAP_MIN) {
+  if (this->ota_source_mode_ != "github" && free_heap < LSC_GH_HEAP_MIN)
+    ESP_LOGD(TAG, "update check: %u B heap free, going over the relay", (unsigned) free_heap);
+  else if (free_heap < LSC_GH_HEAP_MIN) {
     // Release the BLE link for the duration of the check to free the internal RAM it needs. Never
     // while the OTA engine holds anything: dropping the link there would abandon a transfer.
     const bool link_up = this->state() == espbt::ClientState::ESTABLISHED;
@@ -1972,6 +1995,51 @@ void LibrescootBleClient::check_integration_() {
 
 // Stream a GitHub API GET (TLS per the YAML-configured trust) through a per-byte sink, without
 // buffering the whole payload. Returns true on HTTP 200.
+// GitHub's rate-limit headers, present on every API response. esp_http_client keeps only a few
+// response headers, so they are picked out of the header event as they arrive.
+esp_err_t LibrescootBleClient::github_http_event_(esp_http_client_event_t *evt) {
+  if (evt->event_id != HTTP_EVENT_ON_HEADER || evt->user_data == nullptr)
+    return ESP_OK;
+  auto *self = static_cast<LibrescootBleClient *>(evt->user_data);
+  if (strcasecmp(evt->header_key, "x-ratelimit-remaining") == 0)
+    self->gh_rate_remaining_ = (int32_t) strtol(evt->header_value, nullptr, 10);
+  else if (strcasecmp(evt->header_key, "x-ratelimit-limit") == 0)
+    self->gh_rate_total_ = (int32_t) strtol(evt->header_value, nullptr, 10);
+  else if (strcasecmp(evt->header_key, "x-ratelimit-reset") == 0)
+    self->gh_rate_reset_epoch_ = (uint32_t) strtoul(evt->header_value, nullptr, 10);
+  return ESP_OK;
+}
+
+// Knowing the remaining budget before it runs out is the difference between backing off and
+// walking into a 403.
+void LibrescootBleClient::github_log_rate_() {
+  if (this->gh_rate_remaining_ < 0 || this->gh_rate_total_ < 0)
+    return;
+  uint32_t mins = 0;
+  if (this->time_ != nullptr && this->gh_rate_reset_epoch_ != 0) {
+    const auto now = this->time_->now();
+    if (now.is_valid() && this->gh_rate_reset_epoch_ > (uint32_t) now.timestamp)
+      mins = (this->gh_rate_reset_epoch_ - (uint32_t) now.timestamp) / 60;
+  }
+  const char *mode = this->github_token_.empty() ? "unauthenticated" : "token";
+  const bool low = this->gh_rate_remaining_ <= 5;
+  if (low)
+    ESP_LOGW(TAG, "github API (%s): %ld of %ld requests left, resets in %u min", mode,
+             (long) this->gh_rate_remaining_, (long) this->gh_rate_total_, (unsigned) mins);
+  else
+    ESP_LOGI(TAG, "github API (%s): %ld of %ld requests left, resets in %u min", mode,
+             (long) this->gh_rate_remaining_, (long) this->gh_rate_total_, (unsigned) mins);
+}
+
+// Attach the configured token, and only to api.github.com. Asset downloads redirect to
+// objects.githubusercontent.com, and a token must not be handed to another host.
+void LibrescootBleClient::github_auth_(esp_http_client_handle_t c, const std::string &url) {
+  if (this->github_token_.empty() || url.rfind("https://api.github.com/", 0) != 0)
+    return;
+  const std::string h = "Bearer " + this->github_token_;
+  esp_http_client_set_header(c, "Authorization", h.c_str());
+}
+
 bool LibrescootBleClient::github_http_stream_(const std::string &url,
                                               const std::function<void(char)> &sink) {
   esp_http_client_config_t cfg = {};
@@ -1980,14 +2048,18 @@ bool LibrescootBleClient::github_http_stream_(const std::string &url,
   cfg.timeout_ms = 15000;
   cfg.buffer_size = 1024;
   cfg.buffer_size_tx = 1024;
+  cfg.event_handler = &LibrescootBleClient::github_http_event_;
+  cfg.user_data = this;
   esp_http_client_handle_t c = esp_http_client_init(&cfg);
   esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
   esp_http_client_set_header(c, "Accept", "application/vnd.github+json");
+  this->github_auth_(c, url);
   esp_http_client_set_header(c, "X-GitHub-Api-Version", "2022-11-28");
   bool ok = false;
   esp_err_t err = esp_http_client_open(c, 0);
   if (err == ESP_OK) {
     esp_http_client_fetch_headers(c);
+    this->github_log_rate_();
     int status = esp_http_client_get_status_code(c);
     if (status == 200) {
       char buf[512];
@@ -2011,7 +2083,20 @@ bool LibrescootBleClient::github_http_stream_(const std::string &url,
       if (!ok)
         ESP_LOGW(TAG, "update check: response was cut short — discarding it");
     } else {
-      ESP_LOGW(TAG, "update check: HTTP %d", status);
+      if (status == 403 || status == 429)
+        this->gh_rate_limited_ = true;
+      const bool tok = !this->github_token_.empty();
+      if (status == 401)
+        ESP_LOGE(TAG, "update check: HTTP 401 — GitHub rejected the token (expired, revoked or "
+                      "malformed); check github_token");
+      else if (status == 403 && tok)
+        ESP_LOGE(TAG, "update check: HTTP 403 — token accepted but not permitted, or rate limited; "
+                      "the token needs read access to the repository");
+      else if (status == 403)
+        ESP_LOGW(TAG, "update check: HTTP 403 — unauthenticated rate limit (60/h) reached; set "
+                      "github_token to raise it");
+      else
+        ESP_LOGW(TAG, "update check: HTTP %d", status);
     }
   } else {
     // Report the heap: a failed handshake allocation is indistinguishable from a network fault by
@@ -2067,7 +2152,21 @@ void LibrescootBleClient::github_fetch_() {
   std::string mdb_target, dbc_target, mdb_summary, dbc_summary;
   const bool full = (this->gh_method_ == "full");
 
-  if (stable) {
+  // With the relay as byte source, the whole check goes over it: plain HTTP, no TLS session, and
+  // one request instead of three. Only the display data travels this way; the integrity anchor is
+  // fetched from GitHub over TLS in ota_resolve_ regardless of this setting.
+  const bool via_relay = (this->ota_source_mode_ != "github");
+  if (via_relay) {
+    std::vector<std::string> tags;
+    if (this->fetch_check_via_relay_(this->gh_channel_, best, tags)) {
+      this->gh_tags_ = std::move(tags);
+      src_complete = true;
+      // Same target rule as the GitHub path: full jumps to the channel latest, delta steps to each
+      // component's own adjacent successor. The bodies come from the relay in fetch_asset below.
+      mdb_target = full ? best : this->gh_successor_(this->gh_current_tag_);
+      dbc_target = full ? best : this->gh_successor_(this->gh_current_dbc_tag_);
+    }
+  } else if (stable) {
     // Stable ships one release at a time via /latest; keep the single-release path.
     static const char NEEDLE[] = "\"tag_name\":\"";
     const size_t NLEN = sizeof(NEEDLE) - 1;
@@ -2170,7 +2269,19 @@ void LibrescootBleClient::github_fetch_() {
                                                                                              : "OUTSIDE"));
       }
 #endif
-      this->gh_tags_ = std::move(tags);
+      // Keep the previous window unless the new one is at least as useful. A torn fetch returns a
+      // short or empty list, and replacing a covering window with it leaves no computable successor
+      // and withdraws a valid offer.
+      const bool covers =
+          !curtag.empty() && std::find(tags.begin(), tags.end(), curtag) != tags.end();
+      const bool had_cover = !curtag.empty() && std::find(this->gh_tags_.begin(), this->gh_tags_.end(),
+                                                          curtag) != this->gh_tags_.end();
+      if (covers || (!had_cover && tags.size() >= this->gh_tags_.size())) {
+        this->gh_tags_ = std::move(tags);
+      } else {
+        ESP_LOGW(TAG, "update check: fetched %u tags, keeping the previous %u-tag window",
+                 (unsigned) tags.size(), (unsigned) this->gh_tags_.size());
+      }
     }
 
     // successor(from): the next single delta step. A delta only applies to its immediately-preceding
@@ -2178,15 +2289,13 @@ void LibrescootBleClient::github_fetch_() {
     // fetched window — then the smallest tag > from is genuinely adjacent and its delta base == from.
     // If `from` is older than everything fetched (a far-behind board), we can't guarantee an
     // applicable delta, so offer nothing for delta (the operator uses `full` instead).
+    // Resolved against gh_tags_, the same window refresh_update_availability_ uses. The local `rels`
+    // list is only as deep as the releases listing, so on a board that widens the window from /tags
+    // the two would disagree: the changelog and asset size would be fetched for a different tag than
+    // the one shown, and both are then suppressed as stale.
     auto successor = [&](const std::string &from) -> std::string {
       if (from.empty()) return best;
-      bool in_window = false;
-      std::string nx;
-      for (auto &r : rels) {
-        if (r.tag == from) in_window = true;
-        if (r.tag > from && (nx.empty() || r.tag < nx)) nx = r.tag;
-      }
-      return in_window ? nx : std::string();
+      return this->gh_successor_(from);
     };
     auto single_body = [&](const std::string &t) -> std::string {
       for (auto &r : rels) if (r.tag == t) return r.body;
@@ -2229,6 +2338,12 @@ void LibrescootBleClient::github_fetch_() {
     if (tag.empty())
       return;
     fetched_body.clear();
+    if (via_relay) {
+      // Notes only. The asset size is display data, and fetching it would mean the TLS session this
+      // path exists to avoid; the size START sends comes from ota_resolve_.
+      fetched_body = this->fetch_notes_via_relay_(tag);
+      return;
+    }
 #ifndef LSC_HEAP_RICH
     // Notes off the relay where one is configured; the asset sizes below still come from GitHub.
     fetched_body = this->fetch_notes_via_relay_(tag);
@@ -2321,6 +2436,75 @@ void LibrescootBleClient::github_fetch_() {
   this->gh_done_ = true;  // consumed on the main loop
 }
 
+// Channel latest + tag list from the relay. Reply is plain text: "latest <tag>" on the first line,
+// one tag per line after it. Display and target selection only — the SHA-256 the scooter verifies
+// against is fetched from api.github.com over TLS by ota_resolve_, on this device, either way.
+bool LibrescootBleClient::fetch_check_via_relay_(const std::string &channel, std::string &latest,
+                                                std::vector<std::string> &tags) {
+  const std::string &src = this->ota_source_url_;
+  if (src.rfind("http://", 0) != 0)
+    return false;
+  size_t p = src.find("/ota/");
+  if (p == std::string::npos)
+    return false;
+  std::string q = src.substr(0, p) + "/check/" + src.substr(p + 5);
+  if (!q.empty() && q.back() != '/')
+    q += '/';
+  q += channel;
+
+  esp_http_client_config_t cfg = {};
+  cfg.url = q.c_str();
+  cfg.timeout_ms = 20000;  // the relay may have to fetch from GitHub before it can answer
+  cfg.buffer_size = 512;
+  cfg.buffer_size_tx = 1024;
+  esp_http_client_handle_t c = esp_http_client_init(&cfg);
+  if (c == nullptr)
+    return false;
+  esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
+
+  bool ok = false;
+  int status = -1;
+  if (esp_http_client_open(c, 0) == ESP_OK) {
+    esp_http_client_fetch_headers(c);
+    status = esp_http_client_get_status_code(c);
+  }
+  if (status == 200) {
+    std::string line;
+    char buf[256];
+    int r;
+    auto commit = [&]() {
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+        line.pop_back();
+      if (line.rfind("latest ", 0) == 0)
+        latest = line.substr(7);
+      else if (!line.empty() && tags.size() < 200)
+        tags.push_back(line);
+      line.clear();
+    };
+    while ((r = esp_http_client_read(c, buf, sizeof(buf))) > 0)
+      for (int i = 0; i < r; i++) {
+        if (buf[i] == '\n')
+          commit();
+        else
+          line += buf[i];
+      }
+    commit();
+    ok = !latest.empty() && !tags.empty();
+    if (ok)
+      ESP_LOGI(TAG, "update check via relay: latest '%s', %u tags", latest.c_str(),
+               (unsigned) tags.size());
+    else
+      ESP_LOGW(TAG, "update check via relay: unusable reply");
+  } else if (status == 204) {
+    ESP_LOGW(TAG, "update check via relay: no data for channel '%s'", channel.c_str());
+  } else {
+    ESP_LOGW(TAG, "update check via relay: HTTP %d", status);
+  }
+  esp_http_client_close(c);
+  esp_http_client_cleanup(c);
+  return ok;
+}
+
 // Release notes through the Home Assistant relay, for boards that cannot spare a second TLS
 // session. Display text only; the SHA-256 the scooter verifies against always comes from
 // api.github.com over TLS on this device (see ota_resolve_).
@@ -2387,9 +2571,25 @@ void LibrescootBleClient::apply_check_result_() {
   this->check_release_restore_();
   if (!this->gh_ok_ || this->gh_latest_tag_.empty()) {
     ESP_LOGW(TAG, "update check: no result; will retry");
-    this->next_check_ms_ = millis() + 45 * 1000UL;  // retry soon (TLS can fail under heap pressure)
+    // Each check costs several API requests and the unauthenticated limit is 60 per hour, so a
+    // fixed short retry exhausts the budget and turns one failure into an hour of 403s. Widen the
+    // gap with every consecutive failure, and wait out GitHub's hourly window on a rate limit.
+    if (this->gh_fail_streak_ < 5)
+      this->gh_fail_streak_++;
+    uint32_t backoff = CHECK_RETRY_BASE_MS << (this->gh_fail_streak_ - 1);
+    if (backoff > CHECK_RETRY_MAX_MS)
+      backoff = CHECK_RETRY_MAX_MS;
+    if (this->gh_rate_limited_) {
+      backoff = CHECK_RETRY_RATE_LIMIT_MS;
+      this->gh_rate_limited_ = false;
+      ESP_LOGW(TAG, "update check: rate limited by GitHub — next attempt in %u min",
+               (unsigned) (backoff / 60000));
+    }
+    this->next_check_ms_ = millis() + backoff;
     return;
   }
+  this->gh_fail_streak_ = 0;
+  this->gh_rate_limited_ = false;
   // Tag count: the delta target is only computable while the installed tag is inside the window.
   ESP_LOGI(TAG, "update check: latest '%s' for channel '%s' (%u tags)", this->gh_latest_tag_.c_str(),
            this->gh_channel_.c_str(), (unsigned) this->gh_tags_.size());
@@ -2462,6 +2662,12 @@ void LibrescootBleClient::squelch_updates_() {
 }
 
 void LibrescootBleClient::refresh_update_availability_() {
+  // Not while a transfer or an asset lookup is running. Nothing about the offer can change then,
+  // and rebuilding the summary means kilobyte-sized string appends at the moment the ring buffer,
+  // the download task and the HTTP client have just taken their memory. The install entity's
+  // progress comes from the OTA engine, not from here.
+  if (this->ota_state_ != OtaState::IDLE || this->ota_resolve_running_ || !this->ota_jobs_.empty())
+    return;
   const std::string &latest = this->gh_latest_tag_;  // channel latest (GitHub tag form)
   if (latest.empty()) {
     // No successful update check yet — say "nothing to offer" rather than leaving the entities in
@@ -2505,8 +2711,15 @@ void LibrescootBleClient::refresh_update_availability_() {
 
   // Whether a next step exists for each component, independent of ordering. This drives what the
   // entities show, so a component that is waiting its turn still reports the update it will get.
-  const bool mdb_has = have_mdb && !mtar.empty() && !ieq(this->mdb_version_, mtar);
-  const bool dbc_has = have_dbc && !dtar.empty() && !ieq(this->dbc_version_, dtar);
+  // Never offer a target older than what is installed. With delta the successor is newer by
+  // construction; with full the target is whatever the source calls "latest", and a wrong or
+  // tampered answer would otherwise be offered as a downgrade. A version typed into OTA Version by
+  // hand is not affected — that is a deliberate choice and perform_update honours it.
+  auto forward = [&](const std::string &tgt, const std::string &installed) {
+    return !tgt.empty() && version_to_tag(installed) < tgt;
+  };
+  const bool mdb_has = have_mdb && forward(mtar, this->mdb_version_);
+  const bool dbc_has = have_dbc && forward(dtar, this->dbc_version_);
 
   // Which one unattended installation may take next. full: MDB reaches the channel latest first.
   // delta: DBC steps until it matches MDB, then MDB takes its next step — one delta at a time.
@@ -2570,9 +2783,9 @@ void LibrescootBleClient::refresh_update_availability_() {
       !this->mdb_version_.empty() && !ieq(this->mdb_version_, "unknown") &&
       (this->sum_recheck_after_ms_ == 0 || now_ms >= this->sum_recheck_after_ms_)) {
     this->sum_recheck_after_ms_ = now_ms + 120000;  // at most one changelog re-fetch every 2 min
-    // No link release here: this fires on a two-minute timer while the changelog does not match
-    // the shown target.
-    this->request_update_check(false);  // fetch the matching changelog; it enable_loop()s to apply itself
+    // May release the link: on a board that cannot check while connected this is the only way the
+    // changelog is ever fetched. CHECK_RELEASE_MIN_GAP_MS bounds how often that happens.
+    this->request_update_check(true);  // fetch the matching changelog; it enable_loop()s to apply itself
   }
 
   if (this->mdb_update_ != nullptr && !(busy && this->ota_active_update_ == this->mdb_update_)) {
@@ -2701,12 +2914,28 @@ void LibrescootBleClient::perform_update(uint8_t component, bool force) {
   this->ota_resolve_done_ = false;
   ESP_LOGI("ota", "install %s: resolving %s assets for '%s' (bytes from %s)",
            force ? "(forced)" : "", this->ota_method_str_.c_str(), this->rs_tag_.c_str(), this->rs_source_.c_str());
+  // The lookup is one small HTTPS request, but its handshake wants ~4.8 kB contiguous, which a
+  // connected BLE link leaves fragmented beyond reach. Hand the link back for the few seconds the
+  // resolve takes; the retries inside it cover the moment the link is still closing.
+#ifndef LSC_HEAP_RICH
+  // Always hand the link back for the lookup. Its handshake needs ~4.8 kB contiguous, and whether a
+  // connected link leaves that is not predictable — a heap threshold got it wrong in both
+  // directions. The lookup takes seconds and happens only on an install, so paying it every time is
+  // the price of a deterministic outcome. Boards with PSRAM keep the link.
+  if (this->state() == espbt::ClientState::ESTABLISHED) {
+    ESP_LOGI("ota", "resolve: releasing the BLE link for the asset lookup");
+    this->resolve_link_release_ = true;
+    this->apply_link_state_();
+  }
+#endif
   // Same stack budget as the update-check worker: the larger one is only needed when verifying
   // against the Mozilla cert bundle.
   if (xTaskCreate(&LibrescootBleClient::ota_resolve_task_, "librescoot_res", LSC_GH_TASK_STACK, this,
                   5, nullptr) != pdPASS) {
     ESP_LOGW("ota", "could not start resolve task (an update check may be running) — try again");
     this->ota_resolve_running_ = false;
+    this->resolve_link_release_ = false;
+    this->apply_link_state_();
     if (this->ota_status_ != nullptr)
       this->ota_status_->publish_state("Error: busy, try again");
   }
