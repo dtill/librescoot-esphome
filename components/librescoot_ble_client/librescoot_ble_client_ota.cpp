@@ -149,6 +149,9 @@ void LibrescootBleClient::ota_start(const std::string &url, const std::string &s
   ESP_LOGI(OTAG, "START %s %s size=%u chunk=%u gap=%ums bundle='%s'",
            comp_name(component), eff_stage ? "(stage-only)" : "(install)", (unsigned) size,
            this->ota_chunk_, this->ota_send_gap_ms_, bundle_id.c_str());
+  ESP_LOGI(OTAG, "heap at start: %u B free, largest block %u B",
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
   this->ota_set_state_(OtaState::STARTING);
   this->ota_send_start_();
 }
@@ -255,9 +258,7 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       this->ota_producer_run_ = true;
       this->ota_producer_done_ = false;
       this->ota_http_ok_ = false;
-      // 16 kB is only needed when verifying against the Mozilla cert bundle; bytes off the
-      // plain-HTTP relay involve no TLS in this task at all.
-      if (xTaskCreate(&LibrescootBleClient::ota_producer_task_, "librescoot_dl", LSC_GH_TASK_STACK,
+      if (xTaskCreate(&LibrescootBleClient::ota_producer_task_, "librescoot_dl", LSC_OTA_TASK_STACK,
                       this, 6, nullptr) != pdPASS) {
         this->ota_fail_("could not start download task");
         return;
@@ -268,6 +269,9 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       ESP_LOGI(OTAG, "START_ACK: %s resume=%u window=%u (open %u) ack_every=%u chunk=%u ring=%u",
                status == 0x00 ? "resume" : "fresh", (unsigned) resume, this->ota_window_chunks_,
                this->ota_window_open_, this->ota_ack_every_, this->ota_chunk_, (unsigned) this->ota_cap_);
+      ESP_LOGI(OTAG, "heap streaming: %u B free, largest block %u B",
+               (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+               (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
       break;
     }
     case 0x82: {  // ACK [flags][acked:u32]
@@ -1212,6 +1216,19 @@ void LibrescootBleClient::ota_fail_(const char *why) {
     if (this->ota_selfheal_at_ms_ == 0)
       this->ota_selfheal_at_ms_ = 1;  // 0 is the "no backoff" sentinel; never store it
     this->ota_set_state_(OtaState::IDLE);  // ota_kick_next_job_ re-runs it after the backoff
+    // Drop a link that has stopped carrying GATT. The controller keeps reporting the connection
+    // (RSSI still answers) but the peer returns nothing, so every further START times out on a
+    // dead channel; only a fresh connection recovers it. State is already IDLE here, so the
+    // disconnect handler does not queue the job a second time.
+    if (this->ota_acked_ > this->ota_resume_) {
+      this->ota_stall_streak_ = 0;
+    } else if (++this->ota_stall_streak_ >= 2) {
+      this->ota_stall_streak_ = 0;
+      if (this->state() == espbt::ClientState::ESTABLISHED) {
+        ESP_LOGW(OTAG, "link stopped answering — reconnecting before the next attempt");
+        this->disconnect();
+      }
+    }
     ESP_LOGW(OTAG, "self-heal: '%s' — auto-resume #%u (streak %u/%u) in %u s", why,
              (unsigned) this->ota_selfheal_total_, (unsigned) this->ota_selfheal_count_, OTA_SELFHEAL_MAX,
              OTA_SELFHEAL_BACKOFF_MS / 1000);

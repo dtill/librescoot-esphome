@@ -681,9 +681,12 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // wedges the connection instead of merely being lost, so this is learned per link and persisted.
   // Only ever halved while a transfer is in flight: the scooter counts resume offsets in chunks, and
   // halving keeps every previous offset an exact multiple. Grown back only on a fresh transfer.
-  static constexpr uint16_t OTA_CHUNK_MAX = 240;
+  static constexpr uint16_t OTA_CHUNK_MAX = LSC_OTA_CHUNK_MAX;
   static constexpr uint16_t OTA_CHUNK_MIN = 60;
   uint16_t ota_chunk_limit_{OTA_CHUNK_MAX};
+  // Consecutive self-heals that moved no bytes. The peer's GATT server can stop answering
+  // while the link layer stays up, and retrying START on that link never recovers.
+  uint8_t ota_stall_streak_{0};
   ESPPreferenceObject ota_chunk_pref_;
   void ota_note_no_progress_();
   uint16_t ota_window_chunks_{64};

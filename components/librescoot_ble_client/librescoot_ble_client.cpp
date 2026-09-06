@@ -385,7 +385,7 @@ void LibrescootBleClient::setup() {
   // the in-flight window; the negotiated window is capped to fit.
   if (this->ota_status_ != nullptr || this->mdb_update_ != nullptr || this->dbc_update_ != nullptr) {
     bool has_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
-    this->ota_cap_ = (has_psram ? 64u : 32u) * 240u;
+    this->ota_cap_ = (has_psram ? 64u : 32u) * OTA_CHUNK_MAX;
     this->ota_buf_ = (uint8_t *) heap_caps_malloc(this->ota_cap_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (this->ota_buf_ == nullptr)
       this->ota_buf_ = (uint8_t *) malloc(this->ota_cap_);
@@ -672,6 +672,8 @@ void LibrescootBleClient::loop() {
     return;
 
   // Paced extended-command query queue (on connect / refresh).
+  if (this->ota_state_ != OtaState::IDLE && !this->pending_queries_.empty())
+    this->pending_queries_.clear();  // the link belongs to the transfer
   if (!this->pending_queries_.empty() && now >= this->next_query_ms_) {
     this->send_ext_query_(this->pending_queries_.front());
     this->pending_queries_.erase(this->pending_queries_.begin());
@@ -1054,6 +1056,14 @@ void LibrescootBleClient::post_discovered_() {
 }
 
 void LibrescootBleClient::on_connected_() {
+  // Not while a transfer is running. The extended-command channel and OTA share the one BLE link,
+  // and the scooter processes both serially — the on-connect burst competed with the transfer and
+  // it stopped shortly after. The reconnect during an OTA exists to carry the transfer, nothing
+  // else; the sensors are refreshed when the install is done.
+  if (this->ota_state_ != OtaState::IDLE || !this->ota_jobs_.empty()) {
+    ESP_LOGI(TAG, "connected during a transfer — skipping the sensor refresh");
+    return;
+  }
   // Force an immediate first read of every polled characteristic. Reset the retry
   // counter and the last-read timestamp too: without this a characteristic that gave
   // up during an earlier (flappy) link — or one the refresh button targets after a
@@ -2887,6 +2897,7 @@ void LibrescootBleClient::perform_update(uint8_t component, bool force) {
   this->ota_cancel_ = false;
   this->ota_resume_count_ = 0;
   this->ota_selfheal_count_ = 0;   // fresh user-initiated install: reset the auto-resume streak
+  this->ota_stall_streak_ = 0;
   this->ota_selfheal_at_ms_ = 0;
   this->ota_install_component_ = component;
   this->enable_loop();  // the OTA engine is driven from loop(); keep it running (see loop()).

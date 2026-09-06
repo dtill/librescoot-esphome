@@ -386,7 +386,10 @@ async def to_code(config):
     # Release notes are published as an entity state and copied per subscribed API client. Bodies in
     # this repo run ~1.5-6.3 kB; a 2.3 kB state exhausted the API server's outgoing buffer on a board
     # without PSRAM. Do not raise without measuring what the API path carries on that board.
-    cg.add_define("LSC_CHANGELOG_MAX", 16000 if _rich else 1500)
+    cg.add_define("LSC_CHANGELOG_MAX", 16000 if _rich else 400)
+    # 240 B is one ATT write of MTU-3 and needs Data Length Extension to survive; 120 B is what
+    # a board without PSRAM streams reliably, and it halves the ring buffer on a tight heap.
+    cg.add_define("LSC_OTA_CHUNK_MAX", 240 if _rich else 120)
     # How much of the release listing to pull; the depth serves the "full" method's aggregated
     # changelog. The delta window is widened separately from /tags.
     cg.add_define("LSC_GH_PER_PAGE", 100 if _rich else 30)
@@ -397,6 +400,9 @@ async def to_code(config):
     cg.add_define("LSC_GH_PER_BODY", 300 if _rich else 0)
     # Worker stack: verifying against the Mozilla cert bundle needs more than a pinned certificate.
     cg.add_define("LSC_GH_TASK_STACK", 16384 if config[CONF_USE_CERT_BUNDLE] else 8192)
+    # The byte producer needs a TLS-capable stack only where it can reach GitHub directly.
+    # Without PSRAM that option does not exist and it always streams plain HTTP off the relay.
+    cg.add_define("LSC_OTA_TASK_STACK", 8192 if _direct_github_ok() else 4096)
     # Heap required before the check may start: worker stack plus working set.
     # A guard, not a guarantee: a single large TLS record can ask for more. Must stay below what the
     # board reaches with the BLE link released (~41 kB here), or no check can ever run.
