@@ -88,15 +88,6 @@ static uint32_t u32le(const uint8_t *v) {
   return (uint32_t) v[0] | ((uint32_t) v[1] << 8) | ((uint32_t) v[2] << 16) | ((uint32_t) v[3] << 24);
 }
 
-static bool ieq(const std::string &a, const std::string &b) {
-  if (a.size() != b.size())
-    return false;
-  for (size_t i = 0; i < a.size(); i++)
-    if (tolower((unsigned char) a[i]) != tolower((unsigned char) b[i]))
-      return false;
-  return true;
-}
-
 static std::string mac_to_str(uint64_t m) {
   char b[18];
   snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", (uint8_t) (m >> 40), (uint8_t) (m >> 32),
@@ -121,14 +112,6 @@ static bool icontains(const std::string &hay, const std::string &needle) {
 
 // BLE reports the version with a lowercase 't' in the timestamp (nightly-20260730t200638);
 // the GitHub release tag uses uppercase 'T'. Convert so a DBC "catch up to MDB" target resolves.
-static std::string version_to_tag(const std::string &v) {
-  std::string t = v;
-  for (size_t i = 1; i + 1 < t.size(); i++)
-    if (t[i] == 't' && isdigit((unsigned char) t[i - 1]) && isdigit((unsigned char) t[i + 1]))
-      t[i] = 'T';
-  return t;
-}
-
 static std::string fmt_size(uint32_t bytes) {
   char b[24];
   if (bytes >= 1024u * 1024)
@@ -512,8 +495,13 @@ void LibrescootBleClient::loop() {
       const std::string installed = version_to_tag(mdb ? this->mdb_version_ : this->dbc_version_);
       // A mismatch needs both sides known; right after a reconnect the installed version is not.
       const bool known = !installed.empty() && !ieq(installed, "unknown");
+      // A merged bundle spans the whole gap: its own base IS the installed version, so the
+      // mismatch that would otherwise refuse the install does not apply to it.
+      const bool chained = this->rs_chain_ok_ && ieq(this->rs_chain_from_, installed) &&
+                           ieq(this->rs_chain_to_, this->rs_tag_);
       const bool base_mismatch =
-          ok && known && !this->rs_delta_base_.empty() && !ieq(this->rs_delta_base_, installed);
+          ok && known && !chained && !this->rs_delta_base_.empty() &&
+          !ieq(this->rs_delta_base_, installed);
       if (ok && !known && !this->rs_delta_base_.empty())
         ESP_LOGW("ota", "install: the scooter has not reported its version yet — proceeding without "
                         "the delta base check (expected base %s)", this->rs_delta_base_.c_str());
@@ -532,6 +520,20 @@ void LibrescootBleClient::loop() {
                  installed.empty() ? "(unknown)" : installed.c_str());
         if (this->ota_status_ != nullptr)
           this->ota_status_->publish_state("Error: delta needs " + this->rs_delta_base_);
+        // The gap is exactly what chaining exists for, so say so rather than leaving the user with
+        // a bare refusal.
+        if (!this->ota_delta_chain_ && this->chain_possible_())
+          ESP_LOGW("ota", "install: %s and %s are more than one release apart. Turn on "
+                          "'OTA Update Method delta-chaining' to merge the steps in between into a "
+                          "single install.",
+                   installed.c_str(), this->rs_tag_.c_str());
+        else if (!this->ota_delta_chain_)
+          ESP_LOGW("ota", "install: 'OTA Update Method delta-chaining' would merge the missing "
+                          "steps, but it needs OTA Update Method 'delta' and a reachable HA relay "
+                          "(method '%s', relay %s).",
+                   this->ota_method_str_.c_str(), this->integration_reachable_ ? "up" : "down");
+        else
+          ESP_LOGW("ota", "install: delta chaining is on but the relay could not merge this run.");
         // Same reasoning as a terminal install failure: unattended mode must not retry a delta that
         // cannot apply, or it would re-resolve it against GitHub every tick.
         if (this->ota_auto_update_) {
@@ -542,6 +544,25 @@ void LibrescootBleClient::loop() {
             this->auto_update_sw_->publish_state(false);
         }
         this->ota_settle_update_entity_();
+      } else if (ok && chained) {
+        // The merged bundle is served by the relay, not by GitHub: /ota/<secret> becomes
+        // /chainbytes/<secret>/<component>/<from>/<to>/<file>.
+        std::string url = this->rs_source_;
+        size_t at = url.find("/ota/");
+        url.replace(at, 5, "/chainbytes/");
+        url += std::string("/") + (mdb ? "mdb" : "dbc") + "/" + this->rs_chain_from_ + "/" +
+               this->rs_chain_to_ + "/" + this->rs_chain_name_;
+        this->ota_jobs_.push_back({url, this->rs_chain_sha_, bundle_id(this->rs_chain_name_),
+                                   this->rs_chain_size_, this->ota_install_component_});
+        ESP_LOGI("ota", "install: %s %s queued for %s (%u merged steps from %s)", mdb ? "MDB" : "DBC",
+                 this->rs_chain_name_.c_str(), this->rs_tag_.c_str(), this->rs_chain_steps_,
+                 this->rs_chain_from_.c_str());
+        // Say plainly what the SHA-256 in START does and does not prove for a merged bundle. The
+        // scooter still verifies the applied image against the hash carried inside the bundle,
+        // which was copied from the official last delta of the run.
+        ESP_LOGW("ota", "install: this bundle was merged by Home Assistant, so its SHA-256 is a "
+                        "transport check only; the applied image is verified against %s",
+                 this->rs_chain_result_.empty() ? "(unknown)" : this->rs_chain_result_.c_str());
       } else if (ok) {
         const std::string &nm = mdb ? this->rs_mdb_name_ : this->rs_dbc_name_;
         const std::string &sha = mdb ? this->rs_mdb_sha_ : this->rs_dbc_sha_;
@@ -1968,6 +1989,7 @@ void LibrescootBleClient::service_integration_check_() {
       this->hi_last_ = this->integration_reachable_;
       this->ha_integration_->publish_state(this->integration_reachable_);
     }
+    this->update_chain_switch_();
     if (!this->ota_download_capable_() && now - this->ota_hint_last_ms_ > 300000) {
       this->ota_hint_last_ms_ = now;
       ESP_LOGW(TAG, "OTA firmware download not possible: no HA-integration relay reachable and this "
@@ -2366,6 +2388,7 @@ void LibrescootBleClient::github_fetch_() {
     size_t an = 0, as = 0, bn = 0;
     int acap = 0;  // 0 idle, 1 name, 2 size
     bool bcap = false, bdone = !fetched_body.empty(), esc = false; int uskip = 0;
+    size_t body_cap = LSC_CHANGELOG_MAX;
     std::string aname, asize;
     this->github_http_stream_(base + "/tags/" + tag, [&](char ch) {
       if (acap == 1) {
@@ -2388,7 +2411,7 @@ void LibrescootBleClient::github_fetch_() {
       if (!bdone) {
         if (bcap) {
           if (!esc && uskip == 0 && ch == '"') { bdone = true; bcap = false; }
-          else json_body_char(fetched_body, ch, esc, uskip, LSC_CHANGELOG_MAX);
+          else json_body_char(fetched_body, ch, esc, uskip, body_cap);
           return;
         }
         bn = (ch == BN[bn]) ? bn + 1 : (ch == BN[0] ? 1 : 0);
@@ -2397,12 +2420,23 @@ void LibrescootBleClient::github_fetch_() {
           fetched_body.clear();
           // One allocation instead of ~10 reallocations, each of which needs old + new at once.
           // Claimed here, after the handshake for this request has released its own ~5 kB.
-          fetched_body.reserve(LSC_CHANGELOG_MAX + 16);
+          // std::string allocates from the internal heap on both boards (PSRAM is caps-alloc
+          // only), and a failed allocation aborts the firmware, so take only what the heap can
+          // spare and cap the changelog to match.
+          static constexpr size_t BODY_HEADROOM = 24576;
+          const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+          body_cap = LSC_CHANGELOG_MAX;
+          if (largest < body_cap + BODY_HEADROOM)
+            body_cap = largest > BODY_HEADROOM + 512 ? largest - BODY_HEADROOM : 512;
+          if (body_cap < LSC_CHANGELOG_MAX)
+            ESP_LOGW(TAG, "changelog capped at %u B (largest free block %u B)", (unsigned) body_cap,
+                     (unsigned) largest);
+          fetched_body.reserve(body_cap + 16);
           esc = false; uskip = 0; bn = 0;
         }
       }
     });
-    if (fetched_body.size() >= LSC_CHANGELOG_MAX) {
+    if (fetched_body.size() >= body_cap) {
       // Mark the cut and link the full notes; the cap is well below a typical release body.
       fetched_body += "\n\n**… truncated — full release notes:** https://github.com/";
       fetched_body += this->github_repo_;
@@ -2629,6 +2663,28 @@ std::string LibrescootBleClient::gh_successor_(const std::string &from) const {
 // now) AND the link mode must be one that will connect on its own ("always"/"auto"/"interval").
 // In "scan"/"disconnect" the component deliberately never takes the link, so an offer could not be
 // acted on; out of range the cached versions are stale and must not drive an offer either.
+// Chaining is only meaningful where the merge can actually happen: the delta method, and a Home
+// Assistant relay that can run xdelta3 and serve the result.
+bool LibrescootBleClient::chain_possible_() const {
+  return this->ota_method_str_ == "delta" && this->integration_reachable_;
+}
+
+void LibrescootBleClient::update_chain_switch_() {
+  const bool possible = this->chain_possible_();
+  if (possible == this->chain_sw_available_)
+    return;
+  this->chain_sw_available_ = possible;
+  ESP_LOGI(TAG, "delta chaining is %s (method '%s', HA relay %s)",
+           possible ? "selectable" : "not selectable", this->ota_method_str_.c_str(),
+           this->integration_reachable_ ? "up" : "down");
+  if (!possible && this->ota_delta_chain_) {
+    this->ota_delta_chain_ = false;
+    if (this->chain_sw_ != nullptr)
+      this->chain_sw_->publish_state(false);
+    ESP_LOGW(TAG, "delta chaining switched off — its preconditions no longer hold");
+  }
+}
+
 bool LibrescootBleClient::ota_offers_allowed_() const {
   const std::string &m = this->link_mode_str_;
   if (!(m == "always" || m == "auto" || m == "interval"))
@@ -3067,6 +3123,7 @@ void LibrescootBleClient::on_select(LibrescootSelect *sel, const std::string &va
       // re-run the update check so the entities and per-component targets reflect the new choice.
       this->ota_method_str_ = value;
       sel->publish_state(value);
+      this->update_chain_switch_();
       // The target is recomputed from the retained tag list for the new method immediately; a
       // background re-check just refreshes the changelog + asset sizes for the new method.
       this->refresh_update_availability_();
@@ -3107,6 +3164,24 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
       if (this->stage_only_sw_ != nullptr)
         this->stage_only_sw_->publish_state(state);
       ESP_LOGI(TAG, "stage_only %s", state ? "ON (transfers stop before COMPLETE)" : "OFF");
+      break;
+    case SwKind::DELTA_CHAINING:
+      // Merging a chain runs on the Home Assistant relay (it needs xdelta3 and ~100 MB), so the
+      // option only means anything with the delta method and a reachable relay. A switch cannot
+      // report "unavailable" over the API, so refuse instead of accepting a setting that could
+      // not be honoured.
+      if (state && !this->chain_possible_()) {
+        ESP_LOGW(TAG, "delta chaining needs OTA Update Method 'delta' and a reachable HA relay "
+                      "(method '%s', relay %s) — staying off",
+                 this->ota_method_str_.c_str(), this->integration_reachable_ ? "up" : "down");
+        if (this->chain_sw_ != nullptr)
+          this->chain_sw_->publish_state(false);
+        break;
+      }
+      this->ota_delta_chain_ = state;
+      if (this->chain_sw_ != nullptr)
+        this->chain_sw_->publish_state(state);
+      ESP_LOGI(TAG, "delta chaining %s", state ? "ON (one install for a run of releases)" : "off");
       break;
     case SwKind::AUTO_UPDATE:
       // Install every offered update unattended (per the availability rules), then switch itself off

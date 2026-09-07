@@ -223,6 +223,7 @@ SWITCHES = {
     # start OFF every boot and auto-update can never restore ON and install unattended.
     "ota_stage_only": ("set_stage_only_switch", SwKind.STAGE_ONLY, "diagnostic", "mdi:package-variant-closed", "ALWAYS_OFF"),
     "ota_auto_update": ("set_auto_update_switch", SwKind.AUTO_UPDATE, "diagnostic", "mdi:auto-download", "ALWAYS_OFF"),
+    "ota_delta_chaining": ("set_delta_chain_switch", SwKind.DELTA_CHAINING, "diagnostic", "mdi:link-variant", "ALWAYS_OFF"),
 }
 
 BUTTONS = {

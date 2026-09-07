@@ -135,7 +135,8 @@ librescoot_ble_client:
 | `time_id` | ID, optional | A `time` source (e.g. `sntp`); required only for **System Time sync with ESP** and **System Time Set UTC ISO-8601**. |
 | `github_repo` | string, `librescoot/librescoot` | Owner/name the firmware releases come from. |
 | `update_check_interval` | time, `6h` | How often to poll GitHub for a newer release. |
-| `stage_only` | bool, `false` | `true` = every transfer stops before `COMPLETE` (nothing installed). |
+| `github_token` | string, optional | Fine-grained GitHub token (public repo, read-only). Lifts the API rate limit from 60 to 5000 requests/hour. Keep it in `secrets.yaml`. Used for release metadata only — never sent with the asset download, which redirects to a different host. |
+| `ota_auto_resume` | bool, `true` | Recover a failed transfer by resuming from the offset the scooter already staged, instead of aborting the update. |
 | `presence_timeout` | time, `60s` | **BLE Presence** stays Home if an advert was seen within this window. |
 | `link_interval` | time, `5min` | For the **`interval`** BLE Link Mode: how often to connect, refresh every sensor once, then release the link again. |
 | `link_auto_hold` | time, `3min` | For the **`auto`** BLE Link Mode: hold the connection this long, then release it for ~20 s so a phone / other central gets a turn on the single slot. `0s` = pure failover (never yield proactively). |
@@ -152,6 +153,27 @@ pairing and direct-from-GitHub OTA with no Home Assistant relay — with just `u
 true` (plus `psram:` and `flash_size: 16MB` in the YAML). Do **not** set
 `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC` (it stalls the update check); PSRAM is only needed for the
 handshake — transfers **stream** through a small ring buffer regardless of image size.
+
+Staging without installing is the **OTA Stage Only** switch, not a YAML option — it is
+toggleable at runtime and survives no reboot by design.
+
+### Boards without PSRAM
+
+The component adapts its memory footprint at compile time, so no configuration is required. On a
+board without PSRAM it uses a smaller download-task stack, a 120-byte OTA chunk with a
+correspondingly smaller ring buffer, and a shorter changelog. Transfers still stream, so image size
+remains irrelevant to RAM.
+
+What such a board *does* need is headroom in the native API, because ESPHome collects state
+messages into one large contiguous allocation and a failed allocation cannot be recovered from:
+
+```yaml
+api:
+  batch_delay: 0ms      # send each state message on its own
+```
+
+Symptom if the margin is too thin: the device stops accepting new API connections, and Home
+Assistant reports the connection as dropped immediately after the handshake.
 
 Entity keys are **opt-in**: an entity is instantiated only if its key is present with a
 `name`. Each key accepts the usual entity options (`name`, `id`, `icon`, `entity_category`,
@@ -525,11 +547,54 @@ over BLE — under discussion upstream.)
 
 #### Staging vs installing, and the byte source
 
-The transfer is **stage-only by default** (`stage_only: true`): it streams the entire DATA
-phase and stops *before* `COMPLETE`, so nothing is installed — this exercises the whole state
-machine safely. With `stage_only: false`, a completed transfer sends `COMPLETE`, the scooter
-verifies the SHA-256 against the staged file and queues the real install. Installing firmware
-onto a road vehicle is a deliberate act.
+#### Delta chaining
+
+With `delta`, each release patches only its immediate predecessor, so a scooter several releases
+behind is brought forward one install and one reboot at a time. **OTA Update Method delta-chaining**
+asks the Home Assistant integration to merge the whole run into a single artifact, turning N
+installs into one.
+
+It only takes effect with **OTA Update Method** `delta` and a reachable relay — the merge needs
+`xdelta3` and about 100 MB of memory, so it cannot run on the ESP. Outside that combination the
+switch refuses to turn on and says why in the log; if the conditions stop holding while it is on,
+it switches itself off. (A switch cannot report *unavailable* over the ESPHome API, which is why it
+refuses rather than greying out.)
+
+Chaining does **not** save bytes: a merged patch is usually larger than the steps it replaces. What
+it saves is installs and reboots.
+
+Two things are worth understanding before turning it on:
+
+- **A merged artifact is not an official release asset.** The SHA-256 the transfer sends is
+  therefore a transport check only — it proves the bytes arrived intact, not where they came from.
+- **Authenticity rests on the applied-image hash** (`new_meta.decompressed_sha256`), which is copied
+  verbatim from the official last release of the run and which the scooter verifies after applying
+  the patch. On a board with PSRAM the component fetches that official release from GitHub over TLS
+  itself, reads the hash out of its header and **refuses the transfer before a byte moves** if the
+  merged artifact declares a different one:
+
+  ```
+  delta chain: 4 steps nightly-20260821T182219 -> nightly-20260823T082958 merged into … (2365785 B)
+  delta chain: anchor verified against GitHub over TLS (9f24515a79d4bbe8…)
+  ```
+
+  A board without PSRAM cannot reach the release CDN — that is why the relay exists — so there both
+  sides of the comparison come from Home Assistant. It logs that it is trusting the relay rather
+  than implying a guarantee it does not have.
+
+When an install is refused because the target skips releases, the log names this option.
+
+Two limits worth knowing: the option cannot be selected while the byte source is **direct GitHub**
+(relay reachability is only evaluated for a plain-HTTP source, so switch the source first), and the
+update entity still proposes only the next release — chaining engages for a target you set by hand
+in **OTA Version** that skips releases.
+
+Staging and installing are separated by the **OTA Stage Only** switch. With it on, a transfer
+streams the entire DATA phase and stops *before* `COMPLETE`, so nothing is installed — this
+exercises the whole state machine safely. With it off (the default), a completed transfer sends
+`COMPLETE`, the scooter verifies the SHA-256 against the staged file and queues the real install.
+Installing firmware onto a road vehicle is a deliberate act, so nothing is ever installed without
+a press.
 
 **Direct GitHub download needs an S3+PSRAM board.** On the ESP32-classic the RSA-4096 handshake
 to `objects.githubusercontent.com` runs out of contiguous heap while BLE is active

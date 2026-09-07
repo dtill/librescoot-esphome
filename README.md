@@ -83,6 +83,13 @@ offer their board's next step — press **Install** on either. Unattended instal
 (**OTA Auto Update**) keeps them in order and does one at a time. The scooter reboots after each
 install; the component waits that out. Nothing is ever installed on its own.
 
+**Several releases behind?** With `delta` each release patches only its predecessor, so the scooter
+is normally brought forward one install and one reboot at a time. **OTA Update Method
+delta-chaining** (off by default, needs the companion integration) merges the whole run into a
+single artifact instead — one install, one reboot. It does not save bytes, and on a board with PSRAM
+the ESP verifies the result against the official release over TLS before accepting the merged
+artifact.
+
 #### What you get
 
 Lock/unlock, seatbox, blinkers, alarm, USB/UMS mode, navigation and power-management controls;
@@ -95,7 +102,7 @@ releases, with resume, self-healing transfers and progress/throughput sensors.
 | | ESP32 classic | ESP32-S3 (PSRAM) |
 | :--- | :---: | :---: |
 | Control, all sensors, pairing | ✅ | ✅ |
-| Check for firmware updates | ✅ | ✅ |
+| Check for firmware updates | ✅ (via the integration, no TLS needed) | ✅ (direct) |
 | Firmware download **via Home Assistant** | ✅ (the only way) | ✅ (selectable) |
 | Firmware download **direct from GitHub** | ❌ (not enough memory) | ✅ (default) |
 | Home Assistant companion integration needed for updates | **Yes** | No — but supported |
@@ -104,6 +111,12 @@ The classic cannot hold the GitHub-CDN TLS session next to the Bluetooth stack, 
 integration downloads the release and serves the bytes over the local network. On an S3 the byte
 source is a runtime choice (**OTA Source**), so it can use the relay too. **Everything that is not a
 firmware download works without the integration on both boards.**
+
+> **On an ESP32 classic, add `batch_delay: 0ms` to `api:`.** The board has no PSRAM and runs on a
+> tight heap. ESPHome otherwise collects state messages into one large contiguous allocation, which
+> can fail during a firmware transfer — and a failed allocation restarts the device. Sending each
+> message on its own keeps every allocation small. A device that suddenly stops accepting Home
+> Assistant connections is the symptom to watch for.
 
 > **On an ESP32-S3, add `CONFIG_BT_BLE_50_FEATURES_SUPPORTED: n`** to the board's
 > `framework: sdkconfig_options:`. The S3's Bluetooth-5 controller otherwise issues an *Extended*

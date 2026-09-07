@@ -781,6 +781,45 @@ static std::string delta_base_from_tar_(const uint8_t *tar, size_t len) {
   return "";
 }
 
+// The applied-image hash out of the same metadata.json: inside "changes", each patched member
+// carries "old_meta" then "new_meta"; the first "decompressed_sha256" after "new_meta" is the hash
+// the scooter verifies the finished image against.
+static std::string delta_result_from_tar_(const uint8_t *tar, size_t len) {
+  static const char WANT[] = "metadata.json";
+  static const size_t WANT_LEN = sizeof(WANT) - 1;
+  for (size_t p = 0; p + 512 <= len;) {
+    const char *name = (const char *) tar + p;
+    if (name[0] == '\0')
+      break;
+    size_t nlen = strnlen(name, 100);
+    char oct[13];
+    memcpy(oct, tar + p + 124, 12);
+    oct[12] = '\0';
+    size_t size = (size_t) strtoul(oct, nullptr, 8);
+    p += 512;
+    if (nlen >= WANT_LEN && memcmp(name + nlen - WANT_LEN, WANT, WANT_LEN) == 0) {
+      if (p + size > len)
+        return "";
+      const std::string js((const char *) tar + p, size);
+      size_t k = js.find("\"new_meta\"");
+      if (k == std::string::npos)
+        return "";
+      k = js.find("\"decompressed_sha256\"", k);
+      if (k == std::string::npos)
+        return "";
+      k = js.find('"', js.find(':', k) + 1);
+      if (k == std::string::npos)
+        return "";
+      size_t e = js.find('"', ++k);
+      if (e == std::string::npos)
+        return "";
+      return js.substr(k, e - k);
+    }
+    p += (size + 511) & ~(size_t) 511;
+  }
+  return "";
+}
+
 // Ask the Home Assistant relay for the base instead of reading the archive here. It fetches the
 // same bytes anyway, has the memory to decompress them, and answers a short tag — so a board with
 // only internal RAM gets the check too. Empty means "could not tell", never "mismatch".
@@ -832,7 +871,7 @@ std::string LibrescootBleClient::ota_delta_base_(const std::string &url) {
   return this->ota_delta_base_onchip_(url);
 }
 
-std::string LibrescootBleClient::ota_delta_base_onchip_(const std::string &url) {
+std::string LibrescootBleClient::ota_delta_base_onchip_(const std::string &url, std::string *result) {
   size_t heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   if (heap < DELTA_PROBE_HEAP_MIN) {
     ESP_LOGW(OTAG, "delta probe: skipped, only %u B heap free", (unsigned) heap);
@@ -888,6 +927,8 @@ std::string LibrescootBleClient::ota_delta_base_onchip_(const std::string &url) 
           } else {
             inflated = inflate_head_(df, got - (size_t)(df - raw), inf, cap);
             base = delta_base_from_tar_(inf, inflated);
+            if (result != nullptr)
+              *result = delta_result_from_tar_(inf, inflated);
             heap_caps_free(inf);
           }
         }
@@ -1049,6 +1090,7 @@ void LibrescootBleClient::ota_resolve_() {
   // Delta pre-flight, for the one component this install is for (see ota_delta_base_). Full images
   // carry no base requirement, so they are not probed.
   this->rs_delta_base_.clear();
+  this->rs_chain_ok_ = false;
   if (this->ota_method_str_ != "full") {
     bool mdb = this->ota_install_component_ == 0;
     if (mdb ? this->rs_mdb_ok_ : this->rs_dbc_ok_) {
@@ -1056,9 +1098,127 @@ void LibrescootBleClient::ota_resolve_() {
       this->rs_delta_base_ = this->ota_delta_base_(this->rs_source_ + "/" + this->rs_tag_ + "/" + nm);
       ESP_LOGI(OTAG, "resolve: %s delta patches %s", comp_name(this->ota_install_component_),
                this->rs_delta_base_.empty() ? "(base unknown)" : this->rs_delta_base_.c_str());
+      // The target's delta patches something newer than what is installed, so the steps in between
+      // are missing. Ask the relay to merge them into one artifact instead of refusing.
+      const std::string installed = version_to_tag(mdb ? this->mdb_version_ : this->dbc_version_);
+      const bool gap = !installed.empty() && !ieq(installed, "unknown") &&
+                       !this->rs_delta_base_.empty() && !ieq(this->rs_delta_base_, installed);
+      if (gap && this->ota_delta_chain_)
+        this->ota_chain_resolve_(this->ota_install_component_, installed, this->rs_tag_);
     }
   }
   this->ota_resolve_done_ = true;
+}
+
+// The anchor: the applied-image hash of the OFFICIAL last artifact of the run, fetched from GitHub
+// over TLS by this board. A merged bundle is not an official asset, so its own SHA-256 only proves
+// the bytes arrived intact; comparing the hash it declares against this one is what makes it
+// trustworthy without trusting the host that merged it. Only boards that can read the archive head
+// themselves can do this — the URL is GitHub's regardless of which source serves the bytes.
+std::string LibrescootBleClient::ota_chain_anchor_(uint8_t component, const std::string &tag) {
+#ifdef LSC_HEAP_RICH
+  const std::string name =
+      std::string("librescoot-unu-") + (component == 0 ? "mdb" : "dbc") + "-" + tag + ".delta";
+  std::string result;
+  this->ota_delta_base_onchip_(this->github_base_() + "/" + tag + "/" + name, &result);
+  return result;
+#else
+  (void) component;
+  (void) tag;
+  return "";
+#endif
+}
+
+// Ask the Home Assistant relay to merge the run of deltas between two releases into one artifact.
+// http://host:port/ota/<secret> -> .../chain/<secret>/<component>/<from>/<to>, answering one
+// "key value" per line. 204 = cannot be merged; the caller then falls back to the serial chain.
+bool LibrescootBleClient::ota_chain_resolve_(uint8_t component, const std::string &from,
+                                            const std::string &to) {
+  std::string q = this->rs_source_;
+  size_t p = q.find("/ota/");
+  if (p == std::string::npos) {
+    ESP_LOGW(OTAG, "delta chain: the byte source is not the HA relay — cannot merge");
+    return false;
+  }
+  q.replace(p, 5, "/chain/");
+  q += std::string("/") + (component == 0 ? "mdb" : "dbc") + "/" + from + "/" + to;
+
+  esp_http_client_config_t cfg = {};
+  cfg.url = q.c_str();
+  cfg.timeout_ms = 180000;  // the relay downloads every step and merges them before it answers
+  cfg.buffer_size = 1024;
+  cfg.buffer_size_tx = 1024;
+  esp_http_client_handle_t c = esp_http_client_init(&cfg);
+  if (c == nullptr) {
+    ESP_LOGW(OTAG, "delta chain: could not create the HTTP client");
+    return false;
+  }
+  esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
+
+  bool ok = false;
+  int status = http_open_following_(c);
+  if (status == 200) {
+    char buf[512];
+    int total = 0, r;
+    while (total < (int) sizeof(buf) - 1 &&
+           (r = esp_http_client_read(c, buf + total, sizeof(buf) - 1 - total)) > 0)
+      total += r;
+    buf[total > 0 ? total : 0] = 0;
+    std::string name, sha, result;
+    uint32_t size = 0;
+    unsigned steps = 0;
+    for (const char *line = buf; line != nullptr && *line != 0;) {
+      const char *end = strchr(line, '\n');
+      std::string row(line, end != nullptr ? (size_t)(end - line) : strlen(line));
+      size_t sp = row.find(' ');
+      if (sp != std::string::npos) {
+        const std::string key = row.substr(0, sp), val = row.substr(sp + 1);
+        if (key == "name") name = val;
+        else if (key == "sha256") sha = val;
+        else if (key == "result") result = val;
+        else if (key == "size") size = (uint32_t) strtoul(val.c_str(), nullptr, 10);
+        else if (key == "steps") steps = (unsigned) strtoul(val.c_str(), nullptr, 10);
+      }
+      line = end != nullptr ? end + 1 : nullptr;
+    }
+    if (!name.empty() && !sha.empty() && size > 0 && steps >= 2) {
+      this->rs_chain_name_ = name;
+      this->rs_chain_sha_ = sha;
+      this->rs_chain_result_ = result;
+      this->rs_chain_size_ = size;
+      this->rs_chain_steps_ = (uint8_t) steps;
+      this->rs_chain_from_ = from;
+      this->rs_chain_to_ = to;
+      ESP_LOGI(OTAG, "delta chain: %u steps %s -> %s merged into %s (%u B)", steps, from.c_str(),
+               to.c_str(), name.c_str(), (unsigned) size);
+      // Cross-check the applied-image hash against the official artifact before accepting.
+      const std::string anchor = this->ota_chain_anchor_(component, to);
+      if (anchor.empty()) {
+        ESP_LOGW(OTAG, "delta chain: could not read the anchor from GitHub — accepting the merged "
+                       "bundle on this host's word alone");
+      } else if (!ieq(anchor, result)) {
+        ESP_LOGE(OTAG, "delta chain: REFUSED — the merged bundle claims %s but the official %s "
+                       "artifact produces %s",
+                 result.c_str(), to.c_str(), anchor.c_str());
+        esp_http_client_close(c);
+        esp_http_client_cleanup(c);
+        return false;
+      } else {
+        ESP_LOGI(OTAG, "delta chain: anchor verified against GitHub over TLS (%s)", anchor.c_str());
+      }
+      this->rs_chain_ok_ = true;
+      ok = true;
+    } else {
+      ESP_LOGW(OTAG, "delta chain: the relay answered but the description was incomplete");
+    }
+  } else if (status == 204) {
+    ESP_LOGW(OTAG, "delta chain: the relay cannot merge %s -> %s", from.c_str(), to.c_str());
+  } else {
+    ESP_LOGW(OTAG, "delta chain: relay answered HTTP %d", status);
+  }
+  esp_http_client_close(c);
+  esp_http_client_cleanup(c);
+  return ok;
 }
 
 void LibrescootBleClient::ota_kick_next_job_() {

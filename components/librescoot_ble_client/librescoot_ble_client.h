@@ -23,6 +23,7 @@
 #include "esp_http_client.h"  // esp_http_client_config_t, for the shared TLS-config helper
 #include <map>
 
+#include <cctype>
 #include <functional>
 #include <string>
 #include <vector>
@@ -32,6 +33,26 @@ namespace librescoot_ble_client {
 
 namespace espbt = esphome::esp32_ble_tracker;
 
+// Case-insensitive compare, used throughout for version and state strings.
+inline bool ieq(const std::string &a, const std::string &b) {
+  if (a.size() != b.size())
+    return false;
+  for (size_t i = 0; i < a.size(); i++)
+    if (tolower((unsigned char) a[i]) != tolower((unsigned char) b[i]))
+      return false;
+  return true;
+}
+
+// The scooter reports versions with a lowercase 't' ("nightly-20260820t114220") while GitHub tags
+// use an uppercase one, and GitHub's tag lookup is case sensitive.
+inline std::string version_to_tag(const std::string &v) {
+  std::string t = v;
+  for (size_t i = 1; i + 1 < t.size(); i++)
+    if (t[i] == 't' && isdigit((unsigned char) t[i - 1]) && isdigit((unsigned char) t[i + 1]))
+      t[i] = 'T';
+  return t;
+}
+
 enum class BtnAction : uint8_t {
   SEATBOX_OPEN, HIBERNATE, WAKEUP, REBOOT, REBOOT_HARD, REMOVE_BOND,
   OTA_STATUS_REQ, OTA_ABORT, SYSTIME_SYNC, RESTART_ESP,
@@ -39,7 +60,7 @@ enum class BtnAction : uint8_t {
   PAIR, PASSKEY_SEND,
 };
 enum class SelKind : uint8_t { BLINKER, USB_MODE, LINK_MODE, OTA_CHANNEL, OTA_METHOD, OTA_SOURCE };
-enum class SwKind : uint8_t { ALARM_ENABLED, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE };
+enum class SwKind : uint8_t { ALARM_ENABLED, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE, DELTA_CHAINING };
 enum class TxtKind : uint8_t {
   COMMAND, NAV_DEST, CELLULAR_APN, PM_CRON, PM_DURATION, SYSTIME_ISO, OTA_SOURCE_URL, OTA_VERSION,
   BLE_PASSKEY
@@ -269,6 +290,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void set_scooter_filter(const std::string &f) { scooter_filter_ = f; }
   void set_scooter_mac_sensor(text_sensor::TextSensor *t) { scooter_mac_sensor_ = t; }
   void set_ha_integration(binary_sensor::BinarySensor *b) { ha_integration_ = b; }
+  void set_delta_chain_switch(switch_::Switch *s) { chain_sw_ = s; }
   void set_ota_eta(text_sensor::TextSensor *t) { ota_eta_ = t; }
 
   void set_blinker(LibrescootSelect *s) { blinker_ = s; }
@@ -408,7 +430,12 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // the archive itself (no cost here, works on any board), a direct GitHub source is read on-chip.
   std::string ota_delta_base_(const std::string &url);
   std::string ota_delta_base_relay_(const std::string &url);
-  std::string ota_delta_base_onchip_(const std::string &url);
+  // Reads the archive head itself. `result`, when given, also receives the applied-image hash
+  // (new_meta.decompressed_sha256) — the value a merged chain has to be checked against.
+  std::string ota_delta_base_onchip_(const std::string &url, std::string *result = nullptr);
+  // Fetches the official artifact from GitHub over TLS and returns its applied-image hash.
+  // Empty means "could not read it", never "mismatch".
+  std::string ota_chain_anchor_(uint8_t component, const std::string &tag);
   static void ota_resolve_task_(void *arg);
   void ota_kick_next_job_();               // start the next queued transfer when idle
   void ota_begin_await_version_();         // after install: wait for the reboot + new version
@@ -527,6 +554,25 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // its plain-HTTP OTA relay (the http:// OTA Source URL it configures). Drives the OTA-source
   // capability: without the relay, this board must download from GitHub itself.
   binary_sensor::BinarySensor *ha_integration_{nullptr};
+
+  // Delta chaining: merge a run of consecutive deltas into one artifact so a scooter several
+  // releases behind needs one install and one reboot instead of N. The merge runs on the Home
+  // Assistant relay (it needs xdelta3 and ~100 MB), so the switch is only meaningful with the
+  // delta method and a reachable relay; outside that it reports no state at all.
+  switch_::Switch *chain_sw_{nullptr};
+  bool ota_delta_chain_{false};
+  bool chain_sw_available_{false};
+  bool chain_possible_() const;
+  void update_chain_switch_();
+
+  // Facts about a merged bundle, filled by the resolve worker. The SHA-256 is a transport check
+  // only — a merged bundle is not an official artifact. rs_chain_result_ is the applied-image
+  // hash, taken verbatim from the official last delta, and is what authenticity rests on.
+  bool rs_chain_ok_{false};
+  std::string rs_chain_name_, rs_chain_sha_, rs_chain_result_, rs_chain_from_, rs_chain_to_;
+  uint32_t rs_chain_size_{0};
+  uint8_t rs_chain_steps_{0};
+  bool ota_chain_resolve_(uint8_t component, const std::string &from, const std::string &to);
   bool hi_last_{false};
   uint32_t hi_next_check_ms_{0};
   uint32_t ota_hint_last_ms_{0};        // throttle the "no OTA source" log hint
