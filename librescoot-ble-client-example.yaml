@@ -82,8 +82,8 @@ api:
             id: librescoot_ble_client_hub
 
 ota:
-  platform: esphome
-  password: !secret librescoot_ota_pw
+  - platform: esphome
+    encryption:
 
 wifi:
   use_address: 192.168.178.171

@@ -56,9 +56,9 @@ api:
 #  discovery: false
 #  reboot_timeout: 0s         # 0s = disable restart on mqtt connection loss
 
-ota:
-  platform: esphome
-  password: !secret librescoot_ota_pw
+oota:
+  - platform: esphome
+    encryption:
 
 wifi:
   ssid: !secret librescoot_wifi_ssid

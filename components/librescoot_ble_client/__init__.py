@@ -420,6 +420,12 @@ async def to_code(config):
     cg.add(var.set_ota_source_default(_ota_src_default))
     if CONF_FIRMWARE_SOURCE in config:  # after set_github_repo (which sets the default source)
         cg.add(var.set_firmware_source(config[CONF_FIRMWARE_SOURCE]))
+    # ESPHome 2026.9+ drops unused built-in ESP-IDF components from the build; the OTA
+    # producer / resolver use esp_http_client (and esp-tls beneath it) directly.
+    # Older releases build every IDF component and have no such hook.
+    if hasattr(esp32, "include_builtin_idf_component"):
+        esp32.include_builtin_idf_component("esp_http_client")
+        esp32.include_builtin_idf_component("esp-tls")
     cg.add(var.set_use_cert_bundle(config[CONF_USE_CERT_BUNDLE]))
     if config[CONF_USE_CERT_BUNDLE]:
         # Enabling the bundle option from YAML pulls in the Mozilla roots (no pinned cert needed).

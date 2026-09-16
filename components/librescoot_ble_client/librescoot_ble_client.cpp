@@ -659,7 +659,7 @@ void LibrescootBleClient::loop() {
       !this->pairing_armed_()) {
     this->auto_hold_until_ms_ = 0;
     ESP_LOGI(TAG, "auto: held %u s, releasing the link so another client can connect",
-             this->auto_hold_ms_ / 1000);
+             (unsigned) (this->auto_hold_ms_ / 1000));
     this->disconnect();
   }
 
@@ -817,7 +817,7 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
           !this->pairing_armed_() && this->get_address() != 0) {
         this->set_enabled(false);
         this->yield_until_ms_ = millis() + LINK_YIELD_MS;
-        ESP_LOGI(TAG, "auto: releasing link for %u s so another app can connect", LINK_YIELD_MS / 1000);
+        ESP_LOGI(TAG, "auto: releasing link for %u s so another app can connect", (unsigned) (LINK_YIELD_MS / 1000));
       }
       break;
     }
@@ -919,7 +919,7 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
           this->pair_backoff_until_ms_ = millis() + PAIR_RETRY_BACKOFF_MS;
           ESP_LOGW(TAG, "Pairing failed: %s (reason %d) — still armed, retrying in %u s",
                    auth_fail_reason(param->ble_security.auth_cmpl.fail_reason),
-                   param->ble_security.auth_cmpl.fail_reason, PAIR_RETRY_BACKOFF_MS / 1000);
+                   param->ble_security.auth_cmpl.fail_reason, (unsigned) (PAIR_RETRY_BACKOFF_MS / 1000));
           this->set_timeout("pair_backoff", PAIR_RETRY_BACKOFF_MS, [this]() { this->apply_link_state_(); });
           this->apply_link_state_();
         } else {
@@ -931,7 +931,7 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
             this->pair_backoff_until_ms_ = millis() + REAUTH_RETRY_BACKOFF_MS;
             ESP_LOGW(TAG, "Re-encryption failed: %s (reason %d) — bond still held, retrying in %u s "
                           "(%u/%u)",
-                     auth_fail_reason(r), r, REAUTH_RETRY_BACKOFF_MS / 1000,
+                     auth_fail_reason(r), r, (unsigned) (REAUTH_RETRY_BACKOFF_MS / 1000),
                      this->reauth_fail_count_, REAUTH_FAIL_MAX);
             this->set_timeout("pair_backoff", REAUTH_RETRY_BACKOFF_MS,
                               [this]() { this->apply_link_state_(); });
@@ -3036,7 +3036,7 @@ void LibrescootBleClient::on_button(BtnAction a) {
       // generous window, and reconnect so the scooter can bond. Disarmed once bonding succeeds or
       // the window expires.
       ESP_LOGI(TAG, "Pairing armed for %u s — clearing any stale bond and connecting to bond with "
-                    "the scooter", PAIR_ARM_WINDOW_MS / 1000);
+                    "the scooter", (unsigned) (PAIR_ARM_WINDOW_MS / 1000));
       this->apply_security_params_();
       esp_ble_remove_bond_device(this->get_remote_bda());
       this->pair_arm_until_ms_ = millis() + PAIR_ARM_WINDOW_MS;

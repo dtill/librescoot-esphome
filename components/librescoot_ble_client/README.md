@@ -17,8 +17,8 @@ Protocol reference: <https://reference.librescoot.org/latest/bluetooth/>
 
 ### 1. Flash it
 
-Put your Wi-Fi, an API key, an OTA password and the scooter's Bluetooth MAC into `secrets.yaml`,
-then flash once over USB — from then on the ESP updates itself over Wi-Fi:
+Put your Wi-Fi, an API key and the scooter's Bluetooth MAC into `secrets.yaml`, then flash once
+over USB — from then on the ESP updates itself over Wi-Fi:
 
 ```bash
 esphome run librescoot-ble-client-example.yaml
@@ -645,8 +645,9 @@ If GitHub ever moves a host to a different CA, add that root to `github_ca.h`.
 
 ## Framework
 
-ESP-IDF on ESP32. The component extends `esp32_ble_client::BLEClientBase`, so it registers
-a BLE connection slot and participates in scanning like any `ble_client`.
+ESP-IDF on ESP32 (ESPHome 2026.9.0 or newer). The component extends
+`esp32_ble_client::BLEClientBase`, so it registers a BLE connection slot and participates in
+scanning like any `ble_client`.
 
 ## Example log output
 
