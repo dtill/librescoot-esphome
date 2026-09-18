@@ -555,13 +555,17 @@ asks the Home Assistant integration to merge the whole run into a single artifac
 installs into one.
 
 It only takes effect with **OTA Update Method** `delta` and a reachable relay — the merge needs
-`xdelta3` and about 100 MB of memory, so it cannot run on the ESP. Outside that combination the
+`xdelta3` and hundreds of MB of memory, so it cannot run on the ESP. Outside that combination the
 switch refuses to turn on and says why in the log; if the conditions stop holding while it is on,
 it switches itself off. (A switch cannot report *unavailable* over the ESPHome API, which is why it
 refuses rather than greying out.)
 
-Chaining does **not** save bytes: a merged patch is usually larger than the steps it replaces. What
-it saves is installs and reboots.
+The relay builds the bundle in the background; **OTA Status** shows its progress
+(`Relay: building downloading target image 40%`, `… encoding fresh delta`) until the transfer
+starts, up to 30 minutes. Spans of up to 15 releases are merged from the official patches; longer
+spans get a fresh delta encoded from the two full images, which is smaller than the composed one.
+When the relay cannot bridge a span it says why, and **OTA Status** shows that reason
+(`Error: chain: …`).
 
 Two things are worth understanding before turning it on:
 

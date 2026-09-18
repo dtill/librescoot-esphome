@@ -569,6 +569,11 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // only — a merged bundle is not an official artifact. rs_chain_result_ is the applied-image
   // hash, taken verbatim from the official last delta, and is what authenticity rests on.
   bool rs_chain_ok_{false};
+  std::string rs_chain_err_;  // why the relay would not merge the run, for the user-facing status
+  // Build progress the relay reports while it merges/encodes (written by the resolve task, shown
+  // by loop() in OTA Status when dirty). A fixed buffer: no allocation off the main task.
+  char rs_progress_[96]{};
+  volatile bool rs_progress_dirty_{false};
   std::string rs_chain_name_, rs_chain_sha_, rs_chain_result_, rs_chain_from_, rs_chain_to_;
   uint32_t rs_chain_size_{0};
   uint8_t rs_chain_steps_{0};

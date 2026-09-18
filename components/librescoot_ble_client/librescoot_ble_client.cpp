@@ -465,6 +465,11 @@ void LibrescootBleClient::loop() {
 
   // Install: when the resolve worker finishes, queue ONLY the requested component's transfer
   // (the scooter reboots after each install, so MDB and DBC are separate install actions).
+  if (this->rs_progress_dirty_) {
+    this->rs_progress_dirty_ = false;
+    if (this->ota_status_ != nullptr)
+      this->ota_status_->publish_state(std::string("Relay: ") + this->rs_progress_);
+  }
   if (this->ota_resolve_done_) {
     this->ota_resolve_done_ = false;
     this->ota_resolve_running_ = false;
@@ -518,8 +523,14 @@ void LibrescootBleClient::loop() {
         ESP_LOGW("ota", "install: %s delta %s patches %s, but the scooter runs %s — refusing",
                  mdb ? "MDB" : "DBC", this->rs_tag_.c_str(), this->rs_delta_base_.c_str(),
                  installed.empty() ? "(unknown)" : installed.c_str());
-        if (this->ota_status_ != nullptr)
-          this->ota_status_->publish_state("Error: delta needs " + this->rs_delta_base_);
+        // With chaining on, the relay's reason is the useful message — "delta needs X" only
+        // restates the gap the user already tried to bridge.
+        if (this->ota_status_ != nullptr) {
+          if (this->ota_delta_chain_ && !this->rs_chain_err_.empty())
+            this->ota_status_->publish_state(("Error: chain: " + this->rs_chain_err_).substr(0, 255));
+          else
+            this->ota_status_->publish_state("Error: delta needs " + this->rs_delta_base_);
+        }
         // The gap is exactly what chaining exists for, so say so rather than leaving the user with
         // a bare refusal.
         if (!this->ota_delta_chain_ && this->chain_possible_())
@@ -533,7 +544,8 @@ void LibrescootBleClient::loop() {
                           "(method '%s', relay %s).",
                    this->ota_method_str_.c_str(), this->integration_reachable_ ? "up" : "down");
         else
-          ESP_LOGW("ota", "install: delta chaining is on but the relay could not merge this run.");
+          ESP_LOGW("ota", "install: delta chaining is on but the relay could not merge this run: %s",
+                   this->rs_chain_err_.empty() ? "(no reason given)" : this->rs_chain_err_.c_str());
         // Same reasoning as a terminal install failure: unattended mode must not retry a delta that
         // cannot apply, or it would re-resolve it against GitHub every tick.
         if (this->ota_auto_update_) {

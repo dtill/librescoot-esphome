@@ -1091,6 +1091,8 @@ void LibrescootBleClient::ota_resolve_() {
   // carry no base requirement, so they are not probed.
   this->rs_delta_base_.clear();
   this->rs_chain_ok_ = false;
+  this->rs_chain_err_.clear();
+  this->rs_progress_[0] = 0;
   if (this->ota_method_str_ != "full") {
     bool mdb = this->ota_install_component_ == 0;
     if (mdb ? this->rs_mdb_ok_ : this->rs_dbc_ok_) {
@@ -1143,20 +1145,49 @@ bool LibrescootBleClient::ota_chain_resolve_(uint8_t component, const std::strin
   q.replace(p, 5, "/chain/");
   q += std::string("/") + (component == 0 ? "mdb" : "dbc") + "/" + from + "/" + to;
 
-  esp_http_client_config_t cfg = {};
-  cfg.url = q.c_str();
-  cfg.timeout_ms = 180000;  // the relay downloads every step and merges them before it answers
-  cfg.buffer_size = 1024;
-  cfg.buffer_size_tx = 1024;
-  esp_http_client_handle_t c = esp_http_client_init(&cfg);
-  if (c == nullptr) {
-    ESP_LOGW(OTAG, "delta chain: could not create the HTTP client");
-    return false;
+  // The relay builds in the background — downloading the steps, or two full images for a
+  // fresh delta — and answers 503 with its current phase until the bundle exists. Poll, and
+  // relay the phase to the user; a build that outlives the cap is treated as a refusal.
+  static const uint32_t CHAIN_POLL_MS = 5000, CHAIN_BUILD_MAX_MS = 30UL * 60UL * 1000UL;
+  const uint32_t started = millis();
+  esp_http_client_handle_t c = nullptr;
+  int status = 0;
+  for (;;) {
+    esp_http_client_config_t cfg = {};
+    cfg.url = q.c_str();
+    cfg.timeout_ms = 60000;
+    cfg.buffer_size = 1024;
+    cfg.buffer_size_tx = 1024;
+    c = esp_http_client_init(&cfg);
+    if (c == nullptr) {
+      ESP_LOGW(OTAG, "delta chain: could not create the HTTP client");
+      return false;
+    }
+    esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
+    status = http_open_following_(c);
+    if (status != 503)
+      break;
+    char phase[80];
+    int n = esp_http_client_read(c, phase, sizeof(phase) - 1);
+    phase[n > 0 ? n : 0] = 0;
+    esp_http_client_close(c);
+    esp_http_client_cleanup(c);
+    c = nullptr;
+    if (strncmp(phase, this->rs_progress_, sizeof(this->rs_progress_)) != 0) {
+      ESP_LOGI(OTAG, "delta chain: relay %s", phase);
+      snprintf(this->rs_progress_, sizeof(this->rs_progress_), "%s", phase);
+      this->rs_progress_dirty_ = true;
+    }
+    if (this->ota_cancel_ || millis() - started > CHAIN_BUILD_MAX_MS) {
+      this->rs_chain_err_ = this->ota_cancel_ ? "cancelled while the relay was building"
+                                              : "relay build did not finish in 30 min";
+      ESP_LOGW(OTAG, "delta chain: %s", this->rs_chain_err_.c_str());
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(CHAIN_POLL_MS));
   }
-  esp_http_client_set_header(c, "User-Agent", "esphome-lsc-bluetooth-nrf");
 
   bool ok = false;
-  int status = http_open_following_(c);
   if (status == 200) {
     char buf[512];
     int total = 0, r;
@@ -1211,9 +1242,22 @@ bool LibrescootBleClient::ota_chain_resolve_(uint8_t component, const std::strin
     } else {
       ESP_LOGW(OTAG, "delta chain: the relay answered but the description was incomplete");
     }
+  } else if (status == 422) {
+    // The relay explains a refusal in one line (memory budget, a broken run, a missing asset).
+    char buf[200];
+    int total = 0, r;
+    while (total < (int) sizeof(buf) - 1 &&
+           (r = esp_http_client_read(c, buf + total, sizeof(buf) - 1 - total)) > 0)
+      total += r;
+    buf[total > 0 ? total : 0] = 0;
+    this->rs_chain_err_ = total > 0 ? buf : "relay refused the merge";
+    ESP_LOGW(OTAG, "delta chain: the relay will not merge %s -> %s: %s", from.c_str(), to.c_str(),
+             this->rs_chain_err_.c_str());
   } else if (status == 204) {
+    this->rs_chain_err_ = "relay cannot merge on this host";
     ESP_LOGW(OTAG, "delta chain: the relay cannot merge %s -> %s", from.c_str(), to.c_str());
   } else {
+    this->rs_chain_err_ = "relay answered HTTP " + std::to_string(status);
     ESP_LOGW(OTAG, "delta chain: relay answered HTTP %d", status);
   }
   esp_http_client_close(c);
