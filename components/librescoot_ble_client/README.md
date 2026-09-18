@@ -140,7 +140,7 @@ librescoot_ble_client:
 | `presence_timeout` | time, `60s` | **BLE Presence** stays Home if an advert was seen within this window. |
 | `link_interval` | time, `5min` | For the **`interval`** BLE Link Mode: how often to connect, refresh every sensor once, then release the link again. |
 | `link_auto_hold` | time, `3min` | For the **`auto`** BLE Link Mode: hold the connection this long, then release it for ~20 s so a phone / other central gets a turn on the single slot. `0s` = pure failover (never yield proactively). |
-| `dbc_auto_power` | bool, `false` | After a DBC (dashboard) update has been installed, switch the dashboard on so the update applies and its new version can be read — no ride needed — then off again if it was off before. Needs scooter firmware with nRF `v2.11.0-ls` or newer. |
+| `dbc_auto_power` | bool, `false` | After a DBC (dashboard) update has been installed, switch the dashboard on so the update applies and its new version can be read — no ride needed (the scooter powers it off again by itself in stand-by). Needs scooter firmware with nRF `v2.11.0-ls` or newer. |
 | `ota_source_default` | `github` / `relay`, optional | Default OTA byte source. Omitted → **chip-based** (ESP32-S3 → `github`, every other chip → `relay`). The runtime **OTA Source** select overrides it and is persisted in NVS. |
 | `use_cert_bundle` | bool, `false` | Validate GitHub HTTPS against the ESP-IDF **Mozilla bundle** instead of the pinned roots (auto-enables `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`). Use on **PSRAM boards** for autonomous direct-GitHub downloads. |
 | `ca_certificate` | string, optional | Explicit PEM root/chain for GitHub HTTPS (alternative to the bundle). |
@@ -173,8 +173,34 @@ api:
   batch_delay: 0ms      # send each state message on its own
 ```
 
-Symptom if the margin is too thin: the device stops accepting new API connections, and Home
-Assistant reports the connection as dropped immediately after the handshake.
+That alone is not enough for a long transfer with all entities enabled: a client connecting to
+the API while the transfer runs (Home Assistant reconnecting, for instance) sends every entity's
+current state at once, and on a board this tight that burst can still fail. Give the board room
+by turning off what it does not need — most of the default Wi-Fi and Bluetooth buffers are sized
+for bandwidth the BLE link can never use — and leave the `web_server` out:
+
+```yaml
+esp32:
+  framework:
+    sdkconfig_options:
+      CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "4"
+      CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM: "8"
+      CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM: "8"
+      CONFIG_ESP_WIFI_AMPDU_RX_ENABLED: n
+      CONFIG_ESP_WIFI_AMPDU_TX_ENABLED: n
+      CONFIG_LWIP_MAX_SOCKETS: "8"
+      CONFIG_LWIP_TCP_SND_BUF_DEFAULT: "2880"
+      CONFIG_LWIP_TCP_WND_DEFAULT: "2880"
+esp32_ble:
+  max_connections: 1    # the scooter is the only central
+```
+
+Measured on an ESP32 classic during a 4 MB transfer: free heap went from ~18 kB to ~40 kB, and
+the largest free block from 16 kB to 37 kB. Wi-Fi throughput drops, which only affects how fast
+the ESP's own firmware uploads.
+
+Symptom if the margin is too thin: the device restarts mid-transfer, or stops accepting new API
+connections and Home Assistant reports the connection as dropped immediately after the handshake.
 
 Entity keys are **opt-in**: an entity is instantiated only if its key is present with a
 `name`. Each key accepts the usual entity options (`name`, `id`, `icon`, `entity_category`,
@@ -372,7 +398,7 @@ with `auto` or `interval` you still get them on the next connect.
 | `navigation_set` | Navigation Set to | text (`lat,lon[,name]`) |
 | `navigation_clear` | Navigation Clear | button |
 | `cancel_hibernate` | Cancel Hibernate | button |
-| `dbc_power` | DBC Power | switch — dashboard power on/off, showing the real state. Does not unlock or change the vehicle state. Switching on takes ~15 s (the dashboard boots); off ~5 s. Needs nRF `v2.11.0-ls` or newer, otherwise it refuses |
+| `dbc_power` | DBC Power | switch — dashboard power on/off, showing the real state. Does not unlock or change the vehicle state. Switching on takes ~15 s (the dashboard boots); off ~5 s. In stand-by the scooter switches the dashboard off again by itself after a short while. Needs nRF `v2.11.0-ls` or newer, otherwise it refuses |
 | `dbc_ready` | DBC Ready | binary sensor — the dashboard has booted and reports ready (off while it is powered off) |
 
 ### Configuration
@@ -545,7 +571,7 @@ OTA_STATUS characteristic cannot say *which* board is pending. `pending-reboot` 
 is a legitimate phase for **both** boards — both must reboot to switch Mender partitions. The
 MDB auto-reboots after 3 min stand-by; a DBC install applies on the **next dashboard power
 cycle** — with `dbc_auto_power: true` the component switches the dashboard on itself after a DBC
-install so this happens right away, and off again if it was off before. But the OTA_STATUS characteristic is a **latch of the last BLE-OTA session's terminal
+install so this happens right away (about 30 s from power-on to the new version). But the OTA_STATUS characteristic is a **latch of the last BLE-OTA session's terminal
 progress** — it is *not* re-synced to the scooter's live update state. So even after the
 dashboard has rebooted and both versions match again, `STATUS_REQ` can keep returning
 "pending reboot" (observed live: both boards on the new version, update-service back to idle,

@@ -1604,7 +1604,9 @@ void LibrescootBleClient::mark_unknown_() {
     if (t != nullptr)
       t->publish_state("unknown");
   this->alarm_svc_present_ = false;
-  this->dbc_present_ = false;
+  // dbc_present_ deliberately survives a disconnect: the firmware's command set does not change
+  // between connections, and a reconnect during a transfer skips the on-connect queries that
+  // would otherwise re-learn it.
   this->dbc_power_known_ = false;
 
   this->present1_ = false;
@@ -3362,8 +3364,10 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
       // Reflected from dbc:status. The -wait forms are used so the readback after the reply is
       // the real state (on-wait answers once the dashboard is up, ~14 s from cold).
       if (!this->dbc_present_) {
-        ESP_LOGW(TAG, "DBC Power needs nRF >= v2.11.0-ls (dbc:status unanswered on this firmware) — "
-                      "not sending");
+        // Not seen yet on this boot: ask now, so a capable scooter answers and the next press works.
+        ESP_LOGW(TAG, "DBC Power: dbc:status not answered yet (needs nRF >= v2.11.0-ls) — asking, "
+                      "not switching");
+        this->pending_queries_.push_back("dbc:status");
         if (this->dbc_power_ != nullptr)
           this->dbc_power_->publish_state(this->dbc_power_on_);
         break;

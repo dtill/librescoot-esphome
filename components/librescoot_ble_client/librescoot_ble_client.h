@@ -543,7 +543,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void handle_alarm_status_(const std::string &s);
   void handle_alarm_trigger_(const std::string &s);
 
-  // DBC power. dbc_present_ is set by the first dbc:status reply of a connection — the gate for the
+  // DBC power. dbc_present_ is set by the first dbc:status reply since boot — the gate for the
   // switch (older firmware answers with an error, and the switch has no honest state to show).
   LibrescootSwitch *dbc_power_{nullptr};
   binary_sensor::BinarySensor *dbc_ready_{nullptr};
