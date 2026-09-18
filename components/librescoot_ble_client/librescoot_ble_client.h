@@ -15,6 +15,7 @@
 #include "esphome/components/button/button.h"
 #include "esphome/components/text/text.h"
 #include "esphome/components/lock/lock.h"
+#include "esphome/components/event/event.h"
 #include "esphome/components/update/update_entity.h"
 #include "esphome/components/time/real_time_clock.h"
 #ifdef USE_API
@@ -60,7 +61,7 @@ enum class BtnAction : uint8_t {
   PAIR, PASSKEY_SEND,
 };
 enum class SelKind : uint8_t { BLINKER, USB_MODE, LINK_MODE, OTA_CHANNEL, OTA_METHOD, OTA_SOURCE };
-enum class SwKind : uint8_t { ALARM_ENABLED, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE, DELTA_CHAINING };
+enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE, DELTA_CHAINING };
 enum class TxtKind : uint8_t {
   COMMAND, NAV_DEST, CELLULAR_APN, PM_CRON, PM_DURATION, SYSTIME_ISO, OTA_SOURCE_URL, OTA_VERSION,
   BLE_PASSKEY
@@ -72,7 +73,7 @@ enum class CharId : uint8_t {
   AUX_VOLTAGE, AUX_LEVEL, CBB_LEVEL, CBB_REMAINING, CBB_FULL, CBB_CELL,
   ODOMETER, NAV_ACTIVE, UMS_STATUS, POWER_MUX, STATUS, SEATBOX, HANDLEBAR,
   POWER_STATE, BAT1_STATE, BAT2_STATE, SW_MDB, SW_NRF, AUX_CHARGE, CBB_CHARGE,
-  CMD_RESPONSE, OTA_STATUS,
+  ALARM_STATUS, ALARM_TRIGGER, CMD_RESPONSE, OTA_STATUS,
   // write targets (interval 0, no notify):
   CTRL_CMD, POWER_CMD, EXT_CMD, OTA_CONTROL, OTA_DATA,
 };
@@ -260,6 +261,13 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void set_bat2_present(binary_sensor::BinarySensor *b) { bat2_present_ = b; }
   void set_nav_active(binary_sensor::BinarySensor *b) { nav_active_ = b; }
   void set_aux_charger(binary_sensor::BinarySensor *b) { aux_charger_ = b; }
+  // Alarm service 9a590220 (nRF >= v2.11.0-ls). Absent on older firmware: entities stay unknown.
+  void set_alarm_status(text_sensor::TextSensor *t) { alarm_status_ = t; }
+  void set_alarm_triggered(binary_sensor::BinarySensor *b) { alarm_triggered_ = b; }
+  void set_alarm_last_trigger(text_sensor::TextSensor *t) { alarm_last_trigger_ = t; }
+  void set_alarm_last_trigger_time(text_sensor::TextSensor *t) { alarm_last_trigger_time_ = t; }
+  void set_alarm_trigger_event(event::Event *e) { alarm_trigger_event_ = e; }
+  void set_alarm_armed(LibrescootSwitch *s) { alarm_armed_ = s; }
   void set_ums_status(binary_sensor::BinarySensor *b) { ums_status_ = b; }
   void set_maps_available(binary_sensor::BinarySensor *b) { maps_available_ = b; }
   void set_nav_available(binary_sensor::BinarySensor *b) { nav_available_ = b; }
@@ -514,6 +522,22 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
 
   binary_sensor::BinarySensor *bat1_present_{nullptr}, *bat2_present_{nullptr};
   binary_sensor::BinarySensor *nav_active_{nullptr}, *ums_status_{nullptr}, *aux_charger_{nullptr};
+  // Alarm service (9a590220). alarm_svc_present_ is set at service discovery and decides whether
+  // Alarm Enabled reflects the status characteristic (no command round trip) or the legacy
+  // get:alarm.enabled query.
+  text_sensor::TextSensor *alarm_status_{nullptr}, *alarm_last_trigger_{nullptr}, *alarm_last_trigger_time_{nullptr};
+  binary_sensor::BinarySensor *alarm_triggered_{nullptr};
+  event::Event *alarm_trigger_event_{nullptr};
+  LibrescootSwitch *alarm_armed_{nullptr};
+  bool alarm_svc_present_{false};
+  uint32_t alarm_suppress_until_{0};  // after arm/disarm: let the optimistic state stand briefly
+  // The last trigger delivered as an event ("<source>,<timestamp>"), persisted so an ESP reboot
+  // does not re-fire it, while a trigger that happened during a link gap is still delivered once.
+  struct AlarmTrigPref { char v[64]; };  // the characteristic is a 48-byte buffer
+  ESPPreferenceObject alarm_trigger_pref_;
+  std::string alarm_last_trigger_seen_;
+  void handle_alarm_status_(const std::string &s);
+  void handle_alarm_trigger_(const std::string &s);
   binary_sensor::BinarySensor *maps_available_{nullptr}, *nav_available_{nullptr};
   binary_sensor::BinarySensor *ble_connection_{nullptr}, *ble_presence_{nullptr};
   uint32_t presence_timeout_ms_{60000};  // "Home" if an advert was seen within this window

@@ -76,6 +76,7 @@ static const char *const SVC_CBB = "9a590060-6e67-5d0d-aab9-ad9126b66f91";
 static const char *const SVC_POWERMUX = "9a590100-6e67-5d0d-aab9-ad9126b66f91";
 static const char *const SVC_SCOOTERINFO = "9a59a040-6e67-5d0d-aab9-ad9126b66f91";
 static const char *const SVC_SYSINFO = "9a59a000-6e67-5d0d-aab9-ad9126b66f91";
+static const char *const SVC_ALARM = "9a590220-6e67-5d0d-aab9-ad9126b66f91";  // nRF >= v2.11.0-ls
 static const char *const SVC_EXT = "9a590400-6e67-5d0d-aab9-ad9126b66f91";
 static const char *const CH_EXT = "9a590401-6e67-5d0d-aab9-ad9126b66f91";
 static const char *const CH_EXT_RESP = "9a590402-6e67-5d0d-aab9-ad9126b66f91";
@@ -220,9 +221,17 @@ void LibrescootBleClient::build_char_table_() {
   if (power_state_)
     add(CharId::POWER_STATE, SVC_POWERSTATE, "9a5900a1-6e67-5d0d-aab9-ad9126b66f91", false, 5000);
 
+  // Alarm service: both characteristics notify on every change, so the interval is only a safety
+  // re-read. Alarm Enabled is listed because it prefers the status characteristic over the
+  // get:alarm.enabled round trip when the service exists.
+  if (alarm_status_ || alarm_triggered_ || alarm_armed_ || alarm_enabled_)
+    add(CharId::ALARM_STATUS, SVC_ALARM, "9a590221-6e67-5d0d-aab9-ad9126b66f91", true, 1800000);
+  if (alarm_trigger_event_ || alarm_last_trigger_ || alarm_last_trigger_time_)
+    add(CharId::ALARM_TRIGGER, SVC_ALARM, "9a590222-6e67-5d0d-aab9-ad9126b66f91", true, 1800000);
+
   bool uses_ext = command_text_ || cmd_response_ || cmd_last_response_ || keycard_count_ || sw_dbc_ ||
                   maps_available_ || nav_available_ || apn_text_ || pm_sched_hib_ || pm_cron_text_ ||
-                  pm_duration_text_ || usb_mode_ || ota_channel_ || alarm_enabled_;
+                  pm_duration_text_ || usb_mode_ || ota_channel_ || alarm_enabled_ || alarm_armed_;
   if (uses_ext) {
     add(CharId::CMD_RESPONSE, SVC_EXT, CH_EXT_RESP, true, 0);
     add(CharId::EXT_CMD, SVC_EXT, CH_EXT, false, 0);
@@ -325,6 +334,14 @@ void LibrescootBleClient::setup() {
   uint16_t chunk = 0;
   if (this->ota_chunk_pref_.load(&chunk) && chunk >= OTA_CHUNK_MIN && chunk <= OTA_CHUNK_MAX)
     this->ota_chunk_limit_ = chunk;
+  this->alarm_trigger_pref_ = global_preferences->make_preference<AlarmTrigPref>(fnv1_hash("librescoot_ble_client_alarm_trigger"));
+  {
+    AlarmTrigPref atp{};
+    if (this->alarm_trigger_pref_.load(&atp)) {
+      atp.v[sizeof(atp.v) - 1] = 0;
+      this->alarm_last_trigger_seen_ = atp.v;
+    }
+  }
   this->ota_source_pref_ = global_preferences->make_preference<uint8_t>(fnv1_hash("librescoot_ble_client_ota_source"));
   uint8_t osv;
   std::string osmode = this->ota_source_default_;
@@ -787,6 +804,11 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
       }
       auto *ota = this->find_char_(CharId::OTA_CONTROL);
       this->ota_present_ = ota != nullptr && ota->handle != 0;
+      auto *alarm = this->find_char_(CharId::ALARM_STATUS);
+      this->alarm_svc_present_ = alarm != nullptr && alarm->handle != 0;
+      if (alarm != nullptr && !this->alarm_svc_present_)
+        ESP_LOGW(TAG, "alarm state needs nRF >= v2.11.0-ls (service 9a590220 absent) — Alarm Status / "
+                      "Triggered / Armed stay unknown; Alarm Enabled falls back to get:alarm.enabled");
       ESP_LOGI(TAG, "Service discovery complete. OTA service %s", this->ota_present_ ? "present" : "absent");
       this->on_connected_();
       break;
@@ -1141,7 +1163,7 @@ void LibrescootBleClient::on_connected_() {
     this->pending_queries_.push_back("status:maps-available");
   if (this->nav_available_ != nullptr)
     this->pending_queries_.push_back("status:navigation-available");
-  if (this->alarm_enabled_ != nullptr)
+  if (this->alarm_enabled_ != nullptr && !this->alarm_svc_present_)
     this->pending_queries_.push_back("get:alarm.enabled");
   // The LTC4020 charger's own GATT service (9a590120) is not in this firmware's database, but the
   // same state is readable over the extended-command channel.
@@ -1321,6 +1343,21 @@ void LibrescootBleClient::handle_char_value_(CharId id, uint8_t *v, uint16_t len
         this->scooter_lock_->publish_state(unlocked ? lock::LOCK_STATE_UNLOCKED
                                                      : lock::LOCK_STATE_LOCKED);
       }
+      break;
+    }
+    case CharId::ALARM_STATUS:
+    case CharId::ALARM_TRIGGER: {
+      // Raw dump kept at debug level: the formats are known only from the phone app's parser.
+      char hex[3 * 24 + 1];
+      size_t n = 0;
+      for (uint16_t i = 0; i < len && i < 24; i++)
+        n += snprintf(hex + n, sizeof(hex) - n, "%02X ", v[i]);
+      ESP_LOGD(TAG, "%s raw (%u B): %s", id == CharId::ALARM_STATUS ? "9a590221" : "9a590222", len, hex);
+      std::string s = clean_str_(v, len);
+      if (id == CharId::ALARM_STATUS)
+        this->handle_alarm_status_(s);
+      else
+        this->handle_alarm_trigger_(s);
       break;
     }
     case CharId::CMD_RESPONSE: {
@@ -1535,21 +1572,72 @@ void LibrescootBleClient::mark_unknown_() {
     if (s != nullptr)
       s->publish_state(NAN);
 
-  binary_sensor::BinarySensor *bins[] = {bat1_present_, bat2_present_, nav_active_,
-                                         ums_status_,   maps_available_, nav_available_};
+  binary_sensor::BinarySensor *bins[] = {bat1_present_, bat2_present_, nav_active_,   ums_status_,
+                                         maps_available_, nav_available_, alarm_triggered_};
   for (auto *b : bins)
     if (b != nullptr)
       b->invalidate_state();
 
   text_sensor::TextSensor *texts[] = {status_,     seatbox_,   handlebar_,  power_state_, power_mux_,
                                       bat1_state_, bat2_state_, sw_mdb_,     sw_nrf_,      sw_dbc_,
-                                      aux_charge_, cbb_charge_, keycard_count_};
+                                      aux_charge_, cbb_charge_, keycard_count_, alarm_status_};
   for (auto *t : texts)
     if (t != nullptr)
       t->publish_state("unknown");
+  this->alarm_svc_present_ = false;
 
   this->present1_ = false;
   this->present2_ = false;
+}
+
+// ---------------------------------------------------------------------------
+// alarm service (9a590220)
+// ---------------------------------------------------------------------------
+// 9a590221: one of disabled / disarmed / delay-armed / armed / level-1-triggered /
+// level-2-triggered / seatbox-access (alarm-service's `alarm.status`, forwarded verbatim).
+void LibrescootBleClient::handle_alarm_status_(const std::string &s) {
+  if (this->alarm_status_ != nullptr)
+    this->alarm_status_->publish_state(s);
+  const bool triggered = (s == "level-1-triggered" || s == "level-2-triggered");
+  if (this->alarm_triggered_ != nullptr)
+    this->alarm_triggered_->publish_state(triggered);
+  if (this->alarm_enabled_ != nullptr)
+    this->alarm_enabled_->publish_state(s != "disabled");
+  if (this->alarm_armed_ != nullptr && millis() >= this->alarm_suppress_until_) {
+    // seatbox-access (authorized opening while armed) is a transient of the armed flow: keep.
+    if (s == "armed" || s == "delay-armed" || triggered)
+      this->alarm_armed_->publish_state(true);
+    else if (s == "disarmed" || s == "disabled")
+      this->alarm_armed_->publish_state(false);
+  }
+}
+
+// 9a590222: "<source>,<RFC3339>" or empty. Every distinct value is one trigger; the last one
+// delivered is remembered in NVS so a reboot does not re-fire it, while a trigger that happened
+// during a link gap is still delivered once on the next connect (the nRF keeps the value).
+void LibrescootBleClient::handle_alarm_trigger_(const std::string &s) {
+  const size_t comma = s.find(',');
+  const std::string source = comma == std::string::npos ? s : s.substr(0, comma);
+  const std::string when = comma == std::string::npos ? "" : s.substr(comma + 1);
+  if (this->alarm_last_trigger_ != nullptr)
+    this->alarm_last_trigger_->publish_state(source.empty() ? "none" : source);
+  if (this->alarm_last_trigger_time_ != nullptr)
+    this->alarm_last_trigger_time_->publish_state(when);
+  if (s.empty() || s == this->alarm_last_trigger_seen_)
+    return;
+  static const char *const SOURCES[] = {"motion",     "seatbox",    "handlebar_position", "handlebar_lock",
+                                        "brake_left", "brake_right", "horn_button",       "seatbox_button"};
+  const char *type = "unknown";
+  for (const char *k : SOURCES)
+    if (source == k)
+      type = k;
+  ESP_LOGI(TAG, "alarm trigger: %s at %s", source.c_str(), when.empty() ? "?" : when.c_str());
+  if (this->alarm_trigger_event_ != nullptr)
+    this->alarm_trigger_event_->trigger(type);
+  this->alarm_last_trigger_seen_ = s;
+  AlarmTrigPref atp{};
+  snprintf(atp.v, sizeof(atp.v), "%s", s.c_str());
+  this->alarm_trigger_pref_.save(&atp);
 }
 
 // ---------------------------------------------------------------------------
@@ -3082,9 +3170,8 @@ void LibrescootBleClient::on_button(BtnAction a) {
       // Manual DBC install — always available; target = OTA Version if set, else the MDB version.
       this->perform_update(1, true);
       break;
-    // Arm/disarm are buttons, not a switch: the scooter exposes no way to read the armed state
-    // (no alarm status command, and get:alarm.armed answers "unknown key"), so a switch could only
-    // ever show what was last asked for, not what is.
+    // Arm/disarm buttons predate the alarm service (9a590221, nRF >= v2.11.0-ls), which makes the
+    // armed state readable; the Alarm Armed switch reflects it. Kept for older firmware.
     case BtnAction::ALARM_ARM: this->run_command_("alarm:arm"); break;
     case BtnAction::ALARM_DISARM: this->run_command_("alarm:disarm"); break;
     case BtnAction::ALARM_START: this->run_command_("alarm:start"); break;
@@ -3158,11 +3245,36 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
   switch (k) {
     case SwKind::ALARM_ENABLED:
       this->run_command_(state ? "alarm:enable" : "alarm:disable");
-      // Show the requested state at once so the UI doesn't lag, then ask the scooter what it
-      // actually is — the setting is readable, so this switch reports the truth rather than a wish.
+      // Show the requested state at once so the UI doesn't lag, then let the scooter correct it:
+      // the alarm status characteristic notifies "disabled"/"disarmed" on its own where the alarm
+      // service exists; older firmware is asked with get:alarm.enabled.
       if (this->alarm_enabled_ != nullptr)
         this->alarm_enabled_->publish_state(state);
-      this->pending_queries_.push_back("get:alarm.enabled");
+      if (!this->alarm_svc_present_)
+        this->pending_queries_.push_back("get:alarm.enabled");
+      break;
+    case SwKind::ALARM_ARMED:
+      // Reflected from 9a590221 (armed / delay-armed / triggered → on). Without the alarm service
+      // there is no readback, so the switch refuses rather than showing a wish as a state.
+      if (!this->alarm_svc_present_) {
+        ESP_LOGW(TAG, "Alarm Armed needs nRF >= v2.11.0-ls (service 9a590220 absent) — use the "
+                      "Alarm Arm / Alarm Disarm buttons on this firmware");
+        break;
+      }
+      this->run_command_(state ? "alarm:arm" : "alarm:disarm");
+      this->alarm_suppress_until_ = millis() + 5000;
+      if (this->alarm_armed_ != nullptr)
+        this->alarm_armed_->publish_state(state);
+      // A command the scooter accepts but does not act on (alarm:arm while the alarm is disabled
+      // answers alarm:ok and changes nothing) sends no notification, so nothing would correct the
+      // optimistic state. Re-read the status once the window has passed.
+      this->set_timeout("alarm_reread", 5500, [this]() {
+        auto *e = this->find_char_(CharId::ALARM_STATUS);
+        if (e != nullptr && e->handle != 0) {
+          e->force = true;
+          e->last_ms = millis() - 1200;  // due immediately
+        }
+      });
       break;
     case SwKind::PM_SCHED_HIB:
       this->run_command_(state ? "set:pm.scheduled-hibernate-enabled true"

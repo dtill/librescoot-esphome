@@ -21,6 +21,7 @@ from esphome.components import (
     binary_sensor,
     button,
     esp32,
+    event,
     esp32_ble,
     esp32_ble_client,
     esp32_ble_tracker,
@@ -53,6 +54,7 @@ AUTO_LOAD = [
     "text",
     "lock",
     "update",
+    "event",
 ]
 
 def _final_validate(config):
@@ -158,12 +160,18 @@ BINARY_SENSORS = {
     "reboot_required": ("set_reboot_required", dict(device_class="problem", icon="mdi:restart-alert", entity_category="diagnostic")),
     "ha_integration": ("set_ha_integration", dict(device_class="connectivity", icon="mdi:home-assistant", entity_category="diagnostic")),
     "ble_presence": ("set_ble_presence", dict(device_class="presence", icon="mdi:bluetooth-audio", entity_category="diagnostic")),
+    # Alarm service 9a590220 (nRF >= v2.11.0-ls): on while the alarm sounds (level-1/2-triggered).
+    "alarm_triggered": ("set_alarm_triggered", dict(device_class="tamper", icon="mdi:alarm-light")),
 }
 
 TEXT_SENSORS = {
     "status": ("set_status", dict(icon="mdi:moped")),
     "seatbox": ("set_seatbox", dict(icon="mdi:toolbox")),
     "handlebar_lock": ("set_handlebar", dict(icon="mdi:lock")),
+    # Alarm service 9a590220 (nRF >= v2.11.0-ls)
+    "alarm_status": ("set_alarm_status", dict(icon="mdi:shield-alert", entity_category="diagnostic")),
+    "alarm_last_trigger": ("set_alarm_last_trigger", dict(icon="mdi:motion-sensor", entity_category="diagnostic")),
+    "alarm_last_trigger_time": ("set_alarm_last_trigger_time", dict(icon="mdi:clock-alert", entity_category="diagnostic")),
     "power_state": ("set_power_state", dict(icon="mdi:power-settings")),
     "power_mux": ("set_power_mux", dict(icon="mdi:source-branch", entity_category="diagnostic")),
     "battery_1_state": ("set_bat1_state", dict(icon="mdi:battery-heart-variant", entity_category="diagnostic")),
@@ -218,12 +226,23 @@ def _heap_rich() -> bool:
 # every boot. DISABLED leaves the state to whatever the scooter reports.
 SWITCHES = {
     "alarm_enabled": ("set_alarm_enabled", SwKind.ALARM_ENABLED, None, "mdi:alarm-light", "DISABLED"),
+    # Reflected from the alarm status characteristic (9a590221); refuses without the alarm service.
+    "alarm_armed": ("set_alarm_armed", SwKind.ALARM_ARMED, None, "mdi:shield-lock", "DISABLED"),
     "pm_scheduled_hibernate_enabled": ("set_pm_sched_hib", SwKind.PM_SCHED_HIB, "config", "mdi:calendar-clock", "DISABLED"),
     # Runtime OTA controls (no scooter write, just local flags), so ALWAYS_OFF is right here: both
     # start OFF every boot and auto-update can never restore ON and install unattended.
     "ota_stage_only": ("set_stage_only_switch", SwKind.STAGE_ONLY, "diagnostic", "mdi:package-variant-closed", "ALWAYS_OFF"),
     "ota_auto_update": ("set_auto_update_switch", SwKind.AUTO_UPDATE, "diagnostic", "mdi:auto-download", "ALWAYS_OFF"),
     "ota_delta_chaining": ("set_delta_chain_switch", SwKind.DELTA_CHAINING, "diagnostic", "mdi:link-variant", "ALWAYS_OFF"),
+}
+
+# Alarm trigger provenance (9a590222): one event per trigger, typed by alarm-service's source name.
+ALARM_TRIGGER_SOURCES = [
+    "motion", "seatbox", "handlebar_position", "handlebar_lock",
+    "brake_left", "brake_right", "horn_button", "seatbox_button", "unknown",
+]
+EVENTS = {
+    "alarm_trigger": ("set_alarm_trigger_event", ALARM_TRIGGER_SOURCES, dict(icon="mdi:bell-alert")),
 }
 
 BUTTONS = {
@@ -282,6 +301,9 @@ _ENTITY_SCHEMAS.update(
 )
 _ENTITY_SCHEMAS.update(
     {cv.Optional(k): text_sensor.text_sensor_schema(**opts) for k, (_s, opts) in TEXT_SENSORS.items()}
+)
+_ENTITY_SCHEMAS.update(
+    {cv.Optional(k): event.event_schema(**opts) for k, (_s, _types, opts) in EVENTS.items()}
 )
 _ENTITY_SCHEMAS.update(
     {cv.Optional(k): select.select_schema(LibrescootSelect, **_ekw(ec, icon)) for k, (_s, _kd, _o, ec, icon) in SELECTS.items()}
@@ -450,6 +472,9 @@ async def to_code(config):
     for key, (setter, _opts) in TEXT_SENSORS.items():
         if key in config:
             cg.add(getattr(var, setter)(await text_sensor.new_text_sensor(config[key])))
+    for key, (setter, types, _opts) in EVENTS.items():
+        if key in config:
+            cg.add(getattr(var, setter)(await event.new_event(config[key], event_types=types)))
 
     # --- selects ---
     for key, (setter, kind, options, _ec, _icon) in SELECTS.items():

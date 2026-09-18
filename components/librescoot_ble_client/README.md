@@ -355,9 +355,19 @@ again. Optimistic UI state updates immediately; the BLE write follows on connect
 
 | Key | Entity | Type |
 | :--- | :--- | :--- |
-| `alarm_enabled` | Alarm Enabled | switch — reflects the scooter's real `alarm.enabled` setting (read on connect and after every toggle), not just the last request |
-| `alarm_arm` / `alarm_disarm` | Alarm Arm / Alarm Disarm | button — buttons, not a switch: the firmware exposes no way to read the *armed* state back, so a switch there could only ever show the last request |
+| `alarm_enabled` | Alarm Enabled | switch — shows the scooter's real setting, not just the last request |
+| `alarm_armed` | Alarm Armed | switch — arm / disarm, and shows whether the alarm is actually armed right now. Note: arming does nothing while the alarm is disabled; the switch snaps back |
+| `alarm_status` | Alarm Status | text sensor — `disabled`, `disarmed`, `delay-armed`, `armed`, `level-1-triggered`, `level-2-triggered`, `seatbox-access` |
+| `alarm_triggered` | Alarm Triggered | binary sensor (tamper) — on while the alarm is going off; the one to notify your phone with |
+| `alarm_trigger` | Alarm Trigger | **event** — fires once per trigger with what set it off: `motion`, `seatbox`, `handlebar_position`, `handlebar_lock`, `brake_left`, `brake_right`, `horn_button`, `seatbox_button`. A trigger that happened while the ESP was not connected is still delivered once it reconnects |
+| `alarm_last_trigger` / `alarm_last_trigger_time` | Alarm Last Trigger / … Time | text sensors — source and UTC time of the most recent trigger |
+| `alarm_arm` / `alarm_disarm` | Alarm Arm / Alarm Disarm | button — for firmware without the alarm state service |
 | `alarm_start` / `alarm_stop` | Alarm Start / Stop | button |
+
+Alarm state and triggers need scooter firmware with nRF `v2.11.0-ls` or newer. On older firmware
+the state entities stay *unknown*, `Alarm Armed` refuses to switch, and the log says so once per
+connect. To see triggers the moment they happen, keep the board's **BLE Link Mode** on `always`;
+with `auto` or `interval` you still get them on the next connect.
 | `navigation_set` | Navigation Set to | text (`lat,lon[,name]`) |
 | `navigation_clear` | Navigation Clear | button |
 | `cancel_hibernate` | Cancel Hibernate | button |
