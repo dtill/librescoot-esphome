@@ -104,6 +104,7 @@ CONF_GITHUB_TOKEN = "github_token"
 CONF_UPDATE_INTERVAL = "update_check_interval"
 CONF_LINK_INTERVAL = "link_interval"
 CONF_LINK_AUTO_HOLD = "link_auto_hold"
+CONF_DBC_AUTO_POWER = "dbc_auto_power"
 # DEFAULT OTA byte source ("github"/"relay"); distinct key from the `ota_source` select entity.
 CONF_OTA_SOURCE_DEFAULT = "ota_source_default"
 CONF_FIRMWARE_SOURCE = "firmware_source"
@@ -162,6 +163,8 @@ BINARY_SENSORS = {
     "ble_presence": ("set_ble_presence", dict(device_class="presence", icon="mdi:bluetooth-audio", entity_category="diagnostic")),
     # Alarm service 9a590220 (nRF >= v2.11.0-ls): on while the alarm sounds (level-1/2-triggered).
     "alarm_triggered": ("set_alarm_triggered", dict(device_class="tamper", icon="mdi:alarm-light")),
+    # DBC (dashboard) reports ready — from dbc:status (nRF >= v2.11.0-ls).
+    "dbc_ready": ("set_dbc_ready", dict(icon="mdi:monitor-dashboard", entity_category="diagnostic")),
 }
 
 TEXT_SENSORS = {
@@ -228,6 +231,9 @@ SWITCHES = {
     "alarm_enabled": ("set_alarm_enabled", SwKind.ALARM_ENABLED, None, "mdi:alarm-light", "DISABLED"),
     # Reflected from the alarm status characteristic (9a590221); refuses without the alarm service.
     "alarm_armed": ("set_alarm_armed", SwKind.ALARM_ARMED, None, "mdi:shield-lock", "DISABLED"),
+    # Dashboard power (dbc:on-wait / dbc:off-wait), reflected from dbc:status. Does not change the
+    # vehicle state. Refuses without the dbc commands (nRF >= v2.11.0-ls).
+    "dbc_power": ("set_dbc_power", SwKind.DBC_POWER, "diagnostic", "mdi:monitor", "DISABLED"),
     "pm_scheduled_hibernate_enabled": ("set_pm_sched_hib", SwKind.PM_SCHED_HIB, "config", "mdi:calendar-clock", "DISABLED"),
     # Runtime OTA controls (no scooter write, just local flags), so ALWAYS_OFF is right here: both
     # start OFF every boot and auto-update can never restore ON and install unattended.
@@ -355,6 +361,9 @@ CONFIG_SCHEMA = cv.All(
             # phone or any other central gets a turn on the scooter's single slot. 0 = never yield
             # proactively (pure failover: hold until the link drops on its own).
             cv.Optional(CONF_LINK_AUTO_HOLD, default="3min"): cv.positive_time_period_milliseconds,
+            # After a DBC install, power the dashboard on so the bundle applies and the new version
+            # can be read (dbc:on-wait, then dbc:off if it was off). Off until proven on the vehicle.
+            cv.Optional(CONF_DBC_AUTO_POWER, default=False): cv.boolean,
             # OTA byte source default. Omitted → chip-based (ESP32-S3 → direct GitHub, else HA relay).
             cv.Optional(CONF_OTA_SOURCE_DEFAULT): cv.one_of("github", "relay", lower=True),
             # Compile-time default byte source for the OTA transfer (e.g. a local mirror). The
@@ -458,6 +467,7 @@ async def to_code(config):
     cg.add(var.set_update_check_interval(config[CONF_UPDATE_INTERVAL]))
     cg.add(var.set_link_interval_ms(config[CONF_LINK_INTERVAL]))
     cg.add(var.set_auto_hold_ms(config[CONF_LINK_AUTO_HOLD]))
+    cg.add(var.set_dbc_auto_power(config[CONF_DBC_AUTO_POWER]))
     cg.add(var.set_presence_timeout(config[CONF_PRESENCE_TIMEOUT]))
     if CONF_TIME_ID in config:
         cg.add(var.set_time(await cg.get_variable(config[CONF_TIME_ID])))

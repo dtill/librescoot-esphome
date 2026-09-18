@@ -61,7 +61,7 @@ enum class BtnAction : uint8_t {
   PAIR, PASSKEY_SEND,
 };
 enum class SelKind : uint8_t { BLINKER, USB_MODE, LINK_MODE, OTA_CHANNEL, OTA_METHOD, OTA_SOURCE };
-enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE, DELTA_CHAINING };
+enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, DBC_POWER, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE, DELTA_CHAINING };
 enum class TxtKind : uint8_t {
   COMMAND, NAV_DEST, CELLULAR_APN, PM_CRON, PM_DURATION, SYSTIME_ISO, OTA_SOURCE_URL, OTA_VERSION,
   BLE_PASSKEY
@@ -268,6 +268,10 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void set_alarm_last_trigger_time(text_sensor::TextSensor *t) { alarm_last_trigger_time_ = t; }
   void set_alarm_trigger_event(event::Event *e) { alarm_trigger_event_ = e; }
   void set_alarm_armed(LibrescootSwitch *s) { alarm_armed_ = s; }
+  // DBC power over the extended-command channel (dbc:*, nRF >= v2.11.0-ls).
+  void set_dbc_power(LibrescootSwitch *s) { dbc_power_ = s; }
+  void set_dbc_ready(binary_sensor::BinarySensor *b) { dbc_ready_ = b; }
+  void set_dbc_auto_power(bool v) { dbc_auto_power_ = v; }
   void set_ums_status(binary_sensor::BinarySensor *b) { ums_status_ = b; }
   void set_maps_available(binary_sensor::BinarySensor *b) { maps_available_ = b; }
   void set_nav_available(binary_sensor::BinarySensor *b) { nav_available_ = b; }
@@ -538,6 +542,24 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   std::string alarm_last_trigger_seen_;
   void handle_alarm_status_(const std::string &s);
   void handle_alarm_trigger_(const std::string &s);
+
+  // DBC power. dbc_present_ is set by the first dbc:status reply of a connection — the gate for the
+  // switch (older firmware answers with an error, and the switch has no honest state to show).
+  LibrescootSwitch *dbc_power_{nullptr};
+  binary_sensor::BinarySensor *dbc_ready_{nullptr};
+  bool dbc_present_{false};
+  bool dbc_power_on_{false};          // last dbc:status power field (unknown keeps the last)
+  bool dbc_power_known_{false};
+  uint32_t dbc_suppress_until_{0};    // after a switch press: let the optimistic state stand briefly
+  // Auto-power during the post-install version await (see ota_request_installed_version_):
+  // a DBC bundle applies on the dashboard's next power-on, so with the dashboard off the awaited
+  // version could never change. Off by default until proven on the vehicle.
+  bool dbc_auto_power_{false};
+  bool dbc_autopower_active_{false};  // an on-wait is out or the dashboard is on because of us
+  bool dbc_autopower_was_off_{false}; // power off again afterwards only if we switched it on
+  uint8_t dbc_autopower_tries_{0};
+  void handle_dbc_response_(const std::string &line);
+  void dbc_autopower_finish_();
   binary_sensor::BinarySensor *maps_available_{nullptr}, *nav_available_{nullptr};
   binary_sensor::BinarySensor *ble_connection_{nullptr}, *ble_presence_{nullptr};
   uint32_t presence_timeout_ms_{60000};  // "Home" if an advert was seen within this window

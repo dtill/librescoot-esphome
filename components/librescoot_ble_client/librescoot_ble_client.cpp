@@ -231,7 +231,8 @@ void LibrescootBleClient::build_char_table_() {
 
   bool uses_ext = command_text_ || cmd_response_ || cmd_last_response_ || keycard_count_ || sw_dbc_ ||
                   maps_available_ || nav_available_ || apn_text_ || pm_sched_hib_ || pm_cron_text_ ||
-                  pm_duration_text_ || usb_mode_ || ota_channel_ || alarm_enabled_ || alarm_armed_;
+                  pm_duration_text_ || usb_mode_ || ota_channel_ || alarm_enabled_ || alarm_armed_ ||
+                  dbc_power_ || dbc_ready_ || dbc_auto_power_;
   if (uses_ext) {
     add(CharId::CMD_RESPONSE, SVC_EXT, CH_EXT_RESP, true, 0);
     add(CharId::EXT_CMD, SVC_EXT, CH_EXT, false, 0);
@@ -624,17 +625,31 @@ void LibrescootBleClient::loop() {
       this->ota_awaiting_version_ = false;
       if (this->ota_status_ != nullptr)
         this->ota_status_->publish_state("Installed");
+      this->dbc_autopower_finish_();
       this->ota_settle_update_entity_();
       this->refresh_();  // re-read every sensor now that the scooter is on the new firmware
     } else if (now >= this->ota_await_until_ms_) {
       ESP_LOGW("ota", "install: new version not confirmed in time; resetting");
       this->ota_awaiting_version_ = false;
+      this->dbc_autopower_finish_();
       this->ota_settle_update_entity_();
     } else if (now >= this->ota_await_poll_ms_) {
       // Keep asking until it changes — this is what releases the update entity from "installing
       // 100 %"; without it the entity waits for a reconnect that may never come.
       this->ota_await_poll_ms_ = now + 15000;
       this->ota_request_installed_version_();
+      // A DBC bundle applies on the dashboard's next power-on. With the dashboard off the version
+      // above can never change, so — when allowed — power it on and let the install happen.
+      if (this->ota_install_component_ == 1 && this->dbc_auto_power_ && this->dbc_present_ &&
+          !this->dbc_autopower_active_ && this->dbc_autopower_tries_ < 3 &&
+          this->ota_scooter_phase_ != 0x01 && this->state() == espbt::ClientState::ESTABLISHED) {
+        this->dbc_autopower_active_ = true;
+        this->dbc_autopower_was_off_ = this->dbc_power_known_ && !this->dbc_power_on_;
+        this->dbc_autopower_tries_++;
+        ESP_LOGI("ota", "DBC: powering the dashboard on so the pending update applies (try %u/3)",
+                 this->dbc_autopower_tries_);
+        this->send_ext_query_("dbc:on-wait");
+      }
     }
   }
 
@@ -1169,6 +1184,8 @@ void LibrescootBleClient::on_connected_() {
   // same state is readable over the extended-command channel.
   if (this->aux_charger_ != nullptr)
     this->pending_queries_.push_back("ltc:status");
+  if (this->dbc_power_ != nullptr || this->dbc_ready_ != nullptr || this->dbc_auto_power_)
+    this->pending_queries_.push_back("dbc:status");
   if (this->apn_text_ != nullptr)
     this->pending_queries_.push_back("get:cellular.apn");
   if (this->pm_sched_hib_ != nullptr)
@@ -1400,6 +1417,8 @@ void LibrescootBleClient::parse_cmd_response_(const std::string &line) {
   } else if (line.rfind("ltc:status:", 0) == 0) {
     if (this->aux_charger_ != nullptr)
       this->aux_charger_->publish_state(!ieq(line.substr(11), "off"));
+  } else if (line.rfind("dbc:", 0) == 0) {
+    this->handle_dbc_response_(line);
   } else if (line.rfind("get:alarm.enabled:", 0) == 0) {
     if (this->alarm_enabled_ != nullptr)
       this->alarm_enabled_->publish_state(line.find(":true") != std::string::npos);
@@ -1573,7 +1592,7 @@ void LibrescootBleClient::mark_unknown_() {
       s->publish_state(NAN);
 
   binary_sensor::BinarySensor *bins[] = {bat1_present_, bat2_present_, nav_active_,   ums_status_,
-                                         maps_available_, nav_available_, alarm_triggered_};
+                                         maps_available_, nav_available_, alarm_triggered_, dbc_ready_};
   for (auto *b : bins)
     if (b != nullptr)
       b->invalidate_state();
@@ -1585,6 +1604,8 @@ void LibrescootBleClient::mark_unknown_() {
     if (t != nullptr)
       t->publish_state("unknown");
   this->alarm_svc_present_ = false;
+  this->dbc_present_ = false;
+  this->dbc_power_known_ = false;
 
   this->present1_ = false;
   this->present2_ = false;
@@ -1638,6 +1659,67 @@ void LibrescootBleClient::handle_alarm_trigger_(const std::string &s) {
   AlarmTrigPref atp{};
   snprintf(atp.v, sizeof(atp.v), "%s", s.c_str());
   this->alarm_trigger_pref_.save(&atp);
+}
+
+// ---------------------------------------------------------------------------
+// DBC power (dbc:* extended commands, bluetooth-service >= v2.11.0-ls)
+// ---------------------------------------------------------------------------
+// dbc:status:power:<on|off|unknown>:ready:<true|false|unknown>
+// dbc:<on|off|on-wait|off-wait>:ok | dbc:<cmd>:error:<reason>
+void LibrescootBleClient::handle_dbc_response_(const std::string &line) {
+  if (line.rfind("dbc:status:power:", 0) == 0) {
+    this->dbc_present_ = true;
+    const std::string rest = line.substr(17);  // "<power>:ready:<ready>"
+    const size_t c = rest.find(':');
+    const std::string power = rest.substr(0, c);
+    const size_t r = rest.find("ready:");
+    const std::string ready = r == std::string::npos ? "unknown" : rest.substr(r + 6);
+    if (power == "on" || power == "off") {
+      this->dbc_power_on_ = power == "on";
+      this->dbc_power_known_ = true;
+      if (this->dbc_power_ != nullptr && millis() >= this->dbc_suppress_until_)
+        this->dbc_power_->publish_state(this->dbc_power_on_);
+    }
+    if (this->dbc_ready_ != nullptr) {
+      // The firmware reports ready:unknown while the dashboard is off; off means not ready.
+      if (ready == "true" || ready == "false")
+        this->dbc_ready_->publish_state(ready == "true");
+      else if (power == "off")
+        this->dbc_ready_->publish_state(false);
+      else
+        this->dbc_ready_->invalidate_state();
+    }
+    return;
+  }
+  // A command reply: read the state back so the switch shows what the dashboard is doing.
+  const bool ok = line.find(":ok") != std::string::npos;
+  const bool is_wait = line.rfind("dbc:on-wait:", 0) == 0 || line.rfind("dbc:off-wait:", 0) == 0;
+  if (!ok)
+    ESP_LOGW(TAG, "DBC: %s", line.c_str());
+  if (this->dbc_autopower_active_ && line.rfind("dbc:on-wait:", 0) == 0) {
+    if (ok) {
+      ESP_LOGI("ota", "DBC: dashboard is up — asking for its version");
+      this->ota_request_installed_version_();
+    } else {
+      // Timeout / update-in-progress / redis: not an install failure, try again on a later tick.
+      this->dbc_autopower_active_ = false;
+    }
+  }
+  if (is_wait || ok)
+    this->pending_queries_.push_back("dbc:status");
+}
+
+// Called when the awaited version is confirmed or the await gives up: hand the dashboard back the
+// way it was. Never powers off a dashboard that was on before we started.
+void LibrescootBleClient::dbc_autopower_finish_() {
+  const bool ours = this->dbc_autopower_active_;
+  this->dbc_autopower_active_ = false;
+  this->dbc_autopower_tries_ = 0;
+  if (ours && this->dbc_autopower_was_off_ && this->state() == espbt::ClientState::ESTABLISHED) {
+    ESP_LOGI("ota", "DBC: powering the dashboard off again");
+    this->send_ext_query_("dbc:off");
+    this->pending_queries_.push_back("dbc:status");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3275,6 +3357,21 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
           e->last_ms = millis() - 1200;  // due immediately
         }
       });
+      break;
+    case SwKind::DBC_POWER:
+      // Reflected from dbc:status. The -wait forms are used so the readback after the reply is
+      // the real state (on-wait answers once the dashboard is up, ~14 s from cold).
+      if (!this->dbc_present_) {
+        ESP_LOGW(TAG, "DBC Power needs nRF >= v2.11.0-ls (dbc:status unanswered on this firmware) — "
+                      "not sending");
+        if (this->dbc_power_ != nullptr)
+          this->dbc_power_->publish_state(this->dbc_power_on_);
+        break;
+      }
+      this->run_command_(state ? "dbc:on-wait" : "dbc:off-wait");
+      this->dbc_suppress_until_ = millis() + 5000;
+      if (this->dbc_power_ != nullptr)
+        this->dbc_power_->publish_state(state);
       break;
     case SwKind::PM_SCHED_HIB:
       this->run_command_(state ? "set:pm.scheduled-hibernate-enabled true"

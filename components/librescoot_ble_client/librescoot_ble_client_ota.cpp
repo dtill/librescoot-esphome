@@ -174,6 +174,7 @@ void LibrescootBleClient::ota_user_abort() {
   this->ota_jobs_.clear();               // don't start the next queued component (e.g. DBC)
   this->ota_cancel_ = true;              // discard a resolve result that may still be in flight
   this->ota_awaiting_version_ = false;   // stop waiting for the post-install reboot/version
+  this->dbc_autopower_finish_();         // hand the dashboard back if we powered it on
   if (this->ota_state_ != OtaState::IDLE) {
     const uint8_t m[2] = {0x04, 0x00};   // ABORT, reason=user cancel
     this->write_now_(CharId::OTA_CONTROL, m, sizeof(m));
