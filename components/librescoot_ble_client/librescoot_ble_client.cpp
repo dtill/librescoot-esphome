@@ -2891,8 +2891,9 @@ void LibrescootBleClient::ota_prefill_version_text_(const std::string &tag) {
 }
 
 // Availability model, method-dependent:
-//   delta → DBC-first: step DBC to the successor of ITS version until DBC == MDB, THEN step MDB to
-//           its own successor (one delta at a time; a delta only applies to the preceding release).
+//   delta → MDB leads by one step: while DBC is behind the MDB, step DBC to the successor of ITS
+//           version until DBC == MDB; otherwise (equal, or DBC ahead) step MDB to its own successor.
+//           One delta at a time; a delta only applies to the preceding release.
 //   full  → MDB-first: bring MDB to the channel latest, THEN bring DBC to the channel latest.
 // The per-component target + changelog come from the worker (gh_mdb_target_ / gh_dbc_target_ etc.).
 // The manual "OTA … Install" buttons ignore this gating; auto-update (OTA Auto Update) honours it.
@@ -2950,7 +2951,10 @@ void LibrescootBleClient::refresh_update_availability_() {
   // it as missing so no bogus "unknown → <target>" offer appears.
   bool have_mdb = !this->mdb_version_.empty() && !ieq(this->mdb_version_, "unknown");
   bool have_dbc = !this->dbc_version_.empty() && !ieq(this->dbc_version_, "unknown");
-  bool dbc_behind_mdb = have_mdb && have_dbc && !ieq(this->dbc_version_, this->mdb_version_);
+  // "Behind" is an ordering, not an inequality: a DBC that is AHEAD of the MDB (possible after a
+  // manual DBC install) must not be stepped further — the MDB catches up first.
+  bool dbc_behind_mdb = have_mdb && have_dbc &&
+                        version_to_tag(this->dbc_version_) < version_to_tag(this->mdb_version_);
   bool mdb_at_latest = have_mdb && ieq(this->mdb_version_, latest);
   // Compute the target for the CURRENT method right here (independent of the worker's snapshot):
   // full → the channel latest; delta → the adjacent successor of that component's installed version.
@@ -2972,7 +2976,7 @@ void LibrescootBleClient::refresh_update_availability_() {
   const bool dbc_has = have_dbc && forward(dtar, this->dbc_version_);
 
   // Which one unattended installation may take next. full: MDB reaches the channel latest first.
-  // delta: DBC steps until it matches MDB, then MDB takes its next step — one delta at a time.
+  // delta: the MDB leads — DBC steps only while it is behind the MDB; equal or ahead, MDB steps.
   bool mdb_avail, dbc_avail;
   if (full) {
     mdb_avail = mdb_has;
@@ -3067,7 +3071,7 @@ void LibrescootBleClient::refresh_update_availability_() {
 }
 
 // OTA Auto Update: while the switch is on, install whatever an update entity would currently offer
-// (honouring the delta DBC-first / full MDB-first ordering baked into refresh_update_availability_),
+// (honouring the delta MDB-leads / full MDB-first ordering baked into refresh_update_availability_),
 // one at a time, waiting out each install's reboot. When nothing is left after a fresh GitHub check,
 // switch itself back off. Called at the end of every refresh_update_availability_ and periodically.
 void LibrescootBleClient::ota_auto_update_tick_() {

@@ -286,8 +286,9 @@ librescoot_ble_client:
   # OTA Stage Only: transfers run fully but stop before COMPLETE (staging test, nothing installed).
   ota_stage_only:
     name: "OTA Stage Only"
-  # OTA Auto Update: install every offered update unattended (delta = next release, DBC-first; full =
-  # latest, MDB-first), waiting out each reboot, then switch itself off when everything is up to date.
+  # OTA Auto Update: install every offered update unattended (delta = one release at a time, the MDB
+  # leads and the DBC catches up to it; full = channel latest, MDB first), waiting out each reboot,
+  # then switch itself off when everything is up to date.
   ota_auto_update:
     name: "OTA Auto Update"
   # Merge a run of consecutive deltas into one artifact, so a scooter several releases behind needs

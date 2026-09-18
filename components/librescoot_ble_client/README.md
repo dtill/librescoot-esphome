@@ -488,7 +488,9 @@ version, with `full` the channel latest. So MDB and DBC can show an update at th
 
 **Ordering applies to unattended installation only.** `OTA Auto Update` installs one at a time:
 
-- `delta` — the DBC steps until it matches the MDB, then the MDB takes its next step.
+- `delta` — the MDB leads by one step: while the DBC is behind the MDB it steps until the two
+  match; when they match, or the DBC is ahead (after a manual DBC install), the MDB takes its
+  next step.
 - `full` — the MDB reaches the channel latest first, then the DBC follows.
 
 **OTA Version** always shows the target that would be installed next under that order.
