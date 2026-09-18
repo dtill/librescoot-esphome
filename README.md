@@ -60,10 +60,10 @@ the walkthrough below.
 
 #### Quick start
 
-**1. Flash.** Put your Wi-Fi, an API key, an OTA password and the scooter's Bluetooth MAC into
-`secrets.yaml`, then flash [`librescoot-ble-client-example.yaml`](librescoot-ble-client-example.yaml)
-once over USB (`esphome run …`). After that it updates itself over Wi-Fi. Add the ESP to Home
-Assistant — it is discovered automatically. **Control and all sensors work from here on.**
+**1. Flash.** Put your Wi-Fi, an API key and the scooter's Bluetooth MAC into `secrets.yaml`, then
+flash [`librescoot-ble-client-example.yaml`](librescoot-ble-client-example.yaml) once over USB
+(`esphome run …`). After that it updates itself over Wi-Fi. Add the ESP to Home Assistant — it is
+discovered automatically. **Control and all sensors work from here on.**
 
 **2. Pair.** The scooter must be **on and unlocked**, and you need to see its dashboard.
 
@@ -93,9 +93,11 @@ artifact.
 #### What you get
 
 Lock/unlock, seatbox, blinkers, alarm, USB/UMS mode, navigation and power-management controls;
-battery, CBB and aux-battery telemetry, odometer, operating state, versions and RSSI; the freeform
-extended-command channel; and firmware updates for both scooter boards straight from GitHub
-releases, with resume, self-healing transfers and progress/throughput sensors.
+battery, CBB and aux-battery telemetry, odometer, operating state, versions and RSSI; alarm state
+and an **alarm trigger event** (what set it off, delivered even if it happened while the ESP was
+out of range — nRF v2.11 firmware or newer); the freeform extended-command channel; and firmware
+updates for both scooter boards straight from GitHub releases, with resume, self-healing transfers
+and progress/throughput sensors.
 
 #### Which ESP32 — and do I need the Home Assistant integration?
 
