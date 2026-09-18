@@ -92,7 +92,8 @@ artifact.
 
 #### What you get
 
-Lock/unlock, seatbox, blinkers, alarm, USB/UMS mode, navigation and power-management controls;
+Lock/unlock, seatbox, blinkers, alarm, dashboard power, USB/UMS mode, navigation and power-management
+controls;
 battery, CBB and aux-battery telemetry, odometer, operating state, versions and RSSI; alarm state
 and an **alarm trigger event** (what set it off, delivered even if it happened while the ESP was
 out of range — nRF v2.11 firmware or newer); the freeform extended-command channel; and firmware
@@ -114,17 +115,12 @@ integration downloads the release and serves the bytes over the local network. O
 source is a runtime choice (**OTA Source**), so it can use the relay too. **Everything that is not a
 firmware download works without the integration on both boards.**
 
-> **On an ESP32 classic, add `batch_delay: 0ms` to `api:`.** The board has no PSRAM and runs on a
-> tight heap. ESPHome otherwise collects state messages into one large contiguous allocation, which
-> can fail during a firmware transfer — and a failed allocation restarts the device. Sending each
-> message on its own keeps every allocation small. A device that suddenly stops accepting Home
-> Assistant connections is the symptom to watch for.
+> **One config for both boards.** The component sets the board-specific sdkconfig itself (BLE
+> connect mode on the S3, Wi-Fi/BLE buffer trimming and API batching on a board without PSRAM);
+> the example config only differs in its `esp32:`/`psram:` block. On an ESP32 classic, leave
+> `web_server` out — it competes for the internal RAM a firmware transfer needs. A device that
+> suddenly stops accepting Home Assistant connections is the symptom to watch for.
 
-> **On an ESP32-S3, add `CONFIG_BT_BLE_50_FEATURES_SUPPORTED: n`** to the board's
-> `framework: sdkconfig_options:`. The S3's Bluetooth-5 controller otherwise issues an *Extended*
-> Create Connection that the scooter rejects during the scan→connect switch, looping on status-133
-> connect errors. Forcing the legacy BLE-4.2 connect fixes it; the classic never needs this (MTU 247
-> and Data Length Extension are unaffected).
 
 ### [CBB monitoring via I²C addr 0x36 and 0x0B](librescoot-cbb-example.yaml)
 

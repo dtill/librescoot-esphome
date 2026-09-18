@@ -116,8 +116,8 @@ librescoot_ble_client:
   # reconnect churn at the edge of range.
   link_auto_hold: 3min
   # After a DBC (dashboard) update has been installed, switch the dashboard on so the update
-  # applies and the new version is read — no ride needed. Needs nRF v2.11.0-ls or newer.
-  dbc_auto_power: false
+  # applies and the new version is read — no ride needed (default; needs nRF v2.11.0-ls or newer).
+  dbc_auto_power: true
   # --- OTA settings (defaults shown; the component picks the byte source and the TLS roots
   #     by board: with PSRAM straight from GitHub against the Mozilla bundle, without PSRAM
   #     via the Home Assistant relay with the GitHub roots pinned) ---

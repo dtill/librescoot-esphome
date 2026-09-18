@@ -140,7 +140,7 @@ librescoot_ble_client:
 | `presence_timeout` | time, `60s` | **BLE Presence** stays Home if an advert was seen within this window. |
 | `link_interval` | time, `5min` | For the **`interval`** BLE Link Mode: how often to connect, refresh every sensor once, then release the link again. |
 | `link_auto_hold` | time, `3min` | For the **`auto`** BLE Link Mode: hold the connection this long, then release it for ~20 s so a phone / other central gets a turn on the single slot. `0s` = pure failover (never yield proactively). |
-| `dbc_auto_power` | bool, `false` | After a DBC (dashboard) update has been installed, switch the dashboard on so the update applies and its new version can be read — no ride needed (the scooter powers it off again by itself in stand-by). Needs scooter firmware with nRF `v2.11.0-ls` or newer. |
+| `dbc_auto_power` | bool, `true` | After a DBC (dashboard) update has been installed, switch the dashboard on so the update applies and its new version can be read — no ride needed (the scooter powers it off again by itself in stand-by). Needs scooter firmware with nRF `v2.11.0-ls` or newer; does nothing on older firmware. |
 | `ota_source_default` | `github` / `relay`, optional | Default OTA byte source. Omitted → **chip-based** (ESP32-S3 → `github`, every other chip → `relay`). The runtime **OTA Source** select overrides it and is persisted in NVS. |
 | `use_cert_bundle` | bool, default = PSRAM present | Validate GitHub HTTPS against the ESP-IDF **Mozilla bundle** instead of the pinned roots (auto-enables `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`). On with PSRAM (direct-GitHub downloads), off without. |
 | `ca_certificate` | string, optional | Explicit PEM root/chain for GitHub HTTPS (alternative to the bundle). |
@@ -554,8 +554,8 @@ notification (`[0x84][phase][percent][msg]`) carries **no component field**, so 
 OTA_STATUS characteristic cannot say *which* board is pending. `pending-reboot` (phase `0x02`)
 is a legitimate phase for **both** boards — both must reboot to switch Mender partitions. The
 MDB auto-reboots after 3 min stand-by; a DBC install applies on the **next dashboard power
-cycle** — with `dbc_auto_power: true` the component switches the dashboard on itself after a DBC
-install so this happens right away (about 30 s from power-on to the new version). But the OTA_STATUS characteristic is a **latch of the last BLE-OTA session's terminal
+cycle** — the component switches the dashboard on itself after a DBC install (`dbc_auto_power`,
+on by default) so this happens right away, about 30 s from power-on to the new version. But the OTA_STATUS characteristic is a **latch of the last BLE-OTA session's terminal
 progress** — it is *not* re-synced to the scooter's live update state. So even after the
 dashboard has rebooted and both versions match again, `STATUS_REQ` can keep returning
 "pending reboot" (observed live: both boards on the new version, update-service back to idle,

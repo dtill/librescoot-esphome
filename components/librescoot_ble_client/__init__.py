@@ -428,8 +428,8 @@ CONFIG_SCHEMA = cv.All(
             # proactively (pure failover: hold until the link drops on its own).
             cv.Optional(CONF_LINK_AUTO_HOLD, default="3min"): cv.positive_time_period_milliseconds,
             # After a DBC install, power the dashboard on so the bundle applies and the new version
-            # can be read (dbc:on-wait, then dbc:off if it was off). Off until proven on the vehicle.
-            cv.Optional(CONF_DBC_AUTO_POWER, default=False): cv.boolean,
+            # can be read (dbc:on-wait; the vehicle powers it off again by itself in stand-by).
+            cv.Optional(CONF_DBC_AUTO_POWER, default=True): cv.boolean,
             # OTA byte source default. Omitted → chip-based (ESP32-S3 → direct GitHub, else HA relay).
             cv.Optional(CONF_OTA_SOURCE_DEFAULT): cv.one_of("github", "relay", lower=True),
             # Compile-time default byte source for the OTA transfer (e.g. a local mirror). The

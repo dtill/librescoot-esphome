@@ -553,7 +553,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   uint32_t dbc_suppress_until_{0};    // after a switch press: let the optimistic state stand briefly
   // Auto-power during the post-install version await (see ota_request_installed_version_):
   // a DBC bundle applies on the dashboard's next power-on, so with the dashboard off the awaited
-  // version could never change. Off by default until proven on the vehicle.
+  // version could never change. On by default; the vehicle powers the dashboard off again itself.
   bool dbc_auto_power_{false};
   bool dbc_autopower_active_{false};  // an on-wait is out or the dashboard is on because of us
   bool dbc_autopower_was_off_{false}; // power off again afterwards only if we switched it on
