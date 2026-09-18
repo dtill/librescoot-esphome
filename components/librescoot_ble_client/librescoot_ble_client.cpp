@@ -1174,6 +1174,11 @@ void LibrescootBleClient::on_connected_() {
     this->pending_queries_.push_back("keycard:count");
   if (this->sw_dbc_ != nullptr || this->dbc_update_ != nullptr || this->mdb_update_ != nullptr)
     this->pending_queries_.push_back("status:version:dbc");
+  // The MDB version characteristic (9a59a041) is a cache the nRF fills from what bluetooth-service
+  // pushed at its start; after an MDB update it has been seen to keep the pre-update value for the
+  // whole session. The extended command reads the live value, so ask it as well and let it win.
+  if (this->sw_mdb_ != nullptr || this->mdb_update_ != nullptr || this->dbc_update_ != nullptr)
+    this->pending_queries_.push_back("status:version:mdb");
   if (this->maps_available_ != nullptr)
     this->pending_queries_.push_back("status:maps-available");
   if (this->nav_available_ != nullptr)
@@ -1213,13 +1218,14 @@ void LibrescootBleClient::ota_request_installed_version_() {
       e->tries = 0;
       e->last_ms = millis() - 1200;  // due immediately
     }
-    return;
   }
+  // Both boards: the live version over the command channel (the MDB characteristic can be stale).
+  const char *q_live = this->ota_install_component_ == 0 ? "status:version:mdb" : "status:version:dbc";
   for (const auto &q : this->pending_queries_)
-    if (q == "status:version:dbc")
+    if (q == q_live)
       return;  // already queued
   const bool was_idle = this->pending_queries_.empty();
-  this->pending_queries_.push_back("status:version:dbc");
+  this->pending_queries_.push_back(q_live);
   // Send it straight away only when nothing else is queued; otherwise let the existing spacing
   // run — the command channel is shared and crowding it is what fails first at weak signal.
   if (was_idle && this->next_query_ms_ > millis())
@@ -1337,9 +1343,20 @@ void LibrescootBleClient::handle_char_value_(CharId id, uint8_t *v, uint16_t len
         this->boot_reread_at_ms_ = millis() + 30000;
       break;
     }
-    case CharId::SW_MDB:
-      this->set_mdb_version_(clean_str_(v, len));
+    case CharId::SW_MDB: {
+      const std::string c = clean_str_(v, len);
+      // A live status:version:mdb answer outranks the nRF's cached characteristic until the
+      // characteristic itself moves to a new value.
+      if (!this->mdb_version_live_.empty() && !ieq(c, this->mdb_version_live_) &&
+          ieq(c, this->mdb_version_char_)) {
+        break;  // same stale cache as before; keep the live value
+      }
+      this->mdb_version_char_ = c;
+      if (!this->mdb_version_live_.empty() && !ieq(c, this->mdb_version_live_))
+        this->mdb_version_live_.clear();  // the characteristic moved: trust it again
+      this->set_mdb_version_(c);
       break;
+    }
     case CharId::SW_NRF:
       if (this->sw_nrf_ != nullptr)
         this->sw_nrf_->publish_state(clean_str_(v, len));
@@ -1405,6 +1422,15 @@ void LibrescootBleClient::parse_cmd_response_(const std::string &line) {
   // Typed responses — parsed always so on-connect queries and manual commands both work.
   if (line.rfind("status:version:dbc:", 0) == 0) {
     this->set_dbc_version_(line.substr(19));
+  } else if (line.rfind("status:version:mdb:", 0) == 0) {
+    const std::string live = line.substr(19);
+    if (!live.empty() && !ieq(live, "unknown")) {
+      if (!this->mdb_version_.empty() && !ieq(live, this->mdb_version_))
+        ESP_LOGW(TAG, "MDB version: characteristic says %s, scooter says %s — using the scooter's",
+                 this->mdb_version_.c_str(), live.c_str());
+      this->mdb_version_live_ = live;
+      this->set_mdb_version_(live);
+    }
   } else if (line.rfind("keycard:count:", 0) == 0) {
     if (this->keycard_count_ != nullptr)
       this->keycard_count_->publish_state(line.substr(14));
@@ -2256,6 +2282,22 @@ void LibrescootBleClient::github_auth_(esp_http_client_handle_t c, const std::st
   esp_http_client_set_header(c, "Authorization", h.c_str());
 }
 
+// How much changelog the INTERNAL heap can hold right now. std::string never lives in PSRAM
+// (ESPHome's psram: is caps-alloc only), so the largest INTERNAL block is what matters — asking
+// for MALLOC_CAP_8BIT alone reports the 8 MB PSRAM block on an S3 and the cap never engages (seen:
+// abort in reserve() with 21 kB largest internal block after three hours of transfers).
+size_t LibrescootBleClient::changelog_cap_() const {
+  static constexpr size_t HEADROOM = 24576;
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  size_t cap = LSC_CHANGELOG_MAX;
+  if (largest < cap + HEADROOM)
+    cap = largest > HEADROOM + 512 ? largest - HEADROOM : 512;
+  if (cap < LSC_CHANGELOG_MAX)
+    ESP_LOGW(TAG, "changelog capped at %u B (largest free internal block %u B)", (unsigned) cap,
+             (unsigned) largest);
+  return cap;
+}
+
 bool LibrescootBleClient::github_http_stream_(const std::string &url,
                                               const std::function<void(char)> &sink) {
   esp_http_client_config_t cfg = {};
@@ -2607,14 +2649,7 @@ void LibrescootBleClient::github_fetch_() {
           // std::string allocates from the internal heap on both boards (PSRAM is caps-alloc
           // only), and a failed allocation aborts the firmware, so take only what the heap can
           // spare and cap the changelog to match.
-          static constexpr size_t BODY_HEADROOM = 24576;
-          const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-          body_cap = LSC_CHANGELOG_MAX;
-          if (largest < body_cap + BODY_HEADROOM)
-            body_cap = largest > BODY_HEADROOM + 512 ? largest - BODY_HEADROOM : 512;
-          if (body_cap < LSC_CHANGELOG_MAX)
-            ESP_LOGW(TAG, "changelog capped at %u B (largest free block %u B)", (unsigned) body_cap,
-                     (unsigned) largest);
+          body_cap = this->changelog_cap_();
           fetched_body.reserve(body_cap + 16);
           esc = false; uskip = 0; bn = 0;
         }
@@ -2767,13 +2802,14 @@ std::string LibrescootBleClient::fetch_notes_via_relay_(const std::string &tag) 
     status = esp_http_client_get_status_code(c);
   }
   if (status == 200) {
-    body.reserve(LSC_CHANGELOG_MAX + 16);
+    const size_t cap = this->changelog_cap_();
+    body.reserve(cap + 16);
     char buf[256];
     int r;
     while ((r = esp_http_client_read(c, buf, sizeof(buf))) > 0) {
-      if (body.size() >= LSC_CHANGELOG_MAX)
+      if (body.size() >= cap)
         continue;  // drain the rest so the connection closes cleanly
-      size_t take = std::min((size_t) r, LSC_CHANGELOG_MAX - body.size());
+      size_t take = std::min((size_t) r, cap - body.size());
       body.append(buf, take);
     }
     ESP_LOGI(TAG, "release notes via relay: %u B", (unsigned) body.size());

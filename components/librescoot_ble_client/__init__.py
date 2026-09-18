@@ -214,7 +214,7 @@ SELECTS = {
     "ota_channel": ("set_ota_channel", SelKind.OTA_CHANNEL, ["undefined", "stable", "testing", "nightly"], "diagnostic", "mdi:update"),
     "ota_update_method": ("set_ota_method", SelKind.OTA_METHOD, ["delta", "full"], "diagnostic", "mdi:package-variant"),
     # "direct GitHub" is only offered on a board with PSRAM — see _direct_github_ok().
-    "ota_source": ("set_ota_source_select", SelKind.OTA_SOURCE, ["HA relay", "direct GitHub"], "config", "mdi:cloud-download"),
+    "ota_source": ("set_ota_source_select", SelKind.OTA_SOURCE, ["HA relay", "direct GitHub"], "diagnostic", "mdi:cloud-download"),
 }
 
 def _direct_github_ok() -> bool:

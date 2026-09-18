@@ -409,6 +409,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void github_fetch_();                    // runs in its own task (blocking HTTPS)
   static void github_task_(void *arg);
   // Stream a GitHub API GET through a per-byte sink (member so it applies the configured TLS).
+  size_t changelog_cap_() const;  // changelog bytes the internal heap can hold right now
   bool github_http_stream_(const std::string &url, const std::function<void(char)> &sink);
   // Apply the YAML-configured TLS trust (bundle / ca_certificate / built-in roots) to a config.
   void ota_http_tls_(esp_http_client_config_t *cfg);
@@ -727,6 +728,8 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
 
   // --- update-check state ---
   std::string mdb_version_;
+  std::string mdb_version_char_;  // last value of 9a59a041 as read
+  std::string mdb_version_live_;  // last status:version:mdb answer, outranks a stale characteristic
   std::string dbc_version_;
   std::string channel_{"nightly"};        // reflected from the running MDB version
   std::string gh_channel_;                // snapshot for the worker task
@@ -780,6 +783,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // halving keeps every previous offset an exact multiple. Grown back only on a fresh transfer.
   static constexpr uint16_t OTA_CHUNK_MAX = LSC_OTA_CHUNK_MAX;
   static constexpr uint16_t OTA_CHUNK_MIN = 60;
+  uint16_t ota_job_chunk_{0};  // chunk chosen at the job's first START; kept for all its retries
   uint16_t ota_chunk_limit_{OTA_CHUNK_MAX};
   // Consecutive self-heals that moved no bytes. The peer's GATT server can stop answering
   // while the link layer stays up, and retrying START on that link never recovers.

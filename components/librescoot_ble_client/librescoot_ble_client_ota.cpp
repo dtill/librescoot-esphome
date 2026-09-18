@@ -139,11 +139,19 @@ void LibrescootBleClient::ota_start(const std::string &url, const std::string &s
   // Apply what this link was last seen to carry. A brand new transfer starts one step above it, so
   // a link that has since improved (or a different scooter) climbs back to the full chunk instead
   // of being stuck at a size some bad afternoon taught it.
-  uint16_t limit = this->ota_chunk_limit_;
-  if (this->ota_selfheal_count_ == 0 && this->ota_resume_count_ == 0 && limit < OTA_CHUNK_MAX)
-    limit *= 2;
-  if (limit < this->ota_chunk_)
-    this->ota_chunk_ = limit;
+  // The chunk size is part of the scooter's resume identity (bundle, size, hash, chunk): a START
+  // with a different chunk discards the staged partial. So it is decided ONCE per job — a fresh
+  // transfer may climb one step above the learned limit — and every self-heal / reconnect retry of
+  // that job reuses it. Only ota_note_no_progress_ (nothing acknowledged at all) lowers it below.
+  const bool fresh_job = this->ota_selfheal_count_ == 0 && this->ota_resume_count_ == 0;
+  if (fresh_job) {
+    uint16_t limit = this->ota_chunk_limit_;
+    if (limit < OTA_CHUNK_MAX)
+      limit *= 2;
+    this->ota_job_chunk_ = limit;
+  }
+  if (this->ota_job_chunk_ < this->ota_chunk_)
+    this->ota_chunk_ = this->ota_job_chunk_;
 
   bool eff_stage = this->stage_only_;
   ESP_LOGI(OTAG, "START %s %s size=%u chunk=%u gap=%ums bundle='%s'",
@@ -221,6 +229,17 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       uint16_t window = u16le(&x[6]);
       uint8_t ack_every = x[8];
       uint16_t max_chunk = u16le(&x[9]);
+      if (status == 0x14) {
+        // The scooter already runs (or has installed and not yet rebooted into) this version.
+        // Nothing to transfer: go straight to the version await, which reads the live version.
+        ESP_LOGW(OTAG, "START_ACK: the scooter already has %s — waiting for it to report it",
+                 this->rs_tag_.c_str());
+        this->ota_set_state_(OtaState::IDLE);
+        this->ota_have_current_job_ = false;
+        this->ota_begin_await_version_();
+        this->ota_request_installed_version_();
+        return;
+      }
       if (status != 0x00 && status != 0x01) {
         this->ota_fail_(status == 0x11   ? "scooter busy"
                         : status == 0x13 ? "install already in progress"
@@ -1379,8 +1398,9 @@ void LibrescootBleClient::ota_progress_() {
 // A whole session with the link up and not one new byte acknowledged is the signature of writes the
 // link cannot deliver at all — at full MTU a DATA write fragments into ~10 link-layer packets, and
 // on a weak link the peripheral wedges on the incomplete reassembly rather than dropping it. Halve
-// the chunk (never below OTA_CHUNK_MIN) and remember it; halving keeps every staged resume offset an
-// exact multiple of the new size, so the transfer picks up where it left off.
+// the chunk (never below OTA_CHUNK_MIN) and remember it. The scooter keys its resume on the chunk
+// size too, so this does discard the staged partial — acceptable only because nothing was getting
+// through at the old size anyway.
 void LibrescootBleClient::ota_note_no_progress_() {
   // Only when chunks were actually written and none came back acknowledged. A session that died
   // before the download delivered its first bytes says nothing about the chunk size.
@@ -1390,6 +1410,7 @@ void LibrescootBleClient::ota_note_no_progress_() {
   this->ota_chunk_limit_ /= 2;
   if (this->ota_chunk_limit_ < OTA_CHUNK_MIN)
     this->ota_chunk_limit_ = OTA_CHUNK_MIN;
+  this->ota_job_chunk_ = this->ota_chunk_limit_;  // the only in-job change of the chunk size
   ESP_LOGW(OTAG, "no bytes got through at chunk %u — retrying with %u B chunks", this->ota_chunk_,
            this->ota_chunk_limit_);
   this->ota_chunk_pref_.save(&this->ota_chunk_limit_);
