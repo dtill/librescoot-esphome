@@ -1,46 +1,54 @@
-# Unu-Scooter Pro BLE interface for Librescoot FW and nRF >v2.0.0-ls
+# Unu Scooter Pro BLE interface for LibreScoot firmware (nRF v2.x-ls)
 #
-# Component edition: the librescoot_ble_client external component owns the BLE client and
-# implements every characteristic parser, the passkey pairing flow, the extended-command
-# engine and the OTA diagnostics in C++. This YAML only names the entities it wants.
+# The librescoot_ble_client external component owns the BLE client: every characteristic
+# parser, the passkey pairing flow, the extended-command engine, the alarm and dashboard
+# entities and the firmware-update engine live in C++. This YAML names the hardware, the
+# network, and the entities it wants — nothing else.
+#
+# Works unchanged on an ESP32 classic and on an ESP32-S3 with PSRAM: the component sets the
+# board-specific sdkconfig (BLE, Wi-Fi/LwIP buffers, TLS, PSRAM fallback) itself. The only
+# board-specific lines are in the `esp32:` / `psram:` section below.
 #
 # secrets.yaml keys used below:
+#   librescoot_nrf_ble_mac_addr, librescoot_api_key,
 #   librescoot_wifi_ssid / _pw, librescoot_fallback_ap_pw,
-#   librescoot_webserver_basic_auth_user / _pw, librescoot_nrf_ble_mac_addr
+#   librescoot_webserver_basic_auth_user / _pw (only with web_server),
+#   librescoot_github_token (optional)
 
 substitutions:
-  device_name: "librescoot-component-485934"   # hostname, must be <=31 chars
-  device_friendly_name: "Librescoot-BLE-Client-component-485934"
-  device_id_name: "librescoot_nrf_component_485934"
+  device_name: "librescoot-ble-client"        # hostname, must be <= 31 chars
+  device_friendly_name: "Librescoot-BLE-Client"
   ble_mac: !secret librescoot_nrf_ble_mac_addr
 
 esphome:
   name: $device_name
   friendly_name: $device_friendly_name
   comment: "Connects to the LibreScoot / unu Scooter Pro firmware through the nRF BLE chip and controls the most common phone-app functions and a little more."
-  build_path: "../config/esphome/build/${device_name}_build"
-  # Advertised in the mDNS TXT record so the Librescoot-BLE-Client HA integration can
-  # zeroconf-discover this device (and only this kind of device).
+  # Advertised in the mDNS TXT record so the Librescoot-BLE-Client Home Assistant integration
+  # can discover this device (and only this kind of device).
   project:
     name: "librescoot.ble_client"
     version: "1.0.0"
 
+# ----- Board: pick ONE of the two blocks --------------------------------------------------
+# ESP32 classic (no PSRAM). Firmware bytes come through the Home Assistant integration's relay.
 esp32:
   board: esp32dev
   framework:
     type: esp-idf
     advanced:
       minimum_chip_revision: "3.1"
-      sram1_as_iram: false   # SRAM1 -> DRAM heap (~+40 kB) so the RSA-4096 CDN TLS handshake fits
-    sdkconfig_options:
-      # The OTA update check pins only the two GitHub root CAs in the component
-      # (github_ca.h), so the ~100 kB Mozilla cert bundle is not compiled in.
-      CONFIG_MBEDTLS_CERTIFICATE_BUNDLE: n
-      # Shrink the TLS heap footprint so the handshake still fits alongside BLE + the OTA
-      # ring buffer on the ESP32-classic (no PSRAM). Only small requests are sent.
-      CONFIG_MBEDTLS_DYNAMIC_BUFFER: y
-      CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN: "4096"
-      CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN: y
+
+# ESP32-S3 with PSRAM (e.g. N16R8). Downloads firmware straight from GitHub, no relay needed.
+# esp32:
+#   board: esp32-s3-devkitc-1
+#   flash_size: 16MB
+#   framework:
+#     type: esp-idf
+# psram:
+#   mode: octal
+#   speed: 80MHz
+# --------------------------------------------------------------------------------------------
 
 external_components:
   - source:
@@ -53,74 +61,48 @@ api:
   reboot_timeout: 5min
   encryption:
     key: !secret librescoot_api_key
-  actions:
-    # Pairing: the scooter shows a 6-digit passkey on its dashboard; reply with it here.
-    - action: passkey_reply
-      variables:
-        pin: int
-      then:
-        - librescoot_ble_client.passkey_reply:
-            id: librescoot_ble_client_hub
-            passkey: !lambda "return pin;"
-    # Test hook for the OTA transfer engine (stage-only by default; nothing is installed).
-    - action: ota_test
-      variables:
-        url: string
-        size: int
-        bundle: string
-        component: int
-      then:
-        - librescoot_ble_client.ota_transfer:
-            id: librescoot_ble_client_hub
-            url: !lambda "return url;"
-            size: !lambda "return size;"
-            bundle_id: !lambda "return bundle;"
-            component: !lambda "return component;"
-    - action: ota_abort
-      then:
-        - librescoot_ble_client.ota_abort:
-            id: librescoot_ble_client_hub
+  # No `actions:` needed: the component registers its services (passkey_reply, ota_test,
+  # ota_abort) itself, and every function is also an entity.
 
 ota:
   - platform: esphome
-    encryption:
+    encryption:          # reuses the API key (ESPHome 2026.9 or newer)
 
 wifi:
-  use_address: 192.168.178.171
   ssid: !secret librescoot_wifi_ssid
   password: !secret librescoot_wifi_pw
   reboot_timeout: 1min
   min_auth_mode: WPA2
+  # use_address: 192.168.1.50   # set if mDNS (${device_name}.local) is flaky on your network
   ap:
     ssid: ${device_name}-ap
     password: !secret librescoot_fallback_ap_pw
 
 captive_portal:
 
-web_server:
-  local: true
-  version: 3
-  port: 80
-  auth:
-    username: !secret librescoot_webserver_basic_auth_user
-    password: !secret librescoot_webserver_basic_auth_pw
-    type: digest
+# Optional. Leave it out on an ESP32 classic: its task and buffers come out of the same
+# internal RAM a firmware transfer needs, and Home Assistant shows everything it would.
+# web_server:
+#   local: true
+#   version: 3
+#   port: 80
+#   auth:
+#     username: !secret librescoot_webserver_basic_auth_user
+#     password: !secret librescoot_webserver_basic_auth_pw
+#     type: digest
 
 logger:
   baud_rate: 0
 
-# --- BLE stack plumbing (shared, stack-level; must stay in the YAML) ---
+# --- BLE stack (stack-level; stays in the YAML). The component applies the passkey pairing
+# capability and, without PSRAM, trims the connection slots to what is registered. ---
 esp32_ble:
-  io_capability: keyboard_only   # required for the scooter's passkey pairing
 esp32_ble_tracker:
 
 # Time source for the clock-set entities (System Time sync / UTC ISO-8601).
 time:
   - platform: sntp
     id: sntp_time
-    servers:
-      - 192.168.178.1
-      - pool.ntp.org
 
 # -----------------------------------------------------------------------------
 # LSC Bluetooth nRF component — every scooter entity, opt-in by name.
@@ -129,13 +111,26 @@ librescoot_ble_client:
   id: librescoot_ble_client_hub
   mac_address: ${ble_mac}
   time_id: sntp_time
-  # "auto" link mode: hold the scooter's single connection this long, then drop it briefly (~20 s)
-  # so a phone or another BLE client gets a turn. 0s = pure failover. Raise to reduce reconnect churn.
+  # "auto" link mode: hold the scooter's single BLE connection this long, then drop it for ~20 s
+  # so a phone or another client gets a turn. 0s = never yield on purpose. Raise it to cut
+  # reconnect churn at the edge of range.
   link_auto_hold: 3min
-  # --- optional OTA settings (defaults shown) ---
+  # After a DBC (dashboard) update has been installed, switch the dashboard on so the update
+  # applies and the new version is read — no ride needed. Needs nRF v2.11.0-ls or newer.
+  dbc_auto_power: false
+  # --- OTA settings (defaults shown; the component picks the byte source and the TLS roots
+  #     by board: with PSRAM straight from GitHub against the Mozilla bundle, without PSRAM
+  #     via the Home Assistant relay with the GitHub roots pinned) ---
   # github_repo: "librescoot/librescoot"   # owner/name the firmware releases come from
   # update_check_interval: 6h              # how often to poll GitHub for a newer release
-  # (stage_only is now the "OTA Stage Only" switch, default off — see the switch entities below)
+  # use_cert_bundle: true                  # force the Mozilla bundle (default = PSRAM present)
+  # ca_certificate: |                      # or an explicit PEM root instead of the bundle
+  #   -----BEGIN CERTIFICATE----- ...
+  # firmware_source: "http://192.168.178.71:8000"   # compile-time default byte source (mirror)
+  # ota_source_default: relay              # override the chip-based default (github / relay)
+  # Optional fine-grained GitHub token (public repo, read-only): raises the API limit from 60 to
+  # 5000 requests/hour. Sent to api.github.com only, never on the asset download.
+  # github_token: !secret librescoot_github_token
 
   # ----- Telemetry (read) ----------------------------------------------------
   status:
@@ -217,8 +212,8 @@ librescoot_ble_client:
   ble_presence:
     name: "BLE Presence"
   # Problem sensor (device_class: problem — shows red/"Detected" in HA). ON while the scooter is
-  # asking for the pairing passkey; enter it with the passkey_reply action (or, with the HA
-  # integration, its Repair dialog). Turns OFF once bonding succeeds.
+  # asking for the pairing passkey; enter it with 'BLE Pairing Passkey' + 'BLE Pairing Send
+  # Passkey' (or, with the HA integration, its Repair dialog). Turns OFF once bonding succeeds.
   passkey_required:
     name: "BLE Passkey Required"
   # Problem sensor (device_class: problem). ON only when the configured scooter is in range
@@ -268,6 +263,25 @@ librescoot_ble_client:
   # Reflects the scooter's real alarm.enabled setting (read on connect and after each toggle).
   alarm_enabled:
     name: "Alarm Enabled"
+  # Alarm service (9a590220, nRF >= v2.11.0-ls). Armed state reflected from the scooter; the
+  # trigger event fires once per trigger, also for one that happened while the link was down.
+  alarm_armed:
+    name: "Alarm Armed"
+  alarm_status:
+    name: "Alarm Status"
+  alarm_triggered:
+    name: "Alarm Triggered"
+  alarm_last_trigger:
+    name: "Alarm Last Trigger"
+  alarm_last_trigger_time:
+    name: "Alarm Last Trigger Time"
+  alarm_trigger:
+    name: "Alarm Trigger"
+  # Dashboard power (dbc:*, nRF >= v2.11.0-ls). Does not change the vehicle state.
+  dbc_power:
+    name: "DBC Power"
+  dbc_ready:
+    name: "DBC Ready"
   # OTA control switches (always start OFF each boot; no scooter write).
   # OTA Stage Only: transfers run fully but stop before COMPLETE (staging test, nothing installed).
   ota_stage_only:
@@ -276,7 +290,14 @@ librescoot_ble_client:
   # latest, MDB-first), waiting out each reboot, then switch itself off when everything is up to date.
   ota_auto_update:
     name: "OTA Auto Update"
-  # Arm/disarm are buttons: the scooter offers no way to read the armed state back.
+  # Merge a run of consecutive deltas into one artifact, so a scooter several releases behind needs
+  # one install and one reboot instead of several. The merge runs on the Home Assistant relay, so
+  # this only takes effect with OTA Update Method "delta" and a reachable relay; the switch refuses
+  # to turn on otherwise. It does not save bytes - a merged patch is usually larger than the steps
+  # it replaces.
+  ota_delta_chaining:
+    name: "OTA Update Method delta-chaining"
+  # Arm/disarm buttons: kept for firmware without the alarm service (the switch above needs it).
   alarm_arm:
     name: "Alarm Arm"
   alarm_disarm:
@@ -307,8 +328,8 @@ librescoot_ble_client:
   # (complete .mender image, hundreds of MB — an overnight transfer on this hardware).
   ota_update_method:
     name: "OTA Update Method"
-  # OTA byte source: "direct GitHub" or "HA relay". Default is chip-based (this ESP32-classic → HA
-  # relay; it can't do the GitHub-CDN RSA-4096 handshake while BLE is active); persisted in NVS.
+  # OTA byte source: "direct GitHub" (this ESP fetches from GitHub itself) or "HA relay" (Home
+  # Assistant serves the bytes). Default is chip-based (this S3 → direct GitHub); persisted in NVS.
   ota_source:
     name: "OTA Source"
 

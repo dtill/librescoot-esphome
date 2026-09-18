@@ -57,15 +57,28 @@ AUTO_LOAD = [
     "event",
 ]
 
-def _final_validate(config):
-    """Enable the API's dynamic service registration when an API is configured.
+def _yaml_has(section: str, key: str) -> bool:
+    """Whether the user's YAML sets `key` under `section` (defaults filled by validation don't count)."""
+    raw = CORE.raw_config or {}
+    sect = raw.get(section)
+    return isinstance(sect, dict) and key in sect
 
-    The component registers its services from C++, which needs that support compiled in. Without an
-    API block there are no services; the entities work either way.
+
+def _final_validate(config):
+    """Board policy that lives in other components' config, plus the API service registration.
+
+    The component registers its services from C++, which needs `custom_services` compiled in. On a
+    board without PSRAM it also keeps the native API lean: every state message goes out on its own
+    (one big batched allocation is what fails during a transfer). An explicit `batch_delay` in the
+    YAML is left alone.
     """
-    api_config = fv.full_config.get().get("api")
+    full = fv.full_config.get()
+    lean = "psram" not in full  # CORE.config is not populated yet at this stage
+    api_config = full.get("api")
     if api_config is not None:
         api_config["custom_services"] = True
+        if lean and not _yaml_has("api", "batch_delay"):
+            api_config["batch_delay"] = cv.TimePeriodMilliseconds(milliseconds=0)
     return config
 
 
@@ -223,6 +236,59 @@ def _heap_rich() -> bool:
     return "psram" in CORE.config
 
 
+def _sdk_default(name: str, value) -> None:
+    """Set an ESP-IDF sdkconfig value unless the YAML's `sdkconfig_options` already names it."""
+    yaml_opts = CORE.config.get("esp32", {}).get("framework", {}).get("sdkconfig_options", {})
+    if name in yaml_opts:
+        return
+    esp32.add_idf_sdkconfig_option(name, value)
+
+
+def _apply_board_tuning(use_cert_bundle: bool) -> None:
+    """The sdkconfig this component needs on each board, so the YAML only says what hardware it is.
+
+    Both boards: a small mbedTLS footprint — only short requests are ever sent, the large input
+    buffer stays for the CDN's TLS records.
+    ESP32-S3: force the legacy LE Create Connection. The tracker stops the scan and connects at
+    once, which the BLE-5 extended connect rejects mid scan-disable ("Cmd Disallowed" → status 133
+    in a loop). 2M PHY / extended advertising are unused here; MTU 247 and DLE are unaffected.
+    With PSRAM: let an internal-heap allocation fall back to PSRAM (the RSA-4096 CDN handshake).
+    Without PSRAM: trade Wi-Fi/LwIP bandwidth the BLE-bound pipeline never uses for internal RAM
+    (measured +22 kB free during a transfer), and leave the 100 kB certificate bundle out unless
+    it was asked for — the component pins the GitHub roots itself.
+    """
+    _sdk_default("CONFIG_MBEDTLS_DYNAMIC_BUFFER", True)
+    _sdk_default("CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN", 4096)
+    _sdk_default("CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN", True)
+    try:
+        variant = esp32.get_esp32_variant()
+    except Exception:  # noqa: BLE001 - be safe if the variant can't be determined
+        variant = ""
+    if variant == "ESP32S3":
+        _sdk_default("CONFIG_BT_BLE_50_FEATURES_SUPPORTED", False)
+    if _heap_rich():
+        _sdk_default("CONFIG_SPIRAM_TRY_ALLOCATE_WHEN_FAIL", True)
+        return
+    if not use_cert_bundle:
+        _sdk_default("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", False)
+    # BLE connection slots: esp32_ble reserves three by default and each one costs controller and
+    # host RAM. Reserve what is registered (this client, plus any other ble_client), unless the YAML
+    # sets max_connections itself. esp32_ble has already written its own value by now; last wins.
+    if not _yaml_has("esp32_ble", "max_connections"):
+        from esphome.components.esp32_ble import KEY_ESP32_BLE, KEY_USED_CONNECTION_SLOTS
+        used = len(CORE.data.get(KEY_ESP32_BLE, {}).get(KEY_USED_CONNECTION_SLOTS, []))
+        slots = max(1, used)
+        esp32.add_idf_sdkconfig_option("CONFIG_BTDM_CTRL_BLE_MAX_CONN", slots)
+        esp32.add_idf_sdkconfig_option("CONFIG_BT_ACL_CONNECTIONS", slots + 1)
+    _sdk_default("CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM", 4)
+    _sdk_default("CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM", 8)
+    _sdk_default("CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM", 8)
+    _sdk_default("CONFIG_ESP_WIFI_AMPDU_RX_ENABLED", False)
+    _sdk_default("CONFIG_ESP_WIFI_AMPDU_TX_ENABLED", False)
+    _sdk_default("CONFIG_LWIP_TCP_SND_BUF_DEFAULT", 2880)
+    _sdk_default("CONFIG_LWIP_TCP_WND_DEFAULT", 2880)
+
+
 # yaml_key -> (setter, kind_enum, entity_category, icon, restore_mode)
 # restore_mode "DISABLED" is mandatory for anything that commands the scooter: ALWAYS_OFF issues a
 # write_state(false) during setup, which for these would mean sending a command to the vehicle on
@@ -373,7 +439,8 @@ CONFIG_SCHEMA = cv.All(
             #   use_cert_bundle → the ESP-IDF Mozilla bundle (auto-enables the sdkconfig option;
             #     needs PSRAM headroom — the S3, not the classic);
             #   ca_certificate  → explicit PEM root/chain; else the built-in GitHub roots are used.
-            cv.Optional(CONF_USE_CERT_BUNDLE, default=False): cv.boolean,
+            # Default: on with PSRAM (direct GitHub needs the Mozilla roots), off without.
+            cv.Optional(CONF_USE_CERT_BUNDLE): cv.boolean,
             cv.Optional(CONF_CA_CERTIFICATE): cv.string,
             # Case-insensitive substring an advertised BLE name must contain to count as a scooter
             # for the `discovered_scooters` sensor / the HA integration's new-scooter picker.
@@ -431,7 +498,7 @@ async def to_code(config):
     # the shown target's changelog is fetched separately from /tags/<tag> either way.
     cg.add_define("LSC_GH_PER_BODY", 300 if _rich else 0)
     # Worker stack: verifying against the Mozilla cert bundle needs more than a pinned certificate.
-    cg.add_define("LSC_GH_TASK_STACK", 16384 if config[CONF_USE_CERT_BUNDLE] else 8192)
+    cg.add_define("LSC_GH_TASK_STACK", 16384 if config.get(CONF_USE_CERT_BUNDLE, _rich) else 8192)
     # The byte producer needs a TLS-capable stack only where it can reach GitHub directly.
     # Without PSRAM that option does not exist and it always streams plain HTTP off the relay.
     cg.add_define("LSC_OTA_TASK_STACK", 8192 if _direct_github_ok() else 4096)
@@ -457,10 +524,12 @@ async def to_code(config):
     if hasattr(esp32, "include_builtin_idf_component"):
         esp32.include_builtin_idf_component("esp_http_client")
         esp32.include_builtin_idf_component("esp-tls")
-    cg.add(var.set_use_cert_bundle(config[CONF_USE_CERT_BUNDLE]))
-    if config[CONF_USE_CERT_BUNDLE]:
-        # Enabling the bundle option from YAML pulls in the Mozilla roots (no pinned cert needed).
+    use_cert_bundle = config.get(CONF_USE_CERT_BUNDLE, _heap_rich())
+    cg.add(var.set_use_cert_bundle(use_cert_bundle))
+    if use_cert_bundle:
+        # The bundle pulls in the Mozilla roots (no pinned cert needed).
         esp32.add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)
+    _apply_board_tuning(use_cert_bundle)
     if CONF_CA_CERTIFICATE in config:
         cg.add(var.set_ca_certificate(config[CONF_CA_CERTIFICATE]))
     cg.add(var.set_scooter_filter(config[CONF_SCOOTER_FILTER]))

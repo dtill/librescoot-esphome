@@ -142,62 +142,46 @@ librescoot_ble_client:
 | `link_auto_hold` | time, `3min` | For the **`auto`** BLE Link Mode: hold the connection this long, then release it for ~20 s so a phone / other central gets a turn on the single slot. `0s` = pure failover (never yield proactively). |
 | `dbc_auto_power` | bool, `false` | After a DBC (dashboard) update has been installed, switch the dashboard on so the update applies and its new version can be read — no ride needed (the scooter powers it off again by itself in stand-by). Needs scooter firmware with nRF `v2.11.0-ls` or newer. |
 | `ota_source_default` | `github` / `relay`, optional | Default OTA byte source. Omitted → **chip-based** (ESP32-S3 → `github`, every other chip → `relay`). The runtime **OTA Source** select overrides it and is persisted in NVS. |
-| `use_cert_bundle` | bool, `false` | Validate GitHub HTTPS against the ESP-IDF **Mozilla bundle** instead of the pinned roots (auto-enables `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`). Use on **PSRAM boards** for autonomous direct-GitHub downloads. |
+| `use_cert_bundle` | bool, default = PSRAM present | Validate GitHub HTTPS against the ESP-IDF **Mozilla bundle** instead of the pinned roots (auto-enables `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`). On with PSRAM (direct-GitHub downloads), off without. |
 | `ca_certificate` | string, optional | Explicit PEM root/chain for GitHub HTTPS (alternative to the bundle). |
 | `firmware_source` | string, optional | Compile-time default byte source (e.g. a local mirror); the **OTA Source URL** entity still overrides at runtime. |
 | `scooter_filter` | string, `scooter` | Case-insensitive substring an advertised BLE name must contain to count as a scooter in the scan. |
 
-**Certificates come from YAML, not the component.** With neither `use_cert_bundle` nor
-`ca_certificate` set, the two pinned GitHub roots in `github_ca.h` are the built-in fallback
-(the classic uses this). On an **ESP32-S3 with PSRAM** the whole thing runs autonomously —
-pairing and direct-from-GitHub OTA with no Home Assistant relay — with just `use_cert_bundle:
-true` (plus `psram:` and `flash_size: 16MB` in the YAML). Do **not** set
-`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC` (it stalls the update check); PSRAM is only needed for the
-handshake — transfers **stream** through a small ring buffer regardless of image size.
+**Certificates follow the board.** With PSRAM the Mozilla bundle is used and the whole thing
+runs autonomously — pairing and direct-from-GitHub OTA with no Home Assistant relay — with
+nothing but `psram:` in the YAML. Without PSRAM the two pinned GitHub roots in `github_ca.h`
+are used and the bundle is left out of the build. `use_cert_bundle` / `ca_certificate` override
+either. Do **not** set `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC` (it stalls the update check); PSRAM
+is only needed for the handshake — transfers **stream** through a small ring buffer regardless
+of image size.
 
 Staging without installing is the **OTA Stage Only** switch, not a YAML option — it is
 toggleable at runtime and survives no reboot by design.
 
 ### Boards without PSRAM
 
-The component adapts its memory footprint at compile time, so no configuration is required. On a
-board without PSRAM it uses a smaller download-task stack, a 120-byte OTA chunk with a
-correspondingly smaller ring buffer, and a shorter changelog. Transfers still stream, so image size
-remains irrelevant to RAM.
+The component adapts to the board at compile time, so the same YAML works on an ESP32 classic
+and on an ESP32-S3 with PSRAM — only the `esp32:`/`psram:` hardware lines differ. What it decides
+for you:
 
-What such a board *does* need is headroom in the native API, because ESPHome collects state
-messages into one large contiguous allocation and a failed allocation cannot be recovered from:
+| | with PSRAM | without PSRAM |
+| :--- | :--- | :--- |
+| Firmware byte source (default) | direct from GitHub | Home Assistant relay |
+| GitHub TLS roots | Mozilla bundle (`use_cert_bundle: true`) | the two GitHub roots pinned in the component; the 100 kB bundle is left out |
+| OTA chunk / ring buffer, download-task stack, changelog length | full size | smaller |
+| Native API | default batching | `batch_delay: 0ms` — one big batched allocation is what fails during a transfer |
+| BLE connection slots | ESPHome default (3) | as many as are registered (normally 1) |
+| Wi-Fi / LwIP buffers | ESPHome defaults | trimmed (static RX 4, dynamic RX/TX 8, AMPDU off, TCP window 2880) — bandwidth the BLE-bound transfer never uses, ~22 kB of internal RAM back |
+| mbedTLS | small output/asymmetric buffers on both (only short requests are sent) | |
+| ESP32-S3 | legacy BLE connect (`CONFIG_BT_BLE_50_FEATURES_SUPPORTED: n`) — the BLE-5 extended connect loops on status 133 with this scooter | — |
 
-```yaml
-api:
-  batch_delay: 0ms      # send each state message on its own
-```
+Anything you set yourself in `esp32: framework: sdkconfig_options:`, `api: batch_delay:` or
+`esp32_ble: max_connections:` wins over these defaults.
 
-That alone is not enough for a long transfer with all entities enabled: a client connecting to
-the API while the transfer runs (Home Assistant reconnecting, for instance) sends every entity's
-current state at once, and on a board this tight that burst can still fail. Give the board room
-by turning off what it does not need — most of the default Wi-Fi and Bluetooth buffers are sized
-for bandwidth the BLE link can never use — and leave the `web_server` out:
-
-```yaml
-esp32:
-  framework:
-    sdkconfig_options:
-      CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "4"
-      CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM: "8"
-      CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM: "8"
-      CONFIG_ESP_WIFI_AMPDU_RX_ENABLED: n
-      CONFIG_ESP_WIFI_AMPDU_TX_ENABLED: n
-      CONFIG_LWIP_MAX_SOCKETS: "8"
-      CONFIG_LWIP_TCP_SND_BUF_DEFAULT: "2880"
-      CONFIG_LWIP_TCP_WND_DEFAULT: "2880"
-esp32_ble:
-  max_connections: 1    # the scooter is the only central
-```
-
-Measured on an ESP32 classic during a 4 MB transfer: free heap went from ~18 kB to ~40 kB, and
-the largest free block from 16 kB to 37 kB. Wi-Fi throughput drops, which only affects how fast
-the ESP's own firmware uploads.
+Two things stay a YAML decision on a board without PSRAM: leave `web_server` out (its task and
+buffers come out of the same internal RAM a transfer needs; Home Assistant shows everything it
+would), and keep the entity list to what you use — a client connecting to the API sends every
+entity's state at once.
 
 Symptom if the margin is too thin: the device restarts mid-transfer, or stops accepting new API
 connections and Home Assistant reports the connection as dropped immediately after the handshake.
