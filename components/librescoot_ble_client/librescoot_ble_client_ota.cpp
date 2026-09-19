@@ -334,15 +334,23 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
           ESP_LOGI(OTAG, "stage-only: all %u bytes acked, stopping before COMPLETE", (unsigned) this->ota_total_);
           this->ota_finish_(true);
         } else {
-          const uint8_t c = 0x03;  // COMPLETE -> scooter verifies SHA-256 and queues the install
-          this->write_now_(CharId::OTA_CONTROL, &c, 1);
           this->ota_set_state_(OtaState::COMPLETING);
           // The upload is over; only the scooter-side install is still running. Park the speeds now
           // instead of leaving them frozen at the last streaming value for the whole install.
           this->ota_park_rates_();
           if (this->ota_eta_ != nullptr)
             this->ota_eta_->publish_state("00:00:00");
-          ESP_LOGW(OTAG, "all bytes acked -> COMPLETE (installing)");
+          // A DBC install is a handoff to the dashboard: queued while the dashboard is off, the
+          // scooter drops it straight back to idle without a word. Power it on first where we can;
+          // its on-wait reply sends COMPLETE (ota_send_complete_), the COMPLETING timeout is the
+          // fallback if that reply never comes.
+          if (this->ota_component_ == 1 && this->dbc_present_ && this->dbc_auto_power_) {
+            this->ota_complete_pending_ = true;
+            ESP_LOGW(OTAG, "all bytes acked -> powering the dashboard on before COMPLETE");
+            this->send_ext_query_("dbc:on-wait");
+          } else {
+            this->ota_send_complete_();
+          }
         }
       }
       break;
@@ -419,8 +427,14 @@ void LibrescootBleClient::ota_step_() {
         this->ota_fail_("download failed");
       break;
     case OtaState::COMPLETING:
-      if (now - this->ota_state_ms_ > 30000)
-        this->ota_fail_("COMPLETE_ACK timeout");
+      if (now - this->ota_state_ms_ > 30000) {
+        if (this->ota_complete_pending_) {
+          ESP_LOGW(OTAG, "dashboard on-wait unanswered — sending COMPLETE anyway");
+          this->ota_send_complete_();
+        } else {
+          this->ota_fail_("COMPLETE_ACK timeout");
+        }
+      }
       break;
     case OtaState::INSTALLING:
       // No-progress timeout: the on-scooter install can take ~10 min (verify + install), so only
@@ -1347,6 +1361,15 @@ void LibrescootBleClient::ota_handle_disconnect_() {
   }
 }
 
+// COMPLETE: the scooter verifies the SHA-256 of the staged bundle and queues the install.
+void LibrescootBleClient::ota_send_complete_() {
+  this->ota_complete_pending_ = false;
+  const uint8_t c = 0x03;
+  this->write_now_(CharId::OTA_CONTROL, &c, 1);
+  this->ota_state_ms_ = millis();  // COMPLETE_ACK timeout counts from here
+  ESP_LOGW(OTAG, "COMPLETE sent (installing)");
+}
+
 void LibrescootBleClient::ota_set_state_(OtaState s) {
   this->ota_state_ = s;
   this->ota_state_ms_ = millis();
@@ -1489,6 +1512,7 @@ void LibrescootBleClient::ota_learn_rate_(uint32_t moved, uint32_t dt_ms) {
 
 void LibrescootBleClient::ota_finish_(bool ok) {
   this->ota_producer_run_ = false;  // ask the download task to stop; buffer freed in ota_step_
+  this->ota_complete_pending_ = false;
   // Flush the final partial window into the lifetime byte counter and the target-transferred
   // sensor, then park the two speed sensors at 0 (a transfer is no longer running).
   this->ota_park_rates_();

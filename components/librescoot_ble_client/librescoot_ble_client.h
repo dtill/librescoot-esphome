@@ -425,6 +425,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void ota_step_();                        // BLE consumer, driven from loop()
   void ota_publish_rates_();               // 10 s throughput/byte sensors, only while streaming
   void ota_park_rates_();                  // flush the last window and park the speed sensors at 0
+  void ota_send_complete_();               // COMPLETE to the scooter (verify + queue the install)
   void ota_send_data_();                   // send windowed DATA chunks from the ring buffer
   void ota_handle_status_(uint8_t *data, uint16_t len);  // OTA_STATUS dispatch into the FSM
   bool ota_write_data_(uint32_t offset, const uint8_t *data, uint16_t len);
@@ -559,6 +560,13 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   bool dbc_autopower_active_{false};  // an on-wait is out or the dashboard is on because of us
   bool dbc_autopower_was_off_{false}; // power off again afterwards only if we switched it on
   uint8_t dbc_autopower_tries_{0};
+  bool dbc_version_probe_{false};     // auto-update powered the dashboard on to learn its version
+  uint32_t dbc_probe_ms_{0};          // last fresh-version fetch round
+  uint32_t dbc_dash_ok_ms_{0};        // last dbc:on-wait:ok — versions seen after it are the dashboard's own
+  // Freshness for unattended decisions: when each version was last fetched live, when the scooter
+  // last booted, when auto-update was switched on.
+  uint32_t mdb_version_seen_ms_{0}, dbc_version_seen_ms_{0}, scooter_boot_ms_{0};
+  uint32_t ota_auto_armed_ms_{0};
   void handle_dbc_response_(const std::string &line);
   void dbc_autopower_finish_();
   binary_sensor::BinarySensor *maps_available_{nullptr}, *nav_available_{nullptr};
@@ -806,6 +814,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   bool ota_congested_{false};
   int ota_rewinds_{0};
   uint32_t ota_state_ms_{0};             // for phase timeouts
+  bool ota_complete_pending_{false};     // all bytes acked; COMPLETE waits for the dashboard's on-wait
   uint32_t ota_last_ack_ms_{0};
   uint32_t ota_start_ms_{0};             // throughput
   uint32_t ota_last_report_ms_{0};       // status/log throttle (interval scales with file size)

@@ -1,115 +1,61 @@
-# Librescoot-BLE-Client (`librescoot_ble_client`)
+# Librescoot-BLE-Client
 
-An ESPHome external component that connects to the **LibreScoot / unu Scooter Pro** firmware
-through the nRF52 BLE chip and controls the most common phone-app functions and a little more —
-exposing every scooter characteristic as a Home Assistant entity.
+An ESPHome component that connects an ESP32 to your **unu Scooter Pro (LibreScoot firmware)**
+over Bluetooth and puts the scooter into Home Assistant: lock, blinkers, seatbox, alarm,
+batteries, odometer — and **firmware updates for the scooter**, over Bluetooth, from the
+LibreScoot GitHub releases.
 
-Unlike the pure-YAML `ble_client` configuration, this component **owns the BLE client
-itself** — the connection, the passkey pairing flow, every characteristic parser, the
-extended-command engine, the BLE link manager and the full **BLE-OTA firmware-transfer
-engine** all live in C++. The YAML only *names* the entities it wants.
+**You need:** ESPHome 2026.9 or newer · an ESP32 or ESP32-S3 · a scooter on LibreScoot firmware ·
+for firmware updates on a plain ESP32 the
+[Home Assistant integration](../../homeassistant-integration/README.md).
 
-Protocol reference: <https://reference.librescoot.org/latest/bluetooth/>
+## Contents
+
+- [Quick start](#quick-start) — [Flash](#1-flash) · [Pair](#2-pair) · [Done](#3-done)
+- [Configuration](#configuration)
+- [Pairing](#pairing)
+- [Controls](#controls)
+- [Sensors](#sensors)
+- [Bluetooth link](#bluetooth-link)
+- [Alarm](#alarm)
+- [Dashboard power](#dashboard-power)
+- [OTA Updates](#ota-updates) — [Install the next release](#install-the-next-release) ·
+  [Update unattended](#update-unattended-ota-auto-update) · [A specific version](#a-specific-version) ·
+  [Delta or full](#delta-or-full) · [Chained delta updates](#chained-delta-updates) ·
+  [Direct GitHub download (ESP32-S3)](#direct-github-download-esp32-s3) · [Entities](#ota-entities) ·
+  [When something goes wrong](#when-something-goes-wrong)
+- [Command](#command)
+- [Under the hood](#under-the-hood)
 
 ---
 
 ## Quick start
 
-### 1. Flash it
+### 1. Flash
 
-Put your Wi-Fi, an API key and the scooter's Bluetooth MAC into `secrets.yaml`, then flash once
-over USB — from then on the ESP updates itself over Wi-Fi:
+1. Copy [`librescoot-ble-client-example.yaml`](../../librescoot-ble-client-example.yaml).
+2. Put your Wi-Fi, an API key and the scooter's Bluetooth MAC into `secrets.yaml`.
+3. `esphome run librescoot-ble-client-example.yaml` — once over USB. Later updates go over Wi-Fi.
+4. Home Assistant finds the ESP by itself: *Settings → Devices & Services → ESPHome → Add*.
 
-```bash
-esphome run librescoot-ble-client-example.yaml
-```
+### 2. Pair
 
-The example config is [`librescoot-ble-client-example.yaml`](../../librescoot-ble-client-example.yaml)
-at the repository root.
+Switch the scooter **on and unlock it**. You need to see its dashboard.
 
-Add the ESP to Home Assistant (*Settings → Devices & Services → ESPHome*; it is discovered on its
-own). **Control and every sensor work from this point without the companion integration.**
+1. Press **BLE Pairing Start**.
+2. After 10–15 s the dashboard shows a **6-digit code**.
+3. Type it into **BLE Pairing Passkey** and press **BLE Pairing Send Passkey** — within 30 s.
 
-### 2. Pair with the scooter
+**BLE Pairing Required** goes to *OK*: paired. The ESP now reconnects on its own, also after new
+ESPHome builds.
 
-The scooter must be **on and unlocked**, and you need to see its dashboard — the code appears there.
+If it did not work: the code expired (the dashboard shows a new one — use that) · the code was
+wrong (the field is cleared, try again) · the scooter was off or asleep (switch it on first).
 
-1. Press **BLE Pairing Start**. This is the only thing that starts pairing: the component never
-   pairs on its own, and while unbonded it does not even take the link, so the scooter is never
-   pushed into displaying a code nobody asked for.
-2. Read the **6-digit code** off the dashboard (10–15 s until it shows).
-3. Type it into **BLE Pairing Passkey**.
-4. Press **BLE Pairing Send Passkey**.
+### 3. Done
 
-**The pairing session expires about 30 seconds after the code appears** — do steps 2–4 in one go.
-If it expires the scooter shows a *new* code and the old one is dead; a rejected code is discarded
-rather than retried, and the field clears itself for the next attempt. **BLE Pairing Required**
-turns *OK* only once the scooter really is in the controller's bond list, so it never reports
-success early. Failures are logged in words, not as a numeric status — `wrong passkey`,
-`no response (SMP timeout)`, `scooter says pairing not supported — it is not in a pairing-capable
-state`.
-
-The companion Home Assistant integration offers the same four steps as a guided Repair dialog,
-driving these very entities.
-
-### 3. Update the scooter's firmware
-
-> **On an ESP32 classic this needs the companion Home Assistant integration.** That board has no
-> PSRAM and cannot hold the GitHub-CDN TLS session next to the Bluetooth stack, so Home Assistant
-> downloads the release and serves the bytes over plain HTTP on the local network. An **ESP32-S3**
-> downloads straight from GitHub and can use the relay just as well — **OTA Source** switches
-> between them at runtime. Everything *except* the firmware download works without the integration
-> on both boards.
-
-1. **OTA channel** → `stable` / `testing` / `nightly`.
-2. **OTA Update Method** → `full` (complete image, always applies) or `delta` (small patch, valid
-   only against the immediately preceding release — the component reads the patch's own base out of
-   the archive before transferring and refuses a mismatch).
-3. When a release is available, **OTA MDB Update** / **OTA DBC Update** offer it with the release
-   notes. Press **Install**, or the **OTA … Install** button (which ignores the idle gate).
-4. The two boards install **one at a time** and the scooter **reboots after each**; the component
-   waits that out and then offers the next. Follow along on **OTA Status**, **OTA Upload ETA** and
-   the throughput sensors. A transfer survives the scooter driving off and coming back — it resumes
-   from the staged offset.
-
-Nothing installs by itself. **OTA Stage Only** transfers everything but stops short of installing;
-**OTA Auto Update** walks a chain unattended and switches itself off when everything is current or
-on the first failure.
-
----
-
-## Installation
-
-```yaml
-external_components:
-  - source: github://dtill/librescoot-esphome
-    components: [librescoot_ble_client]
-```
-
-Or from a local checkout, pointing at the directory that *contains* `librescoot_ble_client/`:
-
-```yaml
-external_components:
-  - source:
-      type: local
-      path: components
-    components: [librescoot_ble_client]
-```
-
-A ready-made config is [`librescoot-ble-client-example.yaml`](../../librescoot-ble-client-example.yaml)
-in the repository root.
-
-### Required BLE plumbing (stack-level, stays in YAML)
-
-```yaml
-esp32_ble:
-esp32_ble_tracker:
-```
-
-Nothing pairing-related belongs in the YAML. The component applies the passkey capability
-(keyboard-only IO, secure connections with MITM, bonding) to the BLE stack itself, and registers
-the `<node>_passkey_reply` service from C++ — so bonding cannot be broken by an omitted option, and
-it works whether or not an `api:` block is present.
+All entities you named in the YAML are on the ESP's device page in Home Assistant. Controls work
+immediately; the update entities fill in after the first release check (a few minutes).
 
 ---
 
@@ -119,572 +65,328 @@ it works whether or not an `api:` block is present.
 librescoot_ble_client:
   id: librescoot_ble_client_hub
   mac_address: !secret librescoot_nrf_ble_mac_addr
-  time_id: sntp_time               # optional, enables the clock-set entities
+  time_id: sntp_time          # optional, for the clock-set entities
 
   status:
     name: "Status"
   odometer:
     name: "Odometer"
-  # ... only the entities you name are created ...
+  # … an entity exists only if you name it
 ```
 
-| Option | Type | Description |
+| Option | Default | Meaning |
 | :--- | :--- | :--- |
-| `id` | ID | Component id (referenced by the component's automation actions). |
-| `mac_address` | MAC, **required** | The scooter's nRF BLE MAC address. |
-| `time_id` | ID, optional | A `time` source (e.g. `sntp`); required only for **System Time sync with ESP** and **System Time Set UTC ISO-8601**. |
-| `github_repo` | string, `librescoot/librescoot` | Owner/name the firmware releases come from. |
-| `update_check_interval` | time, `6h` | How often to poll GitHub for a newer release. |
-| `github_token` | string, optional | Fine-grained GitHub token (public repo, read-only). Lifts the API rate limit from 60 to 5000 requests/hour. Keep it in `secrets.yaml`. Used for release metadata only — never sent with the asset download, which redirects to a different host. |
-| `ota_auto_resume` | bool, `true` | Recover a failed transfer by resuming from the offset the scooter already staged, instead of aborting the update. |
-| `presence_timeout` | time, `60s` | **BLE Presence** stays Home if an advert was seen within this window. |
-| `link_interval` | time, `5min` | For the **`interval`** BLE Link Mode: how often to connect, refresh every sensor once, then release the link again. |
-| `link_auto_hold` | time, `3min` | For the **`auto`** BLE Link Mode: hold the connection this long, then release it for ~20 s so a phone / other central gets a turn on the single slot. `0s` = pure failover (never yield proactively). |
-| `dbc_auto_power` | bool, `true` | After a DBC (dashboard) update has been installed, switch the dashboard on so the update applies and its new version can be read — no ride needed (the scooter powers it off again by itself in stand-by). Needs scooter firmware with nRF `v2.11.0-ls` or newer; does nothing on older firmware. |
-| `ota_source_default` | `github` / `relay`, optional | Default OTA byte source. Omitted → **chip-based** (ESP32-S3 → `github`, every other chip → `relay`). The runtime **OTA Source** select overrides it and is persisted in NVS. |
-| `use_cert_bundle` | bool, default = PSRAM present | Validate GitHub HTTPS against the ESP-IDF **Mozilla bundle** instead of the pinned roots (auto-enables `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`). On with PSRAM (direct-GitHub downloads), off without. |
-| `ca_certificate` | string, optional | Explicit PEM root/chain for GitHub HTTPS (alternative to the bundle). |
-| `firmware_source` | string, optional | Compile-time default byte source (e.g. a local mirror); the **OTA Source URL** entity still overrides at runtime. |
-| `scooter_filter` | string, `scooter` | Case-insensitive substring an advertised BLE name must contain to count as a scooter in the scan. |
+| `mac_address` | required | The scooter's Bluetooth MAC. |
+| `time_id` | — | A `time` source. Needed only for **System Time sync with ESP** and **System Time Set UTC ISO-8601**. |
+| `update_check_interval` | `6h` | How often to look for a new release. |
+| `github_token` | — | Optional GitHub token (read-only). Lifts the release-check limit from 60 to 5000 per hour. |
+| `dbc_auto_power` | `true` | Switch the dashboard on when a dashboard update needs it: to hand the update over, to apply it, and to read its version. |
+| `link_auto_hold` | `3min` | Link mode `auto`: how long to hold the connection before letting a phone in for ~20 s. |
+| `link_interval` | `5min` | Link mode `interval`: how often to connect and refresh the sensors. |
+| `presence_timeout` | `60s` | How long **BLE Presence** stays on after the scooter was last heard. |
 
-**Certificates follow the board.** With PSRAM the Mozilla bundle is used and the whole thing
-runs autonomously — pairing and direct-from-GitHub OTA with no Home Assistant relay — with
-nothing but `psram:` in the YAML. Without PSRAM the two pinned GitHub roots in `github_ca.h`
-are used and the bundle is left out of the build. `use_cert_bundle` / `ca_certificate` override
-either. Do **not** set `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC` (it stalls the update check); PSRAM
-is only needed for the handshake — transfers **stream** through a small ring buffer regardless
-of image size.
-
-Staging without installing is the **OTA Stage Only** switch, not a YAML option — it is
-toggleable at runtime and survives no reboot by design.
-
-### Boards without PSRAM
-
-The component adapts to the board at compile time, so the same YAML works on an ESP32 classic
-and on an ESP32-S3 with PSRAM — only the `esp32:`/`psram:` hardware lines differ. What it decides
-for you:
-
-| | with PSRAM | without PSRAM |
-| :--- | :--- | :--- |
-| Firmware byte source (default) | direct from GitHub | Home Assistant relay |
-| GitHub TLS roots | Mozilla bundle (`use_cert_bundle: true`) | the two GitHub roots pinned in the component; the 100 kB bundle is left out |
-| OTA chunk / ring buffer, download-task stack, changelog length | full size | smaller |
-| Native API | default batching | `batch_delay: 0ms` — one big batched allocation is what fails during a transfer |
-| BLE connection slots | ESPHome default (3) | as many as are registered (normally 1) |
-| Wi-Fi / LwIP buffers | ESPHome defaults | trimmed (static RX 4, dynamic RX/TX 8, AMPDU off, TCP window 2880) — bandwidth the BLE-bound transfer never uses, ~22 kB of internal RAM back |
-| mbedTLS | small output/asymmetric buffers on both (only short requests are sent) | |
-| ESP32-S3 | legacy BLE connect (`CONFIG_BT_BLE_50_FEATURES_SUPPORTED: n`) — the BLE-5 extended connect loops on status 133 with this scooter | — |
-
-Anything you set yourself in `esp32: framework: sdkconfig_options:`, `api: batch_delay:` or
-`esp32_ble: max_connections:` wins over these defaults.
-
-Two things stay a YAML decision on a board without PSRAM: leave `web_server` out (its task and
-buffers come out of the same internal RAM a transfer needs; Home Assistant shows everything it
-would), and keep the entity list to what you use — a client connecting to the API sends every
-entity's state at once.
-
-Symptom if the margin is too thin: the device restarts mid-transfer, or stops accepting new API
-connections and Home Assistant reports the connection as dropped immediately after the handshake.
-
-Entity keys are **opt-in**: an entity is instantiated only if its key is present with a
-`name`. Each key accepts the usual entity options (`name`, `id`, `icon`, `entity_category`,
-`disabled_by_default`, …); sensible `entity_category`/`icon` defaults are baked in, so a
-bare `name:` is enough.
+Options for testing and special setups are listed under [Under the hood](#under-the-hood).
+The component configures everything board-specific itself; do not add `web_server` — it takes
+memory the firmware transfer needs, and Home Assistant shows everything it would.
 
 ---
 
 ## Pairing
 
-The component performs pairing internally, but **never unprompted**. A bonded scooter reconnects
-silently. While *not* bonded it does not take the link at all unless pairing was deliberately armed —
-connecting is what makes the scooter start pairing and display a passkey, and a code belonging to a
-session that is about to be refused only confuses whoever reads it off the dashboard. If the scooter
-has lost its side of the bond (a firmware update can reset it), an unrequested authentication attempt
-is refused and the link released rather than retried, and retries are spaced out instead of
-reconnecting within a second — back-to-back attempts are what push a peripheral into rate-limiting
-its pairing.
+The ESP never pairs by itself. It connects to a paired scooter silently and leaves an unpaired
+one alone until you press **BLE Pairing Start** — a code appears on the dashboard only when you
+asked for it.
 
-Re-bond deliberately:
+**Pair, or pair again after a lost bond:** the [three steps](#2-pair) from the quick start.
 
-1. Flash the config; add the device to Home Assistant via the ESPHome integration.
-2. Power the scooter into parked mode; you need to see its dashboard.
-3. Press **BLE Pairing Start** (or use the integration's pairing Repair). This clears any stale bond
-   and connects, so the scooter shows a passkey; **BLE Passkey Required** turns on.
-4. Type the 6-digit code into **BLE Pairing Passkey** and press **BLE Pairing Send Passkey**.
-5. The bond is stored on the ESP; future reconnects are automatic and need no passkey. Flashing new
-   firmware to the same chip keeps the bond.
+**Move to a new ESP:** press **BLE Pairing Delete** on the old ESP, remove the ESP in the scooter's
+phone app, then pair the new ESP. A scooter that still remembers the old ESP refuses the new one.
 
-**The pairing session expires ~30 s after the code appears.** That is the whole reason the passkey
-lives in a text field and a button on the ESP rather than behind a dialog: it has to be two taps. If
-it expires, the scooter shows a new code — the old one is dead, and the component discards a code
-the scooter rejected instead of resending it. The field starts empty and clears after every attempt.
-
-Failure reasons are decoded rather than printed as a number, which is what separates three
-otherwise identical-looking failures:
-
-| Log text | What it means |
-| :--- | :--- |
-| `wrong passkey` | The code was wrong, or expired before it arrived. |
-| `no response (SMP timeout)` | Nobody answered the prompt within the session window. |
-| `scooter says pairing not supported — it is not in a pairing-capable state` | The scooter is off or asleep. Switch it on. |
-| `too many attempts — the scooter is rate-limiting pairing` | Back off and wait a moment. |
-
-The component registers a `<node>_passkey_reply` service by itself whenever an `api:` block is
-present — no YAML wiring, nothing to forget. It takes a single `pin` argument and is what the
-companion integration falls back to when the entities are unavailable:
-
-```yaml
-# Home Assistant → Developer Tools → Actions
-action: esphome.<node>_passkey_reply
-data:
-  pin: 12345
-```
-
-For a YAML automation the `librescoot_ble_client.passkey_reply` action is also available:
-
-```yaml
-- librescoot_ble_client.passkey_reply:
-    id: librescoot_ble_client_hub
-    passkey: 12345
-```
-
-> Switching to a new ESP chip: press **BLE Pairing Delete** (enable it in HA first) *and*
-> remove the bond on the scooter, or the new chip cannot re-pair.
+| Entity | Type | Meaning | YAML key |
+| :--- | :--- | :--- | :--- |
+| BLE Pairing Start | button | Start pairing. | `pair_scooter` |
+| BLE Pairing Passkey | text | The code from the dashboard. Typing alone does not send it. | `ble_passkey` |
+| BLE Pairing Send Passkey | button | Send the code. | `ble_send_code` |
+| BLE Pairing Required | problem | *Problem*: scooter nearby but not paired. *OK*: paired and connected. | `pairing_required` |
+| BLE Passkey Required | problem | On while the dashboard shows a code. | `passkey_required` |
+| BLE Pairing Delete | button | Forget the scooter on the ESP. | `ble_remove_bond` |
+| BLE Scooter nRF MAC | text sensor | The scooter this ESP is configured for. | `scooter_mac` |
 
 ---
 
-## Entities
+## Controls
 
-All read entities become *unknown* while the BLE link is down and repopulate on reconnect.
-"Update" is the poll interval; `on connect` values are fetched once per connection over the
-extended-command channel, `on notify` are pushed by the scooter, `—` marks action/control
-entities with no periodic state. Reads are serialized (one GATT read in flight at a time)
-and every polled characteristic is read once immediately on connect.
-
-### Telemetry (read)
-
-| Key | Entity | Type | Update | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `status` | Status | text_sensor | 5 s | Operating state (`ready-to-drive`, `parked`, `stand-by`, …). |
-| `seatbox` | Seatbox | text_sensor | 5 s | Seatbox open/closed. |
-| `handlebar_lock` | Handlebar Lock | text_sensor | 5 s | Handlebar lock state. |
-| `power_state` | Power State | text_sensor | 5 s | Power-management state. |
-| `power_mux` | MDB Power Mux Selected Input | text_sensor | 600 s | Selected power input. |
-| `odometer` | Odometer | sensor (km) | 120 s | Total distance (from metres). |
-| `battery_1_soc` / `battery_2_soc` | Battery n SoC | sensor (%) | 60 s | Main battery charge (unknown when unplugged). |
-| `battery_1_cycles` / `battery_2_cycles` | Battery n Cycles | sensor | 600 s | Charge cycles (unknown when unplugged). |
-| `battery_1_state` / `battery_2_state` | Battery n State | text_sensor | 120 s | Battery state string (unknown when unplugged). |
-| `battery_1_present` / `battery_2_present` | Battery n Present | binary_sensor | 10 s | Slot occupied. |
-| `aux_voltage` | Aux Battery Voltage | sensor (V) | 60 s | 12 V aux battery voltage (u16 LE mV). |
-| `aux_level` | Aux Battery Level | sensor (%) | 60 s | Aux battery charge. |
-| `aux_charge_status` | Aux Charge Status | text_sensor | 120 s | Aux charge state. |
-| `cbb_level` | CBB Battery Level | sensor (%) | 60 s | Connectivity battery charge. |
-| `cbb_charge_status` | CBB Charge Status | text_sensor | 120 s | CBB charge state. |
-| `cbb_remaining` / `cbb_full` | CBB Remaining / Full Capacity | sensor (Ah) | 600 s | u32 LE µAh → Ah. |
-| `cbb_cell` | CBB Cell Voltage | sensor (V) | 120 s | u32 LE µV → V. |
-| `navigation_active` | Navigation Active | binary_sensor | 60 s | Navigation running. |
-| `ums_status` | MDB UMS Status | binary_sensor | 60 s | USB mass-storage active. |
-| `maps_available` | Navigation Maps Available | binary_sensor | on connect | Offline maps present. |
-| `navigation_available` | Navigation Available | binary_sensor | on connect | Navigation service available. |
-| `keycard_count` | Keycard Count | text_sensor | on connect | Registered keycards. |
-| `aux_charger` | Aux Charger | binary_sensor | on connect | Auxiliary-battery charger state. The charger's own Bluetooth service is absent from this firmware, so the state is read through the extended-command channel (`ltc:status`) when the link comes up. Read-only — the component never switches the charger. |
-
-### Versions
-
-| Key | Entity | Update | Description |
+| Entity | Type | Meaning | YAML key |
 | :--- | :--- | :--- | :--- |
-| `sw_mdb` | SW MDB | 1800 s + on connect | i.MX (MDB) version. |
-| `sw_nrf` | SW nRF | 1800 s + on connect | nRF52 firmware version. |
-| `sw_dbc` | SW DBC | on connect | Dashboard version (`status:version:dbc`). |
-| `sw_esp` | SW ESP | static | ESPHome build of this bridge. |
-
-### BLE link
-
-| Key | Entity | Type | Update | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `ble_connection` | BLE Connection | binary_sensor | 1 s | Connected to the scooter. |
-| `ble_presence` | BLE Presence | binary_sensor | 1 s | Connected, or advertisement seen while scanning. |
-| `rssi` | BLE RSSI | sensor (dBm) | live | Signal to the configured scooter. **Also updated while disconnected** — the advertisement RSSI is published (throttled) so you can see whether the scooter is in range before/without a connection (the connection-RSSI read only works while connected). |
-| `ble_link_mode` | BLE Link Mode | select | — | `disconnect` / `scan` / `auto` / `always` / `interval`; persisted across reboots. Any OTA in progress pins the link up. See **Link modes** below. |
-| `pairing_required` | BLE Pairing Required | binary_sensor (problem) | 2 s | **Tri-state.** `OK` only while connected **and** the scooter is in the controller's bond list; `Problem` while it is **in range but not bonded**; `unknown` otherwise (out of range, or not connected yet). A connection on its own is *not* proof of a bond — the link is established before authentication and stays up when pairing fails — so the bond list is what is asked. Drives the HA pairing Repair. |
-| `passkey_required` | BLE Passkey Required | binary_sensor (problem) | event | On while the scooter is displaying a passkey during an **armed** pairing (after **BLE Pairing Start**). |
-| `pair_scooter` | BLE Pairing Start | button | — | Arm a deliberate (re)pairing: clear any stale bond and connect so the scooter shows a passkey. The only trigger for fresh pairing. |
-| `ble_passkey` | BLE Pairing Passkey | text | — | Holds the code from the scooter dashboard. Entering it does **not** send — the button does. Starts empty, clears after each attempt. |
-| `ble_send_code` | BLE Pairing Send Passkey | button | — | Send the code currently in the field. |
-| `ble_remove_bond` | BLE Pairing Delete | button | — | Forget the bond on the ESP side (`disabled_by_default`). |
-| `scooter_mac` | BLE Scooter nRF MAC | text_sensor | on boot | The scooter MAC this ESP is configured for (`mac_address`), always shown — the HA integration reads it to preselect the connected scooter. |
-| `ha_integration` | OTA Source HA Relay | binary_sensor (connectivity) | 60 s | On = the Home Assistant **Librescoot-BLE-Client integration is active**, detected by pinging its plain-HTTP OTA relay (the `http://` OTA Source URL it sets). Off = no relay (autonomous/direct-GitHub, or the integration isn't installed). |
-
-**Link modes** (`ble_link_mode`):
-
-| Mode | Behaviour |
-| :--- | :--- |
-| `disconnect` | Stay disconnected. |
-| `scan` | Stay disconnected and scan for scooter advertisements (used by the HA "find scooter" flow). |
-| `auto` | Stay connected, but let go periodically: after holding for `link_auto_hold` (default **3 min**) the link is dropped for a ~20 s window so a phone (or any other central) can take the scooter's single slot; it also releases for that window after any disconnect. Set `link_auto_hold: 0s` for pure failover (hold until the link drops on its own). |
-| `always` | Stay connected; reconnect immediately. |
-| `interval` | Stay disconnected, but every `link_interval` (default **5 min**) connect, refresh **every** sensor once, then release the link again — low duty cycle, periodic fresh readings. |
-
-The component **never pairs unprompted.** A valid bond reconnects silently; a lost/stale bond
-(unrequested pairing) is refused and the link released rather than retried, so a scooter returning
-to range is never spammed with pairing requests. Fresh pairing is only ever triggered by the
-**BLE Pairing Start** button (or the HA pairing Repair).
-
-**OTA byte-source capability.** The component decides whether an OTA can even start: a plain-HTTP
-source (the HA relay, or a local mirror) must be **reachable** (the `ha_integration` ping); an
-`https://` source (GitHub) needs a working TLS path (`use_cert_bundle` / `ca_certificate` — a
-PSRAM board, since the classic can't do the RSA-4096 CDN handshake). If neither is available,
-**Install** is refused and a log line points at the HA integration — so on a classic without the
-integration you get a clear "install the HA integration or use an S3+PSRAM board" hint rather than
-a mid-transfer failure.
-
-**Link modes.** `always` keeps the link up and reconnects immediately. `auto` also keeps it up,
-but the scooter accepts only **one** central at a time, so `auto` deliberately *lets go*: after
-holding for `link_auto_hold` it drops the link for a ~20 s window (and does the same after any
-disconnect) so a phone (or any other central) can win the reconnect race and take the scooter,
-then it reconnects. `scan` keeps only the scanner running (presence, no connection); `disconnect`
-releases the radio entirely.
-
-**Connect-on-demand.** In `scan`/`disconnect` (or during an `auto` yield) the link is down,
-but triggering any control entity still works: the component transparently brings the link
-up, replays the action once connected, waits for the reply (a short window, longer while a
-command response is still arriving), then restores the configured mode — releasing the link
-again. Optimistic UI state updates immediately; the BLE write follows on connect.
-
-### Lock & controls
-
-| Key | Entity | Type | Description |
-| :--- | :--- | :--- | :--- |
-| `scooter_lock` | Scooter Lock | lock | Reflected from the operating state (`9a590021`): **UNLOCKED** for `parked`/`ready-to-drive`, **LOCKED** for everything else (`hibernating`/`booting`/`stand-by`/`hop-on`, unknown). Defaults LOCKED; never auto-unlocks (security). |
-| `blinker` | Blinker | select | `off` / `left` / `right` / `both`. |
-| `usb_mode` | MDB USB Mode | select | `Normal` / `Mass Storage`, reflected from UMS status. |
-| `seatbox_open` | Seatbox Open | button | Open the seatbox. |
-| `hibernate` / `wakeup` | Hibernate / Wakeup | button | Power management. |
-| `reboot_mdb` / `reboot_mdb_hard` | Reboot MDB / (hard) | button | Reboot the MDB. |
-
-### Alarm & navigation
-
-| Key | Entity | Type |
-| :--- | :--- | :--- |
-| `alarm_enabled` | Alarm Enabled | switch — shows the scooter's real setting, not just the last request |
-| `alarm_armed` | Alarm Armed | switch — arm / disarm, and shows whether the alarm is actually armed right now. Note: arming does nothing while the alarm is disabled; the switch snaps back |
-| `alarm_status` | Alarm Status | text sensor — `disabled`, `disarmed`, `delay-armed`, `armed`, `level-1-triggered`, `level-2-triggered`, `seatbox-access` |
-| `alarm_triggered` | Alarm Triggered | binary sensor (tamper) — on while the alarm is going off; the one to notify your phone with |
-| `alarm_trigger` | Alarm Trigger | **event** — fires once per trigger with what set it off: `motion`, `seatbox`, `handlebar_position`, `handlebar_lock`, `brake_left`, `brake_right`, `horn_button`, `seatbox_button`. A trigger that happened while the ESP was not connected is still delivered once it reconnects |
-| `alarm_last_trigger` / `alarm_last_trigger_time` | Alarm Last Trigger / … Time | text sensors — source and UTC time of the most recent trigger |
-| `alarm_arm` / `alarm_disarm` | Alarm Arm / Alarm Disarm | button — for firmware without the alarm state service |
-| `alarm_start` / `alarm_stop` | Alarm Start / Stop | button |
-
-Alarm state and triggers need scooter firmware with nRF `v2.11.0-ls` or newer. On older firmware
-the state entities stay *unknown*, `Alarm Armed` refuses to switch, and the log says so once per
-connect. To see triggers the moment they happen, keep the board's **BLE Link Mode** on `always`;
-with `auto` or `interval` you still get them on the next connect.
-| `navigation_set` | Navigation Set to | text (`lat,lon[,name]`) |
-| `navigation_clear` | Navigation Clear | button |
-| `cancel_hibernate` | Cancel Hibernate | button |
-| `dbc_power` | DBC Power | switch — dashboard power on/off, showing the real state. Does not unlock or change the vehicle state. Switching on takes ~15 s (the dashboard boots); off ~5 s. In stand-by the scooter switches the dashboard off again by itself after a short while. Needs nRF `v2.11.0-ls` or newer, otherwise it refuses |
-| `dbc_ready` | DBC Ready | binary sensor — the dashboard has booted and reports ready (off while it is powered off) |
-
-### Configuration
-
-| Key | Entity | Type | Description |
-| :--- | :--- | :--- | :--- |
-| `cellular_apn` | Cellular APN | text | Read back on connect; edit sends `set:cellular.apn`. |
-| `pm_scheduled_hibernate_enabled` | PM Scheduled Hibernation Enabled | switch | Read back on connect. |
-| `pm_scheduled_hibernate_cron` | PM Scheduled Hibernation Cron | text | Cron expression. |
-| `pm_scheduled_hibernate_duration` | PM Scheduled Hibernation Duration | text | e.g. `5h30m`. |
-| `ota_channel` | OTA channel | select | `undefined` / `stable` / `testing` / `nightly`. |
-
-### System, time & diagnostics
-
-| Key | Entity | Type | Description |
-| :--- | :--- | :--- | :--- |
-| `system_time_sync` | System Time sync with ESP | button | Set the clock to the ESP's SNTP time (needs `time_id`). |
-| `system_time_iso` | System Time Set UTC ISO-8601 | text | Set the clock from `2026-07-26T18:45:30Z`. |
-| `refresh` | A-Refresh Sensor States | button | Re-poll everything + re-run on-connect queries. |
-| `pair_scooter` | BLE Pairing Start | button | Arm a deliberate (re)pairing: clear any stale bond and connect so the scooter issues a passkey. The only trigger for fresh pairing. |
-| `ble_remove_bond` | BLE Pairing Delete | button | Remove the bond (set `disabled_by_default: true`). |
-| `restart_esp` | Restart ESPHome Device | button | Reboot the ESP bridge. |
-
-### Extended command
-
-The nRF exposes a text command channel (write `9a590401`, notify `9a590402`). The
-**Command** input sends an arbitrary string; the reply is collected with a terminator-aware
-engine (`:ok`, `:error:`, a standalone line, or a `…:count:<n>` header + *n* lines), 20 s
-timeout fallback.
-
-| Key | Entity | Type | Update | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `command` | Command | text | — | Arbitrary command (prefilled `cap:list`). |
-| `command_last_response` | Command last response | text_sensor | on command | Correlated reply (255-char HA limit). |
-| `command_response` | Command response | text_sensor | on notify | Raw notification feed. |
-
-### OTA diagnostics (service `9a590500`)
-
-| Key | Entity | Type | Update | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| `ota_status` | OTA Status | text_sensor | on notify | Decoded status (`Idle`, `Uploading MDB 45%`, `Installing — waiting for scooter reboot…`, `Pending reboot`, …). |
-| `ota_eta` | OTA Upload ETA | text_sensor | on progress | Estimated time remaining for the running upload (`HH:MM:SS`). |
-| `ota_status_request` | OTA Status Request | button | — | `STATUS_REQ`. |
-| `ota_abort` | OTA Abort | button | — | Abort the current session **and** drop the rest of the queue (so DBC doesn't start after aborting MDB), and cancel any wait for the post-install reboot. |
-| `reboot_required` | OTA Reboot Required | binary_sensor (problem) | 30 s while pending | On when the scooter has reported **pending-reboot for >20 min**. `device_class: problem`, shown by default. The HA integration raises a "restart the scooter" Repair from it. See below. |
-
-**Transfer telemetry.** These come from the component's own counters, not from the scooter's status
-characteristic, and are published only while a transfer is streaming — they park at 0 the moment the
-upload ends, so a finished upload never leaves a stale rate on display.
-
-| Key | Entity | Type | Description |
-| :--- | :--- | :--- | :--- |
-| `ota_dl_speed` | OTA Speed Download | sensor (kB/s) | HTTP → ring buffer (GitHub or the HA relay). |
-| `ota_ul_speed` | OTA Speed BLE Upload | sensor (kB/s) | Bytes the scooter has acknowledged. This is the one that matters — the Bluetooth link is the bottleneck, not the download. |
-| `ota_target_transferred` | OTA Target Transferred | sensor (B) | Acknowledged bytes of the running target. |
-| `ota_ble_bytes_total` | OTA BLE Bytes Total | sensor (B, `total_increasing`) | Lifetime bytes pushed over BLE. |
-| `ota_selfheal_resumes` | OTA Auto-Resume Count | sensor (`total_increasing`) | How often a stalled transfer healed itself. |
-| `ota_eta` | OTA Upload ETA | text_sensor | Remaining upload time, from the smoothed upload rate. The estimate before a transfer starts uses a rate the component **learns and keeps in NVS**, so it gets more accurate per link over time. |
-
-### Firmware update — two `update` entities, plus manual install (`update` service `9a590500`)
-
-The scooter is **two** independently-flashed boards: the **MDB** (the i.MX main computer,
-which also hosts the nRF/BLE receiver) and the **DBC** (the dashboard). Each is a Mender A/B
-image with its own version, and **the scooter reboots after installing either one** — so a
-single BLE session cannot flash both back-to-back. The component therefore exposes **one
-`update` entity per board** plus **one manual install button per board**:
-
-| Key | Entity | Type | Description |
-| :--- | :--- | :--- | :--- |
-| `mdb_update` | OTA MDB Update | update | MDB firmware check/install (i.MX version from `9a59a041`). |
-| `dbc_update` | OTA DBC Update | update | DBC firmware check/install (dashboard version from `status:version:dbc`). |
-| `ota_mdb_update` | OTA MDB Install | button | Manual MDB install — **always** works, ignores the availability gate. |
-| `ota_dbc_update` | OTA DBC Install | button | Manual DBC install — **always** works, ignores the availability gate. |
-| `ota_version` | OTA Version | text | Optional target tag (e.g. `nightly-20260803T062157`); empty = channel default. |
-| `ota_update_method` | OTA Update Method | select | `delta` (small patch, default) or `full` (complete `.mender`, hundreds of MB). |
-| `ota_source` | OTA Source | select | **`direct GitHub`** (the ESP fetches from GitHub itself) or **`HA relay`** (the Home Assistant integration serves the bytes). Default is chip-based (`ota_source_default`), persisted in NVS. In `direct GitHub` mode the ESP owns the **OTA Source URL** (it ignores external writes); in `HA relay` mode the integration sets it. |
-| `ota_source_url` | OTA Source URL | text | Effective byte source URL for the transfer, driven by the **OTA Source** select (or a local mirror). |
-
-#### The update check
-
-Both entities share one GitHub-releases query (TLS, in a worker task) that finds the newest
-release for the **selected channel** and compares it against the running versions. The channel
-comes from the `OTA channel` select, which **reflects the running channel** parsed from the MDB
-version (`nightly-…` → `nightly`). `nightly`/`testing` pick the newest tag by timestamp;
-`stable` uses `/releases/latest`. The comparison is case-insensitive (the BLE version reports a
-lowercase `t` in the timestamp, the tag an uppercase `T`).
-
-Checks run when the versions are first known and every ~6 h; **Home Assistant's "check for
-updates" triggers one too** (the API `UPDATE_COMMAND_CHECK` reaches the entity's `check()`,
-which starts the same query).
-
-**Multi-hop changelog.** When the installed version is several releases behind, the release
-notes shown in the HA card aggregate **every** release in between — a header
-(`N releases since installed:` + a bullet list of tags) followed by each release's own notes,
-newest first — so a jump that skips nightlies still shows what changed at every step. The MDB
-card additionally prepends the download size and an install-time estimate.
-
-#### What is offered, and in which order
-
-**Both entities show whatever next step exists for their board**, independent of ordering. Each
-target is that board's own next release: with `delta` the adjacent successor of its installed
-version, with `full` the channel latest. So MDB and DBC can show an update at the same time.
-
-**Ordering applies to unattended installation only.** `OTA Auto Update` installs one at a time:
-
-- `delta` — the MDB leads by one step: while the DBC is behind the MDB it steps until the two
-  match; when they match, or the DBC is ahead (after a manual DBC install), the MDB takes its
-  next step.
-- `full` — the MDB reaches the channel latest first, then the DBC follows.
-
-**OTA Version** always shows the target that would be installed next under that order.
-
-Pressing **Install** on either entity installs that board immediately, ordering or not. This is
-safe: the target is that board's adjacent successor, so the delta base matches, and the delta
-pre-flight reads the base out of the archive and refuses a mismatch before any bytes are sent.
-
-Offers are **gated on the scooter being idle**: shown only while the scooter's OTA phase is
-`idle` (`0x06`). Any other phase — "unknown" (before the first `STATUS_REQ` reply) or "pending
-reboot" after an install — withdraws the offer. A `STATUS_REQ` is sent on every connect, and
-re-sent every 15 s while the phase stays `unknown`, so a real update is not hidden behind a
-stuck phase.
-
-**"Up to date" is only claimed when it is true** — when the board is actually at the channel
-latest. When no offer can be made for another reason (no successful check yet, scooter busy, or
-out of contact) the entity reports **no state** instead. Home Assistant derives "update
-available" purely from `latest_version != installed_version`, so publishing `latest == installed`
-is the only way to show no update — and it also reads as "you are current", which would be wrong
-in those cases. A `STATUS_REQ` is sent on every connect so the phase is known — and if that
-reply is missed (e.g. a flaky link) so the phase stays `unknown`, it is **re-requested every 15 s
-while connected** until it resolves, so a genuinely available update isn't left hidden behind a
-stuck `unknown` phase.
-
-An **`unknown` installed version is never offered an update.** In stand-by the scooter reports
-`status:version:dbc:unknown` (the dashboard is off), so the DBC's installed version reads
-`unknown`; the component treats that as "no version" and publishes `latest == installed` so Home
-Assistant shows no update. A component whose version is genuinely known and behind is still
-offered normally.
-
-The two manual **OTA … Install** buttons ignore all of the above and start immediately, using
-`OTA Version` if set, else the channel latest (MDB) / the MDB version (DBC).
-
-#### How the transfer works — and where MDB and DBC differ
-
-**On the wire the two transfers are the same code path.** The component sends the same
-`START` → `DATA` → `COMPLETE` sequence over the same three characteristics, with the same ring
-buffer, HTTP producer task, sliding window, cumulative ACKs, go-back-N on REWIND, SHA-256 (from
-the GitHub asset `digest`) in START, resume-on-reconnect and progress-bar handling. Only these
-differ:
-
-| | MDB | DBC |
-| :--- | :--- | :--- |
-| `component` byte in `START` | `0x00` | `0x01` |
-| Bundle basename | `librescoot-unu-mdb-<tag>.<ext>` | `librescoot-unu-dbc-<tag>.<ext>` |
-| "Installed version" source | `9a59a041` (i.MX) | `status:version:dbc` (dashboard) |
-| Default install target | channel latest | the **MDB's** running version |
-| Post-install confirmation | waits for `9a59a041` to report the target | waits for `status:version:dbc` to report the target |
-
-**What the scooter does with each is different — and that part is entirely scooter-side:**
-
-- **MDB:** the receiver queues the bundle on `scooter:update:mdb`; `update-service` runs
-  `mender-update install` and the MDB **reboots itself after 3 minutes of sustained stand-by**.
-  Its `pending-reboot` therefore clears on its own.
-- **DBC:** the bundle is received on the **MDB first**, then handed off to the dashboard —
-  `vehicle-service` forces dashboard power on, transfers the bundle to the dashboard's
-  data-server, and the dashboard's own `update-service` installs it. The dashboard is **also**
-  a Mender image, so it **also needs a reboot** to activate; but that reboot is gated by the
-  vehicle state machine / dashboard power, not the 3-minute stand-by timer.
-
-**Why "pending reboot" can stick, and the stuck-reboot watchdog.** The BLE `INSTALL_PROGRESS`
-notification (`[0x84][phase][percent][msg]`) carries **no component field**, so the single
-OTA_STATUS characteristic cannot say *which* board is pending. `pending-reboot` (phase `0x02`)
-is a legitimate phase for **both** boards — both must reboot to switch Mender partitions. The
-MDB auto-reboots after 3 min stand-by; a DBC install applies on the **next dashboard power
-cycle** — the component switches the dashboard on itself after a DBC install (`dbc_auto_power`,
-on by default) so this happens right away, about 30 s from power-on to the new version. But the OTA_STATUS characteristic is a **latch of the last BLE-OTA session's terminal
-progress** — it is *not* re-synced to the scooter's live update state. So even after the
-dashboard has rebooted and both versions match again, `STATUS_REQ` can keep returning
-"pending reboot" (observed live: both boards on the new version, update-service back to idle,
-yet the char still says pending-reboot). Because we **cannot** tell a genuine pending reboot
-from a stale latch — and version equality is not proof either, since a reboot may still be
-pending right after an install — the component does **not** guess. Instead, a **watchdog**
-re-requests `STATUS_REQ` every 30 s while pending-reboot and, if the status stays pending for
-**more than 20 minutes**, turns on the `reboot_required` problem sensor. The Home Assistant
-integration surfaces that as a Repair offering to **restart the scooter**, which clears both
-cases. The idle-gate above is left strict on purpose. (Firmware-side, the fix would be to reset
-OTA_STATUS to idle when update-service clears the `ota` hash, or expose per-component status
-over BLE — under discussion upstream.)
-
-#### Staging vs installing, and the byte source
-
-#### Delta chaining
-
-With `delta`, each release patches only its immediate predecessor, so a scooter several releases
-behind is brought forward one install and one reboot at a time. **OTA Update Method delta-chaining**
-asks the Home Assistant integration to merge the whole run into a single artifact, turning N
-installs into one.
-
-It only takes effect with **OTA Update Method** `delta` and a reachable relay — the merge needs
-`xdelta3` and hundreds of MB of memory, so it cannot run on the ESP. Outside that combination the
-switch refuses to turn on and says why in the log; if the conditions stop holding while it is on,
-it switches itself off. (A switch cannot report *unavailable* over the ESPHome API, which is why it
-refuses rather than greying out.)
-
-The relay builds the bundle in the background; **OTA Status** shows its progress
-(`Relay: building downloading target image 40%`, `… encoding fresh delta`) until the transfer
-starts, up to 30 minutes. Spans of up to 15 releases are merged from the official patches; longer
-spans get a fresh delta encoded from the two full images, which is smaller than the composed one.
-When the relay cannot bridge a span it says why, and **OTA Status** shows that reason
-(`Error: chain: …`).
-
-Two things are worth understanding before turning it on:
-
-- **A merged artifact is not an official release asset.** The SHA-256 the transfer sends is
-  therefore a transport check only — it proves the bytes arrived intact, not where they came from.
-- **Authenticity rests on the applied-image hash** (`new_meta.decompressed_sha256`), which is copied
-  verbatim from the official last release of the run and which the scooter verifies after applying
-  the patch. On a board with PSRAM the component fetches that official release from GitHub over TLS
-  itself, reads the hash out of its header and **refuses the transfer before a byte moves** if the
-  merged artifact declares a different one:
-
-  ```
-  delta chain: 4 steps nightly-20260821T182219 -> nightly-20260823T082958 merged into … (2365785 B)
-  delta chain: anchor verified against GitHub over TLS (9f24515a79d4bbe8…)
-  ```
-
-  A board without PSRAM cannot reach the release CDN — that is why the relay exists — so there both
-  sides of the comparison come from Home Assistant. It logs that it is trusting the relay rather
-  than implying a guarantee it does not have.
-
-When an install is refused because the target skips releases, the log names this option.
-
-Two limits worth knowing: the option cannot be selected while the byte source is **direct GitHub**
-(relay reachability is only evaluated for a plain-HTTP source, so switch the source first), and the
-update entity still proposes only the next release — chaining engages for a target you set by hand
-in **OTA Version** that skips releases.
-
-Staging and installing are separated by the **OTA Stage Only** switch. With it on, a transfer
-streams the entire DATA phase and stops *before* `COMPLETE`, so nothing is installed — this
-exercises the whole state machine safely. With it off (the default), a completed transfer sends
-`COMPLETE`, the scooter verifies the SHA-256 against the staged file and queues the real install.
-Installing firmware onto a road vehicle is a deliberate act, so nothing is ever installed without
-a press.
-
-**Direct GitHub download needs an S3+PSRAM board.** On the ESP32-classic the RSA-4096 handshake
-to `objects.githubusercontent.com` runs out of contiguous heap while BLE is active
-(`api.github.com` metadata uses ECC and is fine). On the **S3 with PSRAM** the bulk `.mender` download runs **directly from GitHub**: it follows the
-`302` from `github.com` to the signed `objects.githubusercontent.com` CDN URL and streams the bytes
-(the HTTP client's TX buffer is sized for that long signed URL). Measured ≈ 5 kB/s over BLE at weak
-signal — the BLE link is the bottleneck, not the download. On the **classic**, direct GitHub is not
-possible (the RSA-4096 CDN handshake runs out of contiguous heap while BLE is active), so point
-**`OTA Source URL`** at the **Home Assistant relay** or a local HTTP mirror. Metadata (size/SHA)
-always comes from the GitHub API on both boards.
-
-```bash
-mkdir -p mirror/<tag> && cd mirror
-# fetch the real bundles so the SHA verifies (only needed for a real COMPLETE/install):
-gh release download <tag> -R librescoot/librescoot -p '*mdb*.delta' -p '*dbc*.delta' -D <tag>
-python3 tools/range_server.py         # Range-capable; python -m http.server does NOT resume
-```
-
-Then set **`OTA Source URL`** to `http://<host>:8000` and press an install button. The component
-also registers `esphome.<node>_ota_test` and `esphome.<node>_ota_abort` (no YAML needed), which
-drive the engine with an explicit `url`/`size`/`bundle`/`component` for pure-local testing without
-GitHub or version comparison:
-
-```yaml
-action: esphome.<node>_ota_test
-data:
-  url: "http://<host>:8000/<tag>/<file>.delta"
-  size: 994112
-  bundle: "<file>.delta"
-  component: 1        # 0 = MDB, 1 = DBC
-```
-
-**Certificates.** Instead of the ~100 kB Mozilla bundle, the two exact GitHub root CAs are
-pinned in `github_ca.h` (USERTrust ECC for `api.github.com`, ISRG Root X1 for the
-`objects.githubusercontent.com` asset host). Disable the bundle in the YAML:
-
-```yaml
-esp32:
-  framework:
-    type: esp-idf
-    sdkconfig_options:
-      CONFIG_MBEDTLS_CERTIFICATE_BUNDLE: n
-```
-
-If GitHub ever moves a host to a different CA, add that root to `github_ca.h`.
+| Scooter Lock | lock | Lock / unlock. Shows the real state; never unlocks by itself. | `scooter_lock` |
+| Blinker | select | `off` / `left` / `right` / `both` | `blinker` |
+| Seatbox Open | button | | `seatbox_open` |
+| Hibernate / Wakeup | button | Power the scooter down / up. | `hibernate` / `wakeup` |
+| Reboot MDB / Reboot MDB (hard) | button | Restart the scooter's computer (soft / power-cycle). | `reboot_mdb` / `reboot_mdb_hard` |
+| MDB USB Mode | select | `Normal` / `Mass Storage` | `usb_mode` |
+| Navigation Set to / Navigation Clear | text / button | Destination as `lat,lon[,name]`. | `navigation_set` / `navigation_clear` |
+| Cancel Hibernate | button | | `cancel_hibernate` |
+| Cellular APN | text | | `cellular_apn` |
+| PM Scheduled Hibernation Enabled / Cron / Duration | switch / text | Scheduled hibernation. | `pm_scheduled_hibernate_enabled` / `_cron` / `_duration` |
+| System Time sync with ESP / Set UTC ISO-8601 | button / text | Set the scooter's clock. | `system_time_sync` / `system_time_iso` |
+| A-Refresh Sensor States | button | Re-read every sensor now. | `refresh` |
+| Restart ESPHome Device | button | | `restart_esp` |
+
+Switches and selects show what the scooter reports, not just what was last pressed.
 
 ---
 
-## Framework
+## Sensors
 
-ESP-IDF on ESP32 (ESPHome 2026.9.0 or newer). The component extends
-`esp32_ble_client::BLEClientBase`, so it registers a BLE connection slot and participates in
-scanning like any `ble_client`.
+| Entity | Type | Meaning | YAML key |
+| :--- | :--- | :--- | :--- |
+| Status | text | `parked`, `ready-to-drive`, `stand-by`, … | `status` |
+| Seatbox / Handlebar Lock | text | | `seatbox` / `handlebar_lock` |
+| Power State | text | | `power_state` |
+| Odometer | km | | `odometer` |
+| Battery 1 / 2 SoC · Cycles · State · Present | % / count / text / binary | The two traction batteries. Unknown while the slot is empty. | `battery_1_soc`, `battery_1_cycles`, `battery_1_state`, `battery_1_present`, `battery_2_…` |
+| Aux Battery Voltage · Level · Aux Charge Status · Aux Charger | V / % / text / binary | The 12 V auxiliary battery and its charger. | `aux_voltage`, `aux_level`, `aux_charge_status`, `aux_charger` |
+| CBB Battery Level · Charge Status · Remaining · Full Capacity · Cell Voltage | % / text / Ah / V | The connectivity battery. | `cbb_level`, `cbb_charge_status`, `cbb_remaining`, `cbb_full`, `cbb_cell` |
+| MDB Power Mux Selected Input | text | | `power_mux` |
+| Navigation Active · Navigation Available · Navigation Maps Available | binary | | `navigation_active`, `navigation_available`, `maps_available` |
+| Keycard Count | text | | `keycard_count` |
+| MDB UMS Status | binary | USB mass-storage mode active. | `ums_status` |
+| SW MDB · SW DBC · SW nRF · SW ESP | text | Installed versions: scooter computer, dashboard, Bluetooth chip, this ESP. | `sw_mdb`, `sw_dbc`, `sw_nrf`, `sw_esp` |
 
-## Example log output
+Sensors read *unknown* while the ESP is not connected to the scooter.
 
-```
-[I][librescoot_ble_client]: Scooter connected
-[I][librescoot_ble_client]: Negotiated ATT_MTU = 247
-[I][librescoot_ble_client]: Service discovery complete. OTA service present
-[I][librescoot_ble_client]: TX ext cmd: status:version:dbc
-[D][ota]: OTA_STATUS raw: 84 06 00 00
-```
+---
+
+## Bluetooth link
+
+| Entity | Type | Meaning | YAML key |
+| :--- | :--- | :--- | :--- |
+| BLE Connection | binary | Connected right now. | `ble_connection` |
+| BLE Presence | binary | Connected or nearby. | `ble_presence` |
+| BLE RSSI | dBm | Signal strength, also while not connected. | `rssi` |
+| BLE Link Mode | select | Who gets the scooter's single Bluetooth connection: | `ble_link_mode` |
+
+| BLE Link Mode | Behaviour |
+| :--- | :--- |
+| `always` | Stay connected. Alarm events arrive instantly. The phone app cannot connect meanwhile. |
+| `auto` (default) | Stay connected, but let go for ~20 s every `link_auto_hold` so a phone can connect. |
+| `interval` | Connect every `link_interval`, refresh the sensors, disconnect. |
+| `scan` | Do not connect; only notice whether the scooter is nearby. |
+| `disconnect` | Off. |
+
+A control you use while not connected is carried out as soon as the ESP connects. A firmware
+transfer always keeps the connection.
+
+---
+
+## Alarm
+
+The scooter's alarm arms itself when parked and reacts to motion, the seatbox, the handlebar and
+the buttons — first blinkers, then the horn. The ESP shows the state and reports each trigger.
+
+| Entity | Type | Meaning | YAML key |
+| :--- | :--- | :--- | :--- |
+| Alarm Status | text | `disabled` · `disarmed` · `delay-armed` · `armed` · `level-1-triggered` · `level-2-triggered` · `seatbox-access` | `alarm_status` |
+| Alarm Triggered | binary | On while the alarm is going off. | `alarm_triggered` |
+| Alarm Trigger | event | One event per trigger. Type = what set it off: `motion`, `seatbox`, `handlebar_position`, `handlebar_lock`, `brake_left`, `brake_right`, `horn_button`, `seatbox_button`. A trigger while the ESP was not connected is delivered on the next connect. | `alarm_trigger` |
+| Alarm Last Trigger / Alarm Last Trigger Time | text | What and when, last time. | `alarm_last_trigger` / `alarm_last_trigger_time` |
+| Alarm Armed | switch | Arm / disarm. | `alarm_armed` |
+| Alarm Enabled | switch | The scooter's alarm setting. With it off, arming does nothing. | `alarm_enabled` |
+| Alarm Start / Alarm Stop | button | Sound / silence the alarm now. | `alarm_start` / `alarm_stop` |
+| Alarm Arm / Alarm Disarm | button | For older firmware without alarm state. | `alarm_arm` / `alarm_disarm` |
+
+Needs scooter firmware with nRF **v2.11.0-ls** or newer. For instant alarm events use link mode
+`always`.
+
+---
+
+## Dashboard power
+
+The scooter switches its dashboard off while parked. **DBC Power** switches it on (~15 s) or off
+without changing the scooter's state; the scooter switches it off again by itself later. A
+dashboard firmware update needs the dashboard on — the ESP does that for you (`dbc_auto_power`).
+
+| Entity | Type | Meaning | YAML key |
+| :--- | :--- | :--- | :--- |
+| DBC Power | switch | Dashboard on / off. | `dbc_power` |
+| DBC Ready | binary | The dashboard has booted. | `dbc_ready` |
+
+Needs nRF **v2.11.0-ls** or newer.
+
+---
+
+## OTA Updates
+
+The ESP checks the LibreScoot GitHub releases and shows what is available in two update
+entities: **OTA MDB Update** (the scooter's computer) and **OTA DBC Update** (the dashboard).
+Press *Install* and the ESP transfers the firmware to the scooter over Bluetooth.
+
+- Updates install **one at a time**.
+- After an MDB update the **scooter reboots** by itself.
+- A DBC update is handed to the dashboard, which must be on: the ESP switches it on before the
+  handoff and again afterwards so the update applies. The scooter does not reboot.
+- A transfer takes 5–60 minutes depending on size and range. It survives the scooter driving
+  away and continues where it stopped.
+- Nothing installs without you pressing *Install* or switching **OTA Auto Update** on.
+
+### Install the next release
+
+1. **OTA channel** → `stable`, `testing` or `nightly`.
+2. **OTA Update Method** → `delta` (small, default) or `full` (whole image).
+3. **OTA MDB Update** / **OTA DBC Update** show the next release with its notes. Press *Install*.
+4. Follow **OTA Status**. When it says `Installed` and **SW MDB** / **SW DBC** show the new
+   version, install the other one if it is offered.
+
+### Update unattended (OTA Auto Update)
+
+1. Set **OTA channel** and **OTA Update Method**.
+2. Switch **OTA Auto Update** on.
+
+The ESP installs one release after the other — scooter computer first, dashboard second — and
+waits out each reboot until the scooter is current. Before every step it waits a few minutes
+(2 after switching on, 5 after a scooter reboot), switches the dashboard on and asks both parts
+for their versions; it never decides on a cached version. It switches itself **off** when done,
+on the first failed install, and after every ESP restart. Switch it on in the evening, check
+**SW MDB** / **SW DBC** in the morning.
+
+### A specific version
+
+1. Type the release tag into **OTA Version** (for example `nightly-20260909T063445`).
+2. Press **OTA MDB Install** or **OTA DBC Install**.
+
+With method `delta` the tag must be the release right after the installed one. For a version
+further ahead use [Chained delta updates](#chained-delta-updates) or method `full`.
+
+### Delta or full?
+
+| | `delta` | `full` |
+| :--- | :--- | :--- |
+| Size | 0.5–7 MB | ~160 MB |
+| Transfer | minutes | hours |
+| Fits | only the release right after the installed one | any installed version |
+| Use when | you keep the scooter current | the scooter is far behind, or a delta was refused |
+
+The ESP checks a delta against the installed version before transferring it and refuses a
+mismatch (`OTA Status: Error: delta needs …`).
+
+### Chained delta updates
+
+Several releases behind but no appetite for a full image: the Home Assistant integration merges
+all deltas between the installed version and your target into one — one transfer, one install,
+one reboot.
+
+You need:
+
+- the [Home Assistant integration](../../homeassistant-integration/README.md), and
+  **OTA Source HA Relay** showing *Connected*
+- **OTA Source** = `HA relay`
+- **OTA Update Method** = `delta`
+- **OTA Update Method delta-chaining** switched on
+
+Then:
+
+1. Type the target release into **OTA Version**.
+2. Press **OTA MDB Install** (or **OTA DBC Install**).
+3. **OTA Status** shows `Relay: building …` while Home Assistant prepares the bundle (up to a few
+   minutes), then the usual transfer and install.
+
+Chaining only happens for a target you typed in. The update entities and **OTA Auto Update**
+always go one release at a time.
+
+### Direct GitHub download (ESP32-S3)
+
+On an **ESP32-S3** the ESP can download the firmware from GitHub by itself, so updates work
+**without Home Assistant**. Set **OTA Source** to `direct GitHub` (the default on an S3).
+
+| | `HA relay` (plain ESP32 and S3) | `direct GitHub` (S3 only) |
+| :--- | :--- | :--- |
+| Needs | the Home Assistant integration | nothing but the ESP |
+| Chained delta updates | yes | no |
+
+### OTA entities
+
+| Entity | Type | Meaning | YAML key |
+| :--- | :--- | :--- | :--- |
+| OTA MDB Update / OTA DBC Update | update | Available release, release notes, install progress. | `mdb_update` / `dbc_update` |
+| OTA MDB Install / OTA DBC Install | button | Install now — **OTA Version** if set, else the next release. | `ota_mdb_update` / `ota_dbc_update` |
+| OTA Version | text | Target release. Prefilled with the next one. | `ota_version` |
+| OTA channel | select | `stable` / `testing` / `nightly` | `ota_channel` |
+| OTA Update Method | select | `delta` / `full` | `ota_update_method` |
+| OTA Update Method delta-chaining | switch | See above. Off after every ESP restart. | `ota_delta_chaining` |
+| OTA Auto Update | switch | See above. Off after every ESP restart. | `ota_auto_update` |
+| OTA Stage Only | switch | Transfer but do not install (for testing). Off after every ESP restart. | `ota_stage_only` |
+| OTA Source | select | `HA relay` / `direct GitHub` | `ota_source` |
+| OTA Source URL | text | Where the firmware bytes come from. Set by the integration. | `ota_source_url` |
+| OTA Source HA Relay | binary | The Home Assistant integration is reachable. | `ha_integration` |
+| OTA Status | text | `Idle` · `Relay: building …` · `Uploading MDB 45%` · `Installing 30%` · `Pending reboot` · `Installed` · `Error: …` | `ota_status` |
+| OTA Upload ETA | text | Remaining transfer time. | `ota_eta` |
+| OTA Speed BLE Upload / OTA Speed Download | kB/s | Live transfer rates. | `ota_ble_upload_speed` / `ota_download_speed` |
+| OTA Target Transferred · OTA BLE Bytes Total · OTA Auto-Resume Count | numbers | Transfer statistics. | `ota_target_transferred`, `ota_ble_bytes_total`, `ota_auto_resume_count` |
+| OTA Status Request | button | Ask the scooter for its update state. | `ota_status_request` |
+| OTA Abort | button | Stop the transfer. | `ota_abort` |
+| OTA Reboot Required | problem | On when the scooter has not rebooted 20 min after an install. | `reboot_required` |
+
+### When something goes wrong
+
+| OTA Status says | Meaning | Do this |
+| :--- | :--- | :--- |
+| `Error: delta needs <tag>` | This delta does not fit the installed version. | Install the next release first, use chained delta updates, or method `full`. |
+| `Error: chain: …` | Home Assistant could not merge the deltas (the text says why). | Pick a nearer target, or method `full`. |
+| `Auto-resume #n (…)` | Bluetooth dropped some bytes. The transfer continues by itself. | Nothing. Closer is faster. |
+| `Pending reboot` for a long time / **OTA Reboot Required** on | The scooter did not reboot after an MDB update. | Press **Reboot MDB (hard)**. |
+| `Installing — waiting for scooter reboot…` after a DBC update | The dashboard is off, so the update has not applied yet. | Switch **DBC Power** on (`dbc_auto_power` does this by itself). |
+| No update shown although there is a newer release | Scooter out of range, link mode `scan`/`disconnect`, or the scooter is still busy with the last install. | Bring it in range, choose `auto`/`always`, or wait. |
+| Install refused: no firmware source | Neither the integration nor direct GitHub is available. | Install the [Home Assistant integration](../../homeassistant-integration/README.md), or use an ESP32-S3. |
+
+---
+
+## Command
+
+Send any command of the scooter's text command channel (`cap:list` lists them). The reply
+appears in **Command last response** (one line) and **Command response** (every line).
+
+| Entity | Type | YAML key |
+| :--- | :--- | :--- |
+| Command | text | `command` |
+| Command last response | text sensor | `command_last_response` |
+| Command response | text sensor | `command_response` |
+
+---
+
+## Under the hood
+
+Optional. The Bluetooth protocol is documented at <https://reference.librescoot.org/>.
+
+**Extra options**
+
+| Option | Default | Meaning |
+| :--- | :--- | :--- |
+| `github_repo` | `librescoot/librescoot` | Where firmware releases come from. |
+| `ota_auto_resume` | `true` | Continue an interrupted transfer where the scooter left off. |
+| `ota_source_default` | by board | `relay` or `github` — the initial **OTA Source**. |
+| `use_cert_bundle` / `ca_certificate` | by board | TLS roots for GitHub. |
+| `firmware_source` | — | For developers: an HTTP server on your network that serves the release files instead of GitHub. |
+| `scooter_filter` | `scooter` | Name fragment that identifies a scooter when scanning. |
+
+**What the component sets up per board.** From the chip and whether `psram:` is configured: with
+PSRAM it downloads from GitHub with the Mozilla root bundle; without PSRAM it uses the Home
+Assistant relay, pins the two GitHub roots itself, trims the Wi-Fi buffers, reserves one
+Bluetooth connection slot and sends API state messages one at a time. On an ESP32-S3 it forces
+the legacy Bluetooth connect (the BLE-5 extended connect loops against this scooter). Anything
+set explicitly in `sdkconfig_options`, `api:` or `esp32_ble:` wins.
+
+**Memory on a plain ESP32.** A transfer runs with ~40 kB of RAM to spare. No `web_server`, and
+only the entities you use. A device that suddenly refuses Home Assistant connections or restarts
+mid-transfer is short of RAM.
+
+**Transfers.** `START` → windowed `DATA` → `COMPLETE` over the scooter's OTA service, SHA-256
+from the GitHub release, resume from the scooter's staged offset, 120-byte chunks on a plain
+ESP32. A delta's base version is read out of the file before any byte moves; a merged bundle is
+checked against the official release's image hash. Bluetooth is the bottleneck: 2–4 kB/s.
+
+**Versions.** The scooter computer's version comes from a Bluetooth characteristic and is
+cross-checked with `status:version:mdb`; the dashboard's from `status:version:dbc`.
+
+**Testing without GitHub.** `tools/range_server.py` serves the release files from your computer;
+point **OTA Source URL** at it. `esphome.<node>_ota_test` (url, size, bundle, component) and
+`esphome.<node>_ota_abort` drive the transfer engine directly.

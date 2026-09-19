@@ -1339,6 +1339,8 @@ void LibrescootBleClient::handle_char_value_(CharId id, uint8_t *v, uint16_t len
         this->power_state_->publish_state(ps);
       // Scooter (re)booting → re-read everything 30 s later so we get fresh data (and confirm a
       // new firmware version after an OTA). Applies always, not just during an update.
+      if (ps == "booting")
+        this->scooter_boot_ms_ = millis();  // every version fetched before this is stale
       if (ps == "booting" && this->boot_reread_at_ms_ == 0)
         this->boot_reread_at_ms_ = millis() + 30000;
       break;
@@ -1425,6 +1427,7 @@ void LibrescootBleClient::parse_cmd_response_(const std::string &line) {
   } else if (line.rfind("status:version:mdb:", 0) == 0) {
     const std::string live = line.substr(19);
     if (!live.empty() && !ieq(live, "unknown")) {
+      this->mdb_version_seen_ms_ = millis();
       if (!this->mdb_version_.empty() && !ieq(live, this->mdb_version_))
         ESP_LOGW(TAG, "MDB version: characteristic says %s, scooter says %s — using the scooter's",
                  this->mdb_version_.c_str(), live.c_str());
@@ -1724,6 +1727,20 @@ void LibrescootBleClient::handle_dbc_response_(const std::string &line) {
   const bool is_wait = line.rfind("dbc:on-wait:", 0) == 0 || line.rfind("dbc:off-wait:", 0) == 0;
   if (!ok)
     ESP_LOGW(TAG, "DBC: %s", line.c_str());
+  if (ok && line.rfind("dbc:on-wait:", 0) == 0)
+    this->dbc_dash_ok_ms_ = millis();  // a version answered after this comes from a running dashboard
+  if (this->ota_complete_pending_ && line.rfind("dbc:on-wait:", 0) == 0) {
+    if (!ok)
+      ESP_LOGW("ota", "DBC: dashboard did not come up (%s) — sending COMPLETE anyway", line.c_str());
+    if (this->ota_state_ == OtaState::COMPLETING)
+      this->ota_send_complete_();
+    else
+      this->ota_complete_pending_ = false;  // the transfer ended meanwhile
+  }
+  if (this->dbc_version_probe_ && line.rfind("dbc:on-wait:", 0) == 0) {
+    this->dbc_version_probe_ = false;
+    this->pending_queries_.push_back("status:version:dbc");  // ok or not: the answer is the proof
+  }
   if (this->dbc_autopower_active_ && line.rfind("dbc:on-wait:", 0) == 0) {
     if (ok) {
       ESP_LOGI("ota", "DBC: dashboard is up — asking for its version");
@@ -1924,6 +1941,8 @@ void LibrescootBleClient::set_mdb_version_(const std::string &v) {
 void LibrescootBleClient::set_dbc_version_(const std::string &v) {
   bool changed = !ieq(v, this->dbc_version_);
   this->dbc_version_ = v;
+  if (!v.empty() && !ieq(v, "unknown"))
+    this->dbc_version_seen_ms_ = millis();
   if (this->sw_dbc_ != nullptr)
     this->sw_dbc_->publish_state(v);
   this->publish_current_();
@@ -2560,6 +2579,9 @@ void LibrescootBleClient::github_fetch_() {
       return std::string();
     };
     // aggregate(from): every release newer than `from` up to latest (newest first), bodies bundled.
+    // Bounded by what the INTERNAL heap can hold right now (std::string never lives in PSRAM)
+    // and reserved once, so growth never asks for old+new at the same time.
+    const size_t agg_cap = this->changelog_cap_();
     auto aggregate = [&](const std::string &from) -> std::string {
       std::vector<const Rel *> inc;
       for (auto &r : rels) {
@@ -2567,12 +2589,17 @@ void LibrescootBleClient::github_fetch_() {
         if (q) inc.push_back(&r);
       }
       std::string s;
-      if (inc.size() <= 1) { if (!inc.empty()) s = inc.front()->body; return s; }
+      if (inc.size() <= 1) { if (!inc.empty()) s = inc.front()->body.substr(0, agg_cap); return s; }
+      s.reserve(agg_cap + 8);
       s = std::to_string(inc.size()) + " releases since installed:\n";
-      for (auto *r : inc) s += "• " + r->tag + "\n";
       for (auto *r : inc) {
+        if (s.size() + r->tag.size() + 4 > agg_cap) break;
+        s += "• " + r->tag + "\n";
+      }
+      for (auto *r : inc) {
+        const size_t need = r->tag.size() + r->body.size() + 8;
+        if (s.size() + need > agg_cap) { s += "\n…"; break; }
         s += "\n### " + r->tag + "\n" + r->body + "\n";
-        if (s.size() > LSC_CHANGELOG_MAX) { s += "\n…"; break; }
       }
       return s;
     };
@@ -2584,7 +2611,7 @@ void LibrescootBleClient::github_fetch_() {
     dbc_target = full ? best : successor(this->gh_current_dbc_tag_);
     mdb_summary = full ? aggregate(this->gh_current_tag_) : single_body(mdb_target);
     dbc_summary = full ? aggregate(this->gh_current_dbc_tag_) : single_body(dbc_target);
-    summary = aggregate(this->gh_current_tag_);  // legacy gh_summary_
+    summary = full ? mdb_summary : std::string();  // legacy gh_summary_, unused by the entities
   }
 
   // Asset sizes for each component's target (and, for stable, the release body) — one streamed JSON
@@ -3120,8 +3147,48 @@ void LibrescootBleClient::ota_auto_update_tick_() {
   if (this->ota_state_ != OtaState::IDLE || this->ota_awaiting_version_ || this->ota_resolve_running_ ||
       !this->ota_jobs_.empty())
     return;  // an install is already in flight
+  if (this->gh_running_)
+    return;  // the release check owns the heap; a transfer next to it has aborted the firmware
   if (this->state() != espbt::ClientState::ESTABLISHED)
     return;
+  // Decide only on versions fetched AFTER the later of "auto-update switched on" and "the scooter
+  // last booted", and not before 2 min after switch-on / 5 min after a boot. Fetching means asking
+  // the scooter's computer live and powering the dashboard on (its version is unknown while it is
+  // off). Never step blind: an unknown dashboard version would let the MDB run away from it.
+  const uint32_t now = millis();
+  const uint32_t since_arm = now - this->ota_auto_armed_ms_;
+  const uint32_t since_boot = this->scooter_boot_ms_ ? now - this->scooter_boot_ms_ : 0xFFFFFFFFu;
+  if (since_arm < 2UL * 60UL * 1000UL || since_boot < 5UL * 60UL * 1000UL)
+    return;  // settle time
+  const uint32_t ref = (this->scooter_boot_ms_ && (int32_t)(this->scooter_boot_ms_ - this->ota_auto_armed_ms_) > 0)
+                           ? this->scooter_boot_ms_ : this->ota_auto_armed_ms_;
+  const bool mdb_fresh = this->mdb_version_seen_ms_ && (int32_t)(this->mdb_version_seen_ms_ - ref) > 0;
+  bool dbc_fresh = this->dbc_version_seen_ms_ && (int32_t)(this->dbc_version_seen_ms_ - ref) > 0;
+  // The MDB caches the dashboard's last published version and answers it while the dashboard is
+  // off. Where we can power it on, "fresh" means: on-wait succeeded after the reference point and
+  // the version was answered after that — i.e. by the dashboard that is actually running.
+  if (this->dbc_present_ && this->dbc_auto_power_)
+    dbc_fresh = dbc_fresh && this->dbc_dash_ok_ms_ && (int32_t)(this->dbc_dash_ok_ms_ - ref) > 0 &&
+                (int32_t)(this->dbc_version_seen_ms_ - this->dbc_dash_ok_ms_) >= 0;
+  if (!mdb_fresh || !dbc_fresh) {
+    if (now - this->dbc_probe_ms_ > 60UL * 1000UL) {
+      this->dbc_probe_ms_ = now;
+      this->dbc_version_probe_ = false;  // a probe whose reply never came must not block the next
+      ESP_LOGI(TAG, "auto-update: fetching fresh versions first (MDB %s, DBC %s)",
+               mdb_fresh ? "ok" : "pending", dbc_fresh ? "ok" : "pending");
+      if (!mdb_fresh)
+        this->pending_queries_.push_back("status:version:mdb");
+      if (!dbc_fresh) {
+        if (this->dbc_present_ && this->dbc_auto_power_ && !this->dbc_version_probe_) {
+          this->dbc_version_probe_ = true;
+          this->send_ext_query_("dbc:on-wait");  // its reply queues status:version:dbc
+        } else {
+          this->pending_queries_.push_back("status:version:dbc");
+        }
+      }
+    }
+    return;
+  }
   // Status must be a settled operating state — never mid-boot. An MDB install reboots the scooter
   // (Status → "booting" → back to stand-by/parked); only step forward once it has settled.
   const std::string st = (this->status_ != nullptr) ? this->status_->state : std::string();
@@ -3454,8 +3521,10 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
       this->ota_auto_update_ = state;
       if (this->auto_update_sw_ != nullptr)
         this->auto_update_sw_->publish_state(state);
-      ESP_LOGI(TAG, "OTA Auto Update %s", state ? "ON" : "off");
+      ESP_LOGI(TAG, "OTA Auto Update %s", state ? "ON (2 min settle, fresh versions first)" : "off");
       if (state) {
+        this->ota_auto_armed_ms_ = millis();
+        this->dbc_probe_ms_ = 0;  // fetch round right away; the 2 min settle still applies
         this->ota_auto_check_pending_ = false;
         this->ota_auto_next_ms_ = millis();
         this->enable_loop();
