@@ -427,13 +427,18 @@ void LibrescootBleClient::ota_step_() {
         this->ota_fail_("download failed");
       break;
     case OtaState::COMPLETING:
-      if (now - this->ota_state_ms_ > 30000) {
-        if (this->ota_complete_pending_) {
+      if (this->ota_complete_pending_) {
+        if (this->ota_complete_after_ms_) {
+          if ((int32_t) (now - this->ota_complete_after_ms_) >= 0) {
+            ESP_LOGI(OTAG, "dashboard settled — sending COMPLETE");
+            this->ota_send_complete_();
+          }
+        } else if (now - this->ota_state_ms_ > 30000) {
           ESP_LOGW(OTAG, "dashboard on-wait unanswered — sending COMPLETE anyway");
           this->ota_send_complete_();
-        } else {
-          this->ota_fail_("COMPLETE_ACK timeout");
         }
+      } else if (now - this->ota_state_ms_ > 30000) {
+        this->ota_fail_("COMPLETE_ACK timeout");
       }
       break;
     case OtaState::INSTALLING:
@@ -1315,6 +1320,11 @@ void LibrescootBleClient::ota_kick_next_job_() {
   this->ota_have_current_job_ = true;
   ESP_LOGI(OTAG, "install: starting %s (%s, %u B)", comp_name(job.component), job.bundle_id.c_str(),
            (unsigned) job.size);
+  // A dashboard update is handed to the dashboard at COMPLETE and it must have been running for
+  // a while by then: power it on now, so the transfer time is its settle time.
+  if (job.component == 1 && this->dbc_present_ && this->dbc_auto_power_ &&
+      !(this->dbc_power_known_ && this->dbc_power_on_))
+    this->send_ext_query_("dbc:on-wait");
   this->ota_start(job.url, job.sha, job.size, job.bundle_id, job.component);
 }
 
@@ -1364,6 +1374,7 @@ void LibrescootBleClient::ota_handle_disconnect_() {
 // COMPLETE: the scooter verifies the SHA-256 of the staged bundle and queues the install.
 void LibrescootBleClient::ota_send_complete_() {
   this->ota_complete_pending_ = false;
+  this->ota_complete_after_ms_ = 0;
   const uint8_t c = 0x03;
   this->write_now_(CharId::OTA_CONTROL, &c, 1);
   this->ota_state_ms_ = millis();  // COMPLETE_ACK timeout counts from here
@@ -1513,6 +1524,7 @@ void LibrescootBleClient::ota_learn_rate_(uint32_t moved, uint32_t dt_ms) {
 void LibrescootBleClient::ota_finish_(bool ok) {
   this->ota_producer_run_ = false;  // ask the download task to stop; buffer freed in ota_step_
   this->ota_complete_pending_ = false;
+  this->ota_complete_after_ms_ = 0;
   // Flush the final partial window into the lifetime byte counter and the target-transferred
   // sensor, then park the two speed sensors at 0 (a transfer is no longer running).
   this->ota_park_rates_();

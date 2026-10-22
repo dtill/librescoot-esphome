@@ -118,6 +118,7 @@ CONF_UPDATE_INTERVAL = "update_check_interval"
 CONF_LINK_INTERVAL = "link_interval"
 CONF_LINK_AUTO_HOLD = "link_auto_hold"
 CONF_DBC_AUTO_POWER = "dbc_auto_power"
+CONF_DELTA_CHAINING = "delta_chaining"
 # DEFAULT OTA byte source ("github"/"relay"); distinct key from the `ota_source` select entity.
 CONF_OTA_SOURCE_DEFAULT = "ota_source_default"
 CONF_FIRMWARE_SOURCE = "firmware_source"
@@ -305,7 +306,10 @@ SWITCHES = {
     # start OFF every boot and auto-update can never restore ON and install unattended.
     "ota_stage_only": ("set_stage_only_switch", SwKind.STAGE_ONLY, "diagnostic", "mdi:package-variant-closed", "ALWAYS_OFF"),
     "ota_auto_update": ("set_auto_update_switch", SwKind.AUTO_UPDATE, "diagnostic", "mdi:auto-download", "ALWAYS_OFF"),
-    "ota_delta_chaining": ("set_delta_chain_switch", SwKind.DELTA_CHAINING, "diagnostic", "mdi:link-variant", "ALWAYS_OFF"),
+    # Wanted ON by default (it is what makes a scooter several releases behind updatable in one
+    # install), but only effective with the delta method and a reachable HA relay — the component
+    # publishes the effective state. DISABLED: a boot write would overwrite that default want.
+    "ota_delta_chaining": ("set_delta_chain_switch", SwKind.DELTA_CHAINING, "diagnostic", "mdi:link-variant", "DISABLED"),
 }
 
 # Alarm trigger provenance (9a590222): one event per trigger, typed by alarm-service's source name.
@@ -430,6 +434,11 @@ CONFIG_SCHEMA = cv.All(
             # After a DBC install, power the dashboard on so the bundle applies and the new version
             # can be read (dbc:on-wait; the vehicle powers it off again by itself in stand-by).
             cv.Optional(CONF_DBC_AUTO_POWER, default=True): cv.boolean,
+            # Delta-chaining: let Home Assistant merge a run of deltas into one install, and offer
+            # the channel LATEST instead of the next release. Only applies with OTA Update Method
+            # "delta" and a reachable HA relay; the runtime switch follows this as its starting
+            # point. false = always step one release at a time.
+            cv.Optional(CONF_DELTA_CHAINING, default=True): cv.boolean,
             # OTA byte source default. Omitted → chip-based (ESP32-S3 → direct GitHub, else HA relay).
             cv.Optional(CONF_OTA_SOURCE_DEFAULT): cv.one_of("github", "relay", lower=True),
             # Compile-time default byte source for the OTA transfer (e.g. a local mirror). The
@@ -537,6 +546,7 @@ async def to_code(config):
     cg.add(var.set_link_interval_ms(config[CONF_LINK_INTERVAL]))
     cg.add(var.set_auto_hold_ms(config[CONF_LINK_AUTO_HOLD]))
     cg.add(var.set_dbc_auto_power(config[CONF_DBC_AUTO_POWER]))
+    cg.add(var.set_delta_chaining(config[CONF_DELTA_CHAINING]))
     cg.add(var.set_presence_timeout(config[CONF_PRESENCE_TIMEOUT]))
     if CONF_TIME_ID in config:
         cg.add(var.set_time(await cg.get_variable(config[CONF_TIME_ID])))

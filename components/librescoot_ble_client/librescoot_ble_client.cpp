@@ -368,6 +368,12 @@ void LibrescootBleClient::setup() {
     // Before the first check the entities are still in their default state, which Home Assistant
     // shows as an available update with an empty target. Park them right away.
     this->squelch_updates_();
+    // Chaining is wanted by default but cannot be effective before the relay has answered, so show
+    // it off now and let the first reachability check turn it on. The switch deliberately does NOT
+    // restore at boot: a restored OFF would be indistinguishable from "the relay was down", and a
+    // restore write would overwrite the default want before anything could be known.
+    if (this->chain_sw_ != nullptr)
+      this->chain_sw_->publish_state(false);
     // The idle-gate only opens once the scooter has reported its OTA phase, so a reply that never
     // arrives means no update is ever offered. Keep asking while it is unknown — from the
     // scheduler, not loop(), which is disabled exactly when the link sits connected and idle.
@@ -1706,8 +1712,11 @@ void LibrescootBleClient::handle_dbc_response_(const std::string &line) {
     const size_t r = rest.find("ready:");
     const std::string ready = r == std::string::npos ? "unknown" : rest.substr(r + 6);
     if (power == "on" || power == "off") {
+      const bool was_on = this->dbc_power_known_ && this->dbc_power_on_;
       this->dbc_power_on_ = power == "on";
       this->dbc_power_known_ = true;
+      if (this->dbc_power_on_ && !was_on)
+        this->dbc_on_since_ms_ = millis();  // first sighting of it on = "booted about now"
       if (this->dbc_power_ != nullptr && millis() >= this->dbc_suppress_until_)
         this->dbc_power_->publish_state(this->dbc_power_on_);
     }
@@ -1727,15 +1736,31 @@ void LibrescootBleClient::handle_dbc_response_(const std::string &line) {
   const bool is_wait = line.rfind("dbc:on-wait:", 0) == 0 || line.rfind("dbc:off-wait:", 0) == 0;
   if (!ok)
     ESP_LOGW(TAG, "DBC: %s", line.c_str());
-  if (ok && line.rfind("dbc:on-wait:", 0) == 0)
+  if (ok && line.rfind("dbc:on-wait:", 0) == 0) {
     this->dbc_dash_ok_ms_ = millis();  // a version answered after this comes from a running dashboard
+    if (!(this->dbc_power_known_ && this->dbc_power_on_))
+      this->dbc_on_since_ms_ = millis();  // we did not know it was on → assume it just booted
+  }
   if (this->ota_complete_pending_ && line.rfind("dbc:on-wait:", 0) == 0) {
-    if (!ok)
-      ESP_LOGW("ota", "DBC: dashboard did not come up (%s) — sending COMPLETE anyway", line.c_str());
-    if (this->ota_state_ == OtaState::COMPLETING)
-      this->ota_send_complete_();
-    else
+    if (this->ota_state_ != OtaState::COMPLETING) {
       this->ota_complete_pending_ = false;  // the transfer ended meanwhile
+    } else if (!ok) {
+      ESP_LOGW("ota", "DBC: dashboard did not come up (%s) — sending COMPLETE anyway", line.c_str());
+      this->ota_send_complete_();
+    } else {
+      // The handoff needs the dashboard's updater, not just its UI: a COMPLETE sent right after
+      // ready:true was dropped to idle, one sent after minutes of uptime installed. Give a fresh
+      // boot DBC_HANDOFF_SETTLE_MS before COMPLETE.
+      const uint32_t now = millis();
+      const uint32_t up = this->dbc_on_since_ms_ ? now - this->dbc_on_since_ms_ : 0;
+      if (up >= DBC_HANDOFF_SETTLE_MS) {
+        this->ota_send_complete_();
+      } else {
+        this->ota_complete_after_ms_ = now + (DBC_HANDOFF_SETTLE_MS - up);
+        ESP_LOGI("ota", "DBC: dashboard up for %u s — COMPLETE in %u s", (unsigned) (up / 1000),
+                 (unsigned) ((DBC_HANDOFF_SETTLE_MS - up) / 1000));
+      }
+    }
   }
   if (this->dbc_version_probe_ && line.rfind("dbc:on-wait:", 0) == 0) {
     this->dbc_version_probe_ = false;
@@ -1978,6 +2003,9 @@ void LibrescootBleClient::request_update_check(bool may_release_link, bool user_
   this->gh_current_dbc_tag_ = (this->dbc_version_.empty() || ieq(this->dbc_version_, "unknown"))
                                   ? "" : version_to_tag(this->dbc_version_);
   this->gh_method_ = this->ota_method_str_;
+  // Chaining turns the check into a "jump to the channel latest" check: one target, and the notes of
+  // every release in between (Home Assistant merges the run into a single install).
+  this->gh_chain_ = this->ota_delta_chain_;
   // The parse grows std::strings alongside WiFi and the BLE stack. Builds are without exceptions,
   // so a failed allocation aborts the firmware — decline the check instead.
   const uint32_t now = millis();
@@ -2428,6 +2456,10 @@ void LibrescootBleClient::github_fetch_() {
   std::string summary;                                 // legacy aggregate (installed MDB → latest)
   std::string mdb_target, dbc_target, mdb_summary, dbc_summary;
   const bool full = (this->gh_method_ == "full");
+  // Delta-chaining aims at the same place a full image does — the channel latest — but gets there
+  // as one merged delta run instead of one whole image. Everything that follows treats the two the
+  // same way for the TARGET and the CHANGELOG; only the asset (and its size) still differ.
+  const bool jump = full || this->gh_chain_;
 
   // With the relay as byte source, the whole check goes over it: plain HTTP, no TLS session, and
   // one request instead of three. Only the display data travels this way; the integrity anchor is
@@ -2440,8 +2472,21 @@ void LibrescootBleClient::github_fetch_() {
       src_complete = true;
       // Same target rule as the GitHub path: full jumps to the channel latest, delta steps to each
       // component's own adjacent successor. The bodies come from the relay in fetch_asset below.
-      mdb_target = full ? best : this->gh_successor_(this->gh_current_tag_);
-      dbc_target = full ? best : this->gh_successor_(this->gh_current_dbc_tag_);
+      mdb_target = jump ? best : this->gh_successor_(this->gh_current_tag_);
+      dbc_target = jump ? best : this->gh_successor_(this->gh_current_dbc_tag_);
+#ifdef LSC_HEAP_RICH
+      if (jump) {
+        // The relay serves one release's notes per request, so the run's changelog is assembled
+        // here — the listing with all bodies at once exists only on the GitHub path.
+        // PSRAM boards only: on a board without it the internal heap is what std::string grows in,
+        // and a failed allocation aborts the firmware (no exceptions). Such a board keeps the
+        // single-release changelog it has always shown — see the fallback after fetch_asset.
+        mdb_summary = this->relay_changelog_(this->gh_current_tag_, best);
+        dbc_summary = (this->gh_current_dbc_tag_ == this->gh_current_tag_)
+                          ? mdb_summary
+                          : this->relay_changelog_(this->gh_current_dbc_tag_, best);
+      }
+#endif
     }
   } else if (stable) {
     // Stable ships one release at a time via /latest; keep the single-release path.
@@ -2607,12 +2652,22 @@ void LibrescootBleClient::github_fetch_() {
     // Full → jump each component to the channel latest with the aggregated (all-in-between) changelog.
     // Delta → step each component to the successor of ITS OWN installed version, with that single
     // release's changelog (a delta only applies to the immediately-preceding release).
-    mdb_target = full ? best : successor(this->gh_current_tag_);
-    dbc_target = full ? best : successor(this->gh_current_dbc_tag_);
-    mdb_summary = full ? aggregate(this->gh_current_tag_) : single_body(mdb_target);
-    dbc_summary = full ? aggregate(this->gh_current_dbc_tag_) : single_body(dbc_target);
-    summary = full ? mdb_summary : std::string();  // legacy gh_summary_, unused by the entities
+    mdb_target = jump ? best : successor(this->gh_current_tag_);
+    dbc_target = jump ? best : successor(this->gh_current_dbc_tag_);
+    mdb_summary = jump ? aggregate(this->gh_current_tag_) : single_body(mdb_target);
+    dbc_summary = jump ? aggregate(this->gh_current_dbc_tag_) : single_body(dbc_target);
+    summary = jump ? mdb_summary : std::string();  // legacy gh_summary_, unused by the entities
   }
+
+  // Was a multi-release changelog built above? The GitHub listing path builds one for every `jump`;
+  // the relay path only on a PSRAM board. Everywhere else the target's own release notes are the
+  // changelog, exactly as before — concatenating a run of them is what the small internal heap
+  // cannot afford.
+#ifdef LSC_HEAP_RICH
+  const bool agg = jump;
+#else
+  const bool agg = jump && !via_relay;
+#endif
 
   // Asset sizes for each component's target (and, for stable, the release body) — one streamed JSON
   // per distinct target tag (MDB and DBC targets can differ under delta).
@@ -2698,15 +2753,25 @@ void LibrescootBleClient::github_fetch_() {
     mdb_summary = dbc_summary = summary;
   } else if (mdb_target == dbc_target) {
     fetch_asset(mdb_target, true, true);
-    if (!full && !fetched_body.empty())  // delta → this single release's full changelog
+    if (!agg && !fetched_body.empty())  // no aggregate → this single release's full changelog
       mdb_summary = dbc_summary = fetched_body;
   } else {
     fetch_asset(mdb_target, true, false);
-    if (!full && !fetched_body.empty())
+    if (!agg && !fetched_body.empty())
       mdb_summary = fetched_body;
     fetch_asset(dbc_target, false, true);
-    if (!full && !fetched_body.empty())
+    if (!agg && !fetched_body.empty())
       dbc_summary = fetched_body;
+  }
+  // A chained install does not transfer the target's own `.delta`: Home Assistant merges the run
+  // (or encodes a fresh delta across it) and the result's size is only known once that has run. The
+  // official asset size would be a wrong number shown with confidence, so publish none — unless the
+  // span is a single release, where the official delta IS what gets transferred.
+  if (this->gh_chain_ && !full) {
+    if (this->gh_steps_ahead_(this->gh_current_tag_) != 1)
+      mdb_sz = 0;
+    if (this->gh_steps_ahead_(this->gh_current_dbc_tag_) != 1)
+      dbc_sz = 0;
   }
   this->gh_mdb_size_ = mdb_sz;
   this->gh_dbc_size_ = dbc_sz;
@@ -2724,6 +2789,69 @@ void LibrescootBleClient::github_fetch_() {
   // missing, so the installed version falls outside the window and no successor can be computed.
   this->gh_ok_ = src_complete && !best.empty();
   this->gh_done_ = true;  // consumed on the main loop
+}
+
+// The changelog of a whole run, off the relay: one GET /notes/<tag> per release between `from`
+// (exclusive) and `to` (inclusive), newest first. The GitHub path gets all bodies from one listing;
+// the relay answers a single release per request, so the run is assembled here, in the worker task.
+// Bounded twice: by what the internal heap can hold (changelog_cap_) and by a request count, so a
+// board that is very far behind cannot turn one update check into a hundred HTTP requests.
+std::string LibrescootBleClient::relay_changelog_(const std::string &from, const std::string &to) {
+#ifndef LSC_HEAP_RICH
+  // Not on a board without PSRAM. std::string grows on the internal heap there (PSRAM is
+  // caps-alloc only), the build has no exceptions, so a failed allocation ends the firmware — and
+  // the few hundred bytes such a board can spare for a changelog could not hold a run anyway.
+  // These boards keep the single-release notes they have always shown.
+  (void) from;
+  (void) to;
+  return std::string();
+#else
+  if (to.empty())
+    return std::string();
+  std::vector<std::string> span;
+  for (const auto &t : this->gh_tags_)
+    if (from.empty() ? (t == to) : (t > from && t <= to))
+      span.push_back(t);
+  std::sort(span.begin(), span.end(), std::greater<std::string>());
+  if (span.empty())
+    return std::string();
+  static const size_t MAX_NOTES = 25;  // requests, not releases: the list below still names them all
+  const size_t cap = this->changelog_cap_();
+  std::string s;
+  s.reserve(cap + 16);
+  if (span.size() > 1) {
+    s = std::to_string(span.size()) + " releases since installed:\n";
+    for (const auto &t : span) {
+      if (s.size() + t.size() + 4 > cap)
+        break;
+      s += "• " + t + "\n";
+    }
+  }
+  size_t n = 0;
+  bool cut = false;
+  for (const auto &t : span) {
+    // Stop before spending a request whose answer cannot fit anyway — on a board without PSRAM the
+    // cap is a few hundred bytes, so this is the common case, not the exception.
+    if (++n > MAX_NOTES || s.size() + t.size() + 80 > cap) {
+      cut = true;
+      break;
+    }
+    std::string body = this->fetch_notes_via_relay_(t);
+    if (body.empty())
+      continue;
+    if (s.size() + body.size() + t.size() + 8 > cap) {
+      cut = true;
+      break;
+    }
+    s += "\n### " + t + "\n" + body + "\n";
+  }
+  if (cut) {
+    // The heap decides how much of a run's notes fit; point at the full list rather than ending
+    // mid-sentence with no way to read the rest.
+    s += "\n\n**… truncated — all releases:** https://github.com/" + this->github_repo_ + "/releases";
+  }
+  return s;
+#endif
 }
 
 // Channel latest + tag list from the relay. Reply is plain text: "latest <tag>" on the first line,
@@ -2918,18 +3046,49 @@ bool LibrescootBleClient::chain_possible_() const {
 
 void LibrescootBleClient::update_chain_switch_() {
   const bool possible = this->chain_possible_();
-  if (possible == this->chain_sw_available_)
-    return;
-  this->chain_sw_available_ = possible;
-  ESP_LOGI(TAG, "delta chaining is %s (method '%s', HA relay %s)",
-           possible ? "selectable" : "not selectable", this->ota_method_str_.c_str(),
-           this->integration_reachable_ ? "up" : "down");
-  if (!possible && this->ota_delta_chain_) {
-    this->ota_delta_chain_ = false;
-    if (this->chain_sw_ != nullptr)
-      this->chain_sw_->publish_state(false);
-    ESP_LOGW(TAG, "delta chaining switched off — its preconditions no longer hold");
+  if (possible != this->chain_sw_available_) {
+    this->chain_sw_available_ = possible;
+    ESP_LOGI(TAG, "delta chaining is %s (method '%s', HA relay %s)",
+             possible ? "selectable" : "not selectable", this->ota_method_str_.c_str(),
+             this->integration_reachable_ ? "up" : "down");
   }
+  this->apply_chain_state_();
+}
+
+// Effective = wanted AND possible. Publishing the effective state keeps the switch honest (the API
+// has no "unavailable" for a switch), and because the want survives, chaining comes back by itself
+// when the relay returns or the method is set back to delta — no second click needed.
+void LibrescootBleClient::apply_chain_state_() {
+  const bool eff = this->ota_chain_want_ && this->chain_possible_();
+  if (eff == this->ota_delta_chain_)
+    return;
+  this->ota_delta_chain_ = eff;
+  if (this->chain_sw_ != nullptr)
+    this->chain_sw_->publish_state(eff);
+  ESP_LOGI(TAG, "delta chaining %s", eff ? "ON (the update entities offer the channel latest, "
+                                           "merged into one install by Home Assistant)"
+                                         : "off (targets fall back to the next release)");
+  // The target and the changelog depend on it (chained → channel latest with every release's notes),
+  // so the snapshot the worker built for the other mode is stale. Re-check unless one is running.
+  this->refresh_update_availability_();
+  this->request_update_check(false);
+}
+
+// Releases strictly newer than `from` up to the channel latest, counted in the fetched tag window.
+// -1 when it cannot be told (no window, or `from` outside it) — the caller then must not claim a
+// span it does not know.
+int LibrescootBleClient::gh_steps_ahead_(const std::string &from) const {
+  if (from.empty() || this->gh_latest_tag_.empty() || this->gh_tags_.empty())
+    return -1;
+  bool in_window = false;
+  int n = 0;
+  for (const auto &t : this->gh_tags_) {
+    if (t == from)
+      in_window = true;
+    else if (t > from && t <= this->gh_latest_tag_)
+      n++;
+  }
+  return in_window ? n : -1;
 }
 
 bool LibrescootBleClient::ota_offers_allowed_() const {
@@ -2992,6 +3151,11 @@ void LibrescootBleClient::refresh_update_availability_() {
   }
   const std::string &method = this->ota_method_str_;
   const bool full = (method == "full");
+  // Delta-chaining targets the channel latest like a full image does — Home Assistant merges the
+  // run of deltas in between into one artifact, so the whole span is a single install and a single
+  // reboot. Without it a delta can only ever step to the adjacent release.
+  const bool chaining = this->ota_delta_chain_;
+  const bool jump = full || chaining;
   // Only offer while the scooter's OTA phase is explicitly IDLE (0x06). Anything else — "unknown"
   // before we've heard back, installing, pending-reboot — suppresses the offer (HA derives
   // "available" from latest != installed, so we publish latest == current to truly hide it).
@@ -3021,8 +3185,8 @@ void LibrescootBleClient::refresh_update_availability_() {
   bool mdb_at_latest = have_mdb && ieq(this->mdb_version_, latest);
   // Compute the target for the CURRENT method right here (independent of the worker's snapshot):
   // full → the channel latest; delta → the adjacent successor of that component's installed version.
-  std::string mtar = full ? latest : this->gh_successor_(have_mdb ? version_to_tag(this->mdb_version_) : "");
-  std::string dtar = full ? latest : this->gh_successor_(have_dbc ? version_to_tag(this->dbc_version_) : "");
+  std::string mtar = jump ? latest : this->gh_successor_(have_mdb ? version_to_tag(this->mdb_version_) : "");
+  std::string dtar = jump ? latest : this->gh_successor_(have_dbc ? version_to_tag(this->dbc_version_) : "");
   this->gh_mdb_target_ = mtar;  // keep in sync so perform_update + the auto-update tick agree
   this->gh_dbc_target_ = dtar;
 
@@ -3041,7 +3205,9 @@ void LibrescootBleClient::refresh_update_availability_() {
   // Which one unattended installation may take next. full: MDB reaches the channel latest first.
   // delta: the MDB leads — DBC steps only while it is behind the MDB; equal or ahead, MDB steps.
   bool mdb_avail, dbc_avail;
-  if (full) {
+  if (jump) {
+    // One install per component takes it all the way to the latest, so the MDB-leads-by-one rule of
+    // stepwise delta does not apply: bring the MDB to the latest first, then the DBC after it.
     mdb_avail = mdb_has;
     dbc_avail = dbc_has && mdb_at_latest;
   } else {
@@ -3069,9 +3235,20 @@ void LibrescootBleClient::refresh_update_availability_() {
   };
   // Header block, one item per line (markdown hard breaks). The time is the estimated BLE UPLOAD
   // time (transfer only — the on-scooter install/reboot is separate and not estimated here).
-  auto sum_line = [&](const char *label, const std::string &tgt, uint32_t sz, const std::string &notes) {
+  auto sum_line = [&](const char *label, const std::string &tgt, uint32_t sz,
+                      const std::string &installed, const std::string &notes) {
     std::string s = std::string("**") + label + " → " + tgt + "**";
-    if (sz) {
+    // How the bytes will be produced. A chained target spanning more than one release is not an
+    // asset that exists on GitHub: Home Assistant merges the run (or encodes one delta across it)
+    // when the install starts, so its size is only known then — say so instead of showing the
+    // single release's size, which would be wrong by a factor.
+    const int steps = chaining ? this->gh_steps_ahead_(version_to_tag(installed)) : 0;
+    if (chaining && steps != 1) {
+      s += "  \nUpload method: delta-chaining";
+      if (steps > 1)
+        s += " (" + std::to_string(steps) + " releases, one install)";
+      s += "  \nUpload size: computed by Home Assistant when the install starts";
+    } else if (sz) {
       s += "  \nUpload method: " + method;
       s += "  \nUpload size: " + fmt_size(sz);
       s += "  \nUpload time (est.): " + fmt_est_time(sz, this->ota_rate_bps_);
@@ -3109,6 +3286,7 @@ void LibrescootBleClient::refresh_update_availability_() {
     if (mdb_has) {
       this->mdb_update_->set_latest(mtar, "LibreScoot MDB", rel_url(mtar),
                                     sum_line("MDB", mtar, mdb_sum_ok ? this->gh_mdb_size_ : 0,
+                                             this->mdb_version_,
                                              mdb_sum_ok ? this->gh_mdb_summary_ : EMPTY));
       this->mdb_update_->set_available(true);
     } else {
@@ -3119,6 +3297,7 @@ void LibrescootBleClient::refresh_update_availability_() {
     if (dbc_has) {
       this->dbc_update_->set_latest(dtar, "LibreScoot DBC", rel_url(dtar),
                                     sum_line("DBC", dtar, dbc_sum_ok ? this->gh_dbc_size_ : 0,
+                                             this->dbc_version_,
                                              dbc_sum_ok ? this->gh_dbc_summary_ : EMPTY));
       this->dbc_update_->set_available(true);
     } else {
@@ -3502,18 +3681,12 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
       // option only means anything with the delta method and a reachable relay. A switch cannot
       // report "unavailable" over the API, so refuse instead of accepting a setting that could
       // not be honoured.
-      if (state && !this->chain_possible_()) {
+      this->ota_chain_want_ = state;
+      if (state && !this->chain_possible_())
         ESP_LOGW(TAG, "delta chaining needs OTA Update Method 'delta' and a reachable HA relay "
-                      "(method '%s', relay %s) — staying off",
+                      "(method '%s', relay %s) — it engages as soon as both hold",
                  this->ota_method_str_.c_str(), this->integration_reachable_ ? "up" : "down");
-        if (this->chain_sw_ != nullptr)
-          this->chain_sw_->publish_state(false);
-        break;
-      }
-      this->ota_delta_chain_ = state;
-      if (this->chain_sw_ != nullptr)
-        this->chain_sw_->publish_state(state);
-      ESP_LOGI(TAG, "delta chaining %s", state ? "ON (one install for a run of releases)" : "off");
+      this->apply_chain_state_();
       break;
     case SwKind::AUTO_UPDATE:
       // Install every offered update unattended (per the availability rules), then switch itself off

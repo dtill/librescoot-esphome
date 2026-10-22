@@ -272,6 +272,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void set_dbc_power(LibrescootSwitch *s) { dbc_power_ = s; }
   void set_dbc_ready(binary_sensor::BinarySensor *b) { dbc_ready_ = b; }
   void set_dbc_auto_power(bool v) { dbc_auto_power_ = v; }
+  void set_delta_chaining(bool on) { this->ota_chain_want_ = on; }
   void set_ums_status(binary_sensor::BinarySensor *b) { ums_status_ = b; }
   void set_maps_available(binary_sensor::BinarySensor *b) { maps_available_ = b; }
   void set_nav_available(binary_sensor::BinarySensor *b) { nav_available_ = b; }
@@ -563,6 +564,8 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   bool dbc_version_probe_{false};     // auto-update powered the dashboard on to learn its version
   uint32_t dbc_probe_ms_{0};          // last fresh-version fetch round
   uint32_t dbc_dash_ok_ms_{0};        // last dbc:on-wait:ok — versions seen after it are the dashboard's own
+  uint32_t dbc_on_since_ms_{0};       // when the dashboard was last seen coming on (its updater needs time)
+  static constexpr uint32_t DBC_HANDOFF_SETTLE_MS = 90UL * 1000UL;
   // Freshness for unattended decisions: when each version was last fetched live, when the scooter
   // last booted, when auto-update was switched on.
   uint32_t mdb_version_seen_ms_{0}, dbc_version_seen_ms_{0}, scooter_boot_ms_{0};
@@ -615,8 +618,18 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // Assistant relay (it needs xdelta3 and ~100 MB), so the switch is only meaningful with the
   // delta method and a reachable relay; outside that it reports no state at all.
   switch_::Switch *chain_sw_{nullptr};
+  // Chaining has a wanted state and an effective one. It is ON by default because it is what makes
+  // a scooter more than one release behind updatable at all, but it can only work with the delta
+  // method and a reachable Home Assistant relay (the merge runs there). `ota_chain_want_` is the
+  // user's choice, `ota_delta_chain_` is what actually applies; the switch shows the latter, so it
+  // reads as off while the preconditions are missing and turns itself back on when they return.
+  bool ota_chain_want_{true};  // set from YAML (delta_chaining:), then by the switch
   bool ota_delta_chain_{false};
   bool chain_sw_available_{false};
+  void apply_chain_state_();
+  // How many releases lie between an installed version and the channel latest (0 = at latest,
+  // 1 = the adjacent successor, >1 = only reachable as a chain).
+  int gh_steps_ahead_(const std::string &from) const;
   bool chain_possible_() const;
   void update_chain_switch_();
 
@@ -696,6 +709,9 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // Release notes over the plain-HTTP relay, for boards without heap for a second TLS session.
   // Returns "" when unavailable.
   std::string fetch_notes_via_relay_(const std::string &tag);
+  // Every release's notes between two tags, newest first, one relay request per release. Used for a
+  // chained target, where the install covers the whole run and so must show the whole changelog.
+  std::string relay_changelog_(const std::string &from, const std::string &to);
   // Can this board actually fetch the firmware bytes? A plain-HTTP source (HA relay / mirror)
   // needs that server reachable; an https source (GitHub) needs a working TLS path (cert bundle,
   // i.e. a PSRAM board — the classic can't do the RSA-4096 CDN handshake).
@@ -744,6 +760,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   std::string gh_current_tag_;            // installed MDB version (tag form) snapshot, for the range
   std::string gh_current_dbc_tag_;        // installed DBC version (tag form) snapshot, for the range
   std::string gh_method_;                 // "delta"/"full" snapshot for the worker
+  bool gh_chain_{false};                  // delta-chaining snapshot: target the channel latest
   std::string gh_latest_tag_;             // channel latest (result written by the task)
   std::string gh_summary_;                // legacy aggregate (installed MDB → latest); kept for compat
   // Per-component target + changelog computed by the worker: delta → the NEXT release (successor of
@@ -815,6 +832,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   int ota_rewinds_{0};
   uint32_t ota_state_ms_{0};             // for phase timeouts
   bool ota_complete_pending_{false};     // all bytes acked; COMPLETE waits for the dashboard's on-wait
+  uint32_t ota_complete_after_ms_{0};    // ...and for the dashboard to have been up long enough
   uint32_t ota_last_ack_ms_{0};
   uint32_t ota_start_ms_{0};             // throughput
   uint32_t ota_last_report_ms_{0};       // status/log throttle (interval scales with file size)
