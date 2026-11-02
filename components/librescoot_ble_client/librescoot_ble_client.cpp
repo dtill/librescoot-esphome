@@ -36,9 +36,11 @@ static const uint32_t PAIR_ARM_WINDOW_MS = 300000;  // 5 min
 // Space out pairing retries. Back-to-back attempts (reconnect, fail, reconnect) gain nothing and
 // push the peripheral into SMP rate-limiting, which makes a temporary refusal look permanent.
 static const uint32_t PAIR_RETRY_BACKOFF_MS = 10000;
-// Re-encryption needs no user action, so it is retried more patiently than a fresh pairing.
-// Bounded, so a bond the scooter has forgotten is still reported.
-static const uint32_t REAUTH_RETRY_BACKOFF_MS = 30000;
+// Re-encryption needs no user action. While the bond is still held, a failure is retried with a
+// growing pause instead of being given up on: at the edge of range (coming back from a ride) the
+// link regularly drops mid-encryption, and that says nothing about the bond. The last step repeats.
+static const uint32_t REAUTH_BACKOFF_MS[] = {30000, 60000, 120000, 300000, 600000};
+static const uint8_t REAUTH_BACKOFF_STEPS = sizeof(REAUTH_BACKOFF_MS) / sizeof(REAUTH_BACKOFF_MS[0]);
 // Minimum spacing between two update-check link releases, whatever requested the check. Several
 // callers can request one, including the version-change trigger that fires on every reconnect.
 static const uint32_t CHECK_RELEASE_MIN_GAP_MS = 30 * 60 * 1000UL;
@@ -49,7 +51,6 @@ static const uint32_t CHECK_RETRY_MAX_MS = 15 * 60 * 1000UL;
 static const uint32_t CHECK_RETRY_RATE_LIMIT_MS = 20 * 60 * 1000UL;
 // Contiguous internal heap the asset lookup's TLS handshake needs, with margin.
 static const size_t RESOLVE_BLOCK_MIN = 10000;
-static const uint8_t REAUTH_FAIL_MAX = 5;
 // "interval" link mode: how long to stay connected per cycle — long enough for on_connected_ to
 // read every characteristic once (reads are serialised, ~25 chars) plus the on-connect queries.
 static const uint32_t INTERVAL_DWELL_MS = 30000;  // 30 s
@@ -886,7 +887,21 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
 // HCI_ERR_MAX_ERR (0x43) + 10 = 77. The bare number in the log says nothing; the decoded reason
 // distinguishes "you typed the wrong code" from "the scooter refuses to pair at all".
 static const char *auth_fail_reason(uint8_t reason) {
-  switch (reason >= 77 ? reason - 77 : 0xFF) {
+  // Below the base the value is a plain HCI error — what a link that drops mid-encryption reports.
+  if (reason < 77) {
+    switch (reason) {
+      case 0x05: return "authentication failure (HCI)";
+      case 0x06: return "key missing — the scooter no longer has this bond";
+      case 0x08: return "link supervision timeout";
+      case 0x13: return "scooter closed the connection";
+      case 0x16: return "connection closed locally";
+      case 0x22: return "link-layer response timeout";
+      case 0x3D: return "MIC failure (encryption)";
+      case 0x3E: return "connection failed to establish";
+      default: return "unknown HCI reason";
+    }
+  }
+  switch (reason - 77) {
     case 0x01: return "wrong passkey";
     case 0x03: return "authentication requirements not met";
     case 0x04: return "confirm value mismatch (wrong passkey)";
@@ -979,22 +994,30 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
           this->apply_link_state_();
         } else {
           const uint8_t r = param->ble_security.auth_cmpl.fail_reason;
-          // A timeout means the scooter never answered — at weak signal no SMP packet gets through.
-          // That says nothing about the bond, so do not treat it like a refusal.
-          const bool silent = (r == 77 + 0x16 || r == 77 + 0x19);  // SMP response / connection timeout
-          if (silent && this->is_bonded_() && ++this->reauth_fail_count_ <= REAUTH_FAIL_MAX) {
-            this->pair_backoff_until_ms_ = millis() + REAUTH_RETRY_BACKOFF_MS;
+          // Only a lost bond justifies giving up: the local bond list no longer has the scooter, or
+          // the controller reports the key as missing (HCI 0x06). Everything else — SMP timeout,
+          // link lost, supervision timeout, a connection that failed to establish — is what a weak
+          // link produces when the scooter comes back into range, and the bond is still good. Those
+          // are retried with a growing pause; a forgotten bond on the scooter's side still surfaces,
+          // because the scooter then asks for a passkey, and an unrequested PASSKEY_REQ blocks.
+          const bool key_missing = (r == 0x06);
+          if (!key_missing && this->is_bonded_()) {
+            const uint8_t step = this->reauth_fail_count_ < REAUTH_BACKOFF_STEPS
+                                     ? this->reauth_fail_count_
+                                     : (uint8_t) (REAUTH_BACKOFF_STEPS - 1);
+            const uint32_t wait = REAUTH_BACKOFF_MS[step];
+            if (this->reauth_fail_count_ < 255)
+              this->reauth_fail_count_++;
+            this->pair_backoff_until_ms_ = millis() + wait;
             ESP_LOGW(TAG, "Re-encryption failed: %s (reason %d) — bond still held, retrying in %u s "
-                          "(%u/%u)",
-                     auth_fail_reason(r), r, (unsigned) (REAUTH_RETRY_BACKOFF_MS / 1000),
-                     this->reauth_fail_count_, REAUTH_FAIL_MAX);
-            this->set_timeout("pair_backoff", REAUTH_RETRY_BACKOFF_MS,
-                              [this]() { this->apply_link_state_(); });
+                          "(attempt %u)",
+                     auth_fail_reason(r), r, (unsigned) (wait / 1000), (unsigned) this->reauth_fail_count_);
+            this->set_timeout("pair_backoff", wait, [this]() { this->apply_link_state_(); });
             this->apply_link_state_();
             break;
           }
-          // Refused, or silent often enough that retrying is pointless: release the link so the
-          // scooter is not spammed with authentication attempts.
+          // The bond is gone: release the link so the scooter is not spammed with authentication
+          // attempts. Re-bonding is a deliberate act.
           ESP_LOGW(TAG, "Unrequested pairing failed: %s (reason %d) — link released so the scooter "
                         "isn't spammed. Press 'BLE Pairing Start' (or the HA pairing Repair) to "
                         "(re)bond.",
@@ -1029,7 +1052,19 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
 
 bool LibrescootBleClient::parse_device(const espbt::ESPBTDevice &device) {
   if (device.address_uint64() == this->get_address()) {
-    this->last_adv_ms_ = millis();
+    const uint32_t now = millis();
+    // Back in range after an absence (a ride): start the re-encryption backoff from scratch and
+    // drop a pending pause, so the link comes back right away instead of after up to 10 minutes.
+    // A real pairing block is untouched — that needs a deliberate re-bond.
+    const bool returned = this->last_adv_ms_ != 0 && now - this->last_adv_ms_ > this->presence_timeout_ms_;
+    this->last_adv_ms_ = now;
+    if (returned && this->reauth_fail_count_ != 0 && !this->pairing_armed_()) {
+      this->reauth_fail_count_ = 0;
+      this->pair_backoff_until_ms_ = 0;
+      this->cancel_timeout("pair_backoff");
+      ESP_LOGI(TAG, "scooter back in range — re-encryption backoff reset");
+      this->defer([this]() { this->apply_link_state_(); });
+    }
     // Publish the advertisement RSSI (throttled) so the signal to the CONFIGURED scooter is visible
     // even while disconnected — the connection-RSSI read only works once connected. Lets the pairing
     // dialog show whether the scooter is actually in range and how strong.

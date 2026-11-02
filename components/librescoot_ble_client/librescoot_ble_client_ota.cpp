@@ -510,7 +510,7 @@ void LibrescootBleClient::ota_publish_rates_() {
     this->ota_ul_ema_bpms_ = (this->ota_ul_ema_bpms_ <= 0.0f) ? ul : (0.6f * this->ota_ul_ema_bpms_ + 0.4f * ul);
   if (this->ota_eta_ != nullptr && this->ota_ul_ema_bpms_ > 0.0f && this->ota_total_ > this->ota_acked_) {
     const uint32_t secs = (uint32_t) ((float) (this->ota_total_ - this->ota_acked_) / (this->ota_ul_ema_bpms_ * 1000.0f));
-    char eta[12];
+    char eta[16];
     snprintf(eta, sizeof(eta), "%02u:%02u:%02u", (unsigned) (secs / 3600), (unsigned) ((secs % 3600) / 60),
              (unsigned) (secs % 60));
     this->ota_eta_->publish_state(eta);
@@ -1490,8 +1490,8 @@ void LibrescootBleClient::ota_fail_(const char *why) {
       }
     }
     ESP_LOGW(OTAG, "self-heal: '%s' — auto-resume #%u (streak %u/%u) in %u s", why,
-             (unsigned) this->ota_selfheal_total_, (unsigned) this->ota_selfheal_count_, OTA_SELFHEAL_MAX,
-             OTA_SELFHEAL_BACKOFF_MS / 1000);
+             (unsigned) this->ota_selfheal_total_, (unsigned) this->ota_selfheal_count_, (unsigned) OTA_SELFHEAL_MAX,
+             (unsigned) (OTA_SELFHEAL_BACKOFF_MS / 1000));
     if (this->ota_status_ != nullptr)
       this->ota_status_->publish_state(std::string("Auto-resume #") + std::to_string((unsigned) this->ota_selfheal_count_) +
                                        " (" + why + ")");
