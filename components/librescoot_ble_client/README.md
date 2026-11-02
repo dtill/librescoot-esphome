@@ -246,7 +246,9 @@ Press *Install* and the ESP transfers the firmware to the scooter over Bluetooth
 The ESP installs one release after the other — scooter computer first, dashboard second — and
 waits out each reboot until the scooter is current. Before every step it waits a few minutes
 (2 after switching on, 5 after a scooter reboot), switches the dashboard on and asks both parts
-for their versions; it never decides on a cached version. It switches itself **off** when done,
+for their versions; it never decides on a cached version. Before a scooter-computer step it
+switches the dashboard off again, because the scooter only reboots into the new version with the
+dashboard off; a dashboard that was already on stays on. It switches itself **off** when done,
 on the first failed install, and after every ESP restart. Switch it on in the evening, check
 **SW MDB** / **SW DBC** in the morning.
 
@@ -339,7 +341,7 @@ On an **ESP32-S3** the ESP can download the firmware from GitHub by itself, so u
 | `Error: delta needs <tag>` | This delta does not fit the installed version, and chaining was not available to bridge the gap. | Check **OTA Update Method delta-chaining** is on (it needs the HA relay), install the next release first, or use method `full`. |
 | `Error: chain: …` | Home Assistant could not merge the deltas (the text says why). | Pick a nearer target, or method `full`. |
 | `Auto-resume #n (…)` | Bluetooth dropped some bytes. The transfer continues by itself. | Nothing. Closer is faster. |
-| `Pending reboot` for a long time / **OTA Reboot Required** on | The scooter did not reboot after an MDB update. | Press **Reboot MDB (hard)**. |
+| `Pending reboot` for a long time / **OTA Reboot Required** on | The scooter did not reboot after an MDB update. It waits for the dashboard to be off before it does. | Switch **DBC Power** off. If it still does not reboot, press **Reboot MDB (hard)**. |
 | `Installing — waiting for scooter reboot…` after a DBC update | The dashboard is off, so the update has not applied yet. | Switch **DBC Power** on (`dbc_auto_power` does this by itself). |
 | No update shown although there is a newer release | Scooter out of range, link mode `scan`/`disconnect`, or the scooter is still busy with the last install. | Bring it in range, choose `auto`/`always`, or wait. |
 | Install refused: no firmware source | Neither the integration nor direct GitHub is available. | Install the [Home Assistant integration](../../homeassistant-integration/README.md), or use an ESP32-S3. |

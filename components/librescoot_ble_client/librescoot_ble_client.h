@@ -562,6 +562,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   bool dbc_autopower_was_off_{false}; // power off again afterwards only if we switched it on
   uint8_t dbc_autopower_tries_{0};
   bool dbc_version_probe_{false};     // auto-update powered the dashboard on to learn its version
+  bool dbc_probe_powered_{false};     // ...and it was off before: auto-update must switch it off again
   uint32_t dbc_probe_ms_{0};          // last fresh-version fetch round
   uint32_t dbc_dash_ok_ms_{0};        // last dbc:on-wait:ok — versions seen after it are the dashboard's own
   uint32_t dbc_on_since_ms_{0};       // when the dashboard was last seen coming on (its updater needs time)
@@ -572,6 +573,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   uint32_t ota_auto_armed_ms_{0};
   void handle_dbc_response_(const std::string &line);
   void dbc_autopower_finish_();
+  void dbc_probe_release_(const char *why);
   binary_sensor::BinarySensor *maps_available_{nullptr}, *nav_available_{nullptr};
   binary_sensor::BinarySensor *ble_connection_{nullptr}, *ble_presence_{nullptr};
   uint32_t presence_timeout_ms_{60000};  // "Home" if an advert was seen within this window

@@ -1827,6 +1827,23 @@ void LibrescootBleClient::dbc_autopower_finish_() {
   }
 }
 
+// Switch the dashboard off again if OTA Auto Update's version probe switched it on. Not while an
+// install is in flight (a DBC install needs it running); the flag then stays and a later tick
+// retries. Without a link the command cannot be sent either, so the flag waits for the reconnect.
+void LibrescootBleClient::dbc_probe_release_(const char *why) {
+  if (!this->dbc_probe_powered_)
+    return;
+  if (this->ota_state_ != OtaState::IDLE || this->ota_awaiting_version_ || this->ota_resolve_running_ ||
+      !this->ota_jobs_.empty() || this->dbc_autopower_active_)
+    return;
+  if (this->state() != espbt::ClientState::ESTABLISHED)
+    return;
+  this->dbc_probe_powered_ = false;
+  ESP_LOGI(TAG, "auto-update: powering the dashboard off again (%s)", why);
+  this->send_ext_query_("dbc:off");
+  this->pending_queries_.push_back("dbc:status");
+}
+
 // ---------------------------------------------------------------------------
 // writes
 // ---------------------------------------------------------------------------
@@ -3352,8 +3369,10 @@ void LibrescootBleClient::refresh_update_availability_() {
 // one at a time, waiting out each install's reboot. When nothing is left after a fresh GitHub check,
 // switch itself back off. Called at the end of every refresh_update_availability_ and periodically.
 void LibrescootBleClient::ota_auto_update_tick_() {
-  if (!this->ota_auto_update_)
+  if (!this->ota_auto_update_) {
+    this->dbc_probe_release_("OTA Auto Update is off");
     return;
+  }
   // Gate hard: only act with the scooter fully idle + connected, the engine free, and versions known.
   // These gates also make us wait out an install's reboot before the next step.
   if (this->ota_scooter_phase_ != 0x06)
@@ -3395,6 +3414,9 @@ void LibrescootBleClient::ota_auto_update_tick_() {
       if (!dbc_fresh) {
         if (this->dbc_present_ && this->dbc_auto_power_ && !this->dbc_version_probe_) {
           this->dbc_version_probe_ = true;
+          // Only a dashboard that was off counts as ours to switch off again later.
+          if (this->dbc_power_known_ && !this->dbc_power_on_)
+            this->dbc_probe_powered_ = true;
           this->send_ext_query_("dbc:on-wait");  // its reply queues status:version:dbc
         } else {
           this->pending_queries_.push_back("status:version:dbc");
@@ -3414,6 +3436,14 @@ void LibrescootBleClient::ota_auto_update_tick_() {
   if (comp >= 0) {
     const std::string &tgt = (comp == 1) ? this->gh_dbc_target_ : this->gh_mdb_target_;
     ESP_LOGW(TAG, "auto-update: installing %s → %s", comp == 1 ? "DBC" : "MDB", tgt.c_str());
+    if (comp == 1) {
+      // A DBC install needs the dashboard running; the install's own power handling takes it over.
+      this->dbc_probe_powered_ = false;
+    } else {
+      // update-service reboots the MDB only once the dashboard reports power off, and it waits for
+      // that without a deadline — a dashboard left on by the version probe holds the reboot forever.
+      this->dbc_probe_release_("MDB install next");
+    }
     this->ota_auto_check_pending_ = true;  // an install fired → require a fresh check before "done"
     this->ota_target_version_.clear();     // auto mode uses the per-component target, not a manual pin
     this->perform_update((uint8_t) comp, false);
@@ -3424,6 +3454,7 @@ void LibrescootBleClient::ota_auto_update_tick_() {
   // auto-install (ota_auto_check_pending_ is cleared in apply_check_result_), then switch off.
   if (!this->ota_auto_check_pending_ && this->gh_ok_) {
     ESP_LOGI(TAG, "auto-update: everything up to date — switching OTA Auto Update off");
+    this->dbc_probe_release_("nothing left to install");
     this->ota_auto_update_ = false;
     if (this->auto_update_sw_ != nullptr)
       this->auto_update_sw_->publish_state(false);
@@ -3694,6 +3725,7 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
         break;
       }
       this->run_command_(state ? "dbc:on-wait" : "dbc:off-wait");
+      this->dbc_probe_powered_ = false;  // the user decides now; auto-update must not undo it
       this->dbc_suppress_until_ = millis() + 5000;
       if (this->dbc_power_ != nullptr)
         this->dbc_power_->publish_state(state);
