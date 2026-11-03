@@ -45,6 +45,8 @@ esp32:
 #   flash_size: 16MB
 #   framework:
 #     type: esp-idf
+#     advanced:
+#       flash_chip: generic   # generic flash driver only: frees IRAM, which the S3 shares with its heap
 # psram:
 #   mode: octal
 #   speed: 80MHz
@@ -80,8 +82,9 @@ wifi:
 
 captive_portal:
 
-# Optional. Leave it out on an ESP32 classic: its task and buffers come out of the same
-# internal RAM a firmware transfer needs, and Home Assistant shows everything it would.
+# Optional, off by default on both boards: its task and buffers come out of the internal RAM
+# that TLS, the BLE stack and a firmware transfer share (PSRAM does not help there), and Home
+# Assistant shows everything it would.
 # web_server:
 #   local: true
 #   version: 3

@@ -178,6 +178,12 @@ Sensors read *unknown* while the ESP is not connected to the scooter.
 A control you use while not connected is carried out as soon as the ESP connects. A firmware
 transfer always keeps the connection.
 
+**Coming back from a ride.** At the edge of range a reconnect can fail halfway. The ESP then tries
+again after a growing pause (up to 10 min) and starts over as soon as the scooter is back in range.
+If the scooter refuses the reconnect although the ESP still has the pairing stored, the ESP's own
+Bluetooth stack has lost the key: the ESP restarts Bluetooth by itself, reloads the pairing and
+reconnects. Wi-Fi and Home Assistant stay connected, and there is nothing to pair again.
+
 ---
 
 ## Alarm

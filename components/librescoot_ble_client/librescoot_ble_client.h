@@ -668,6 +668,9 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // Apply the SMP parameters required to bond with the scooter (keyboard-only IO, SC + MITM,
   // bonding). Owned by the component so pairing does not depend on YAML.
   void apply_security_params_();
+  void ble_before_disabled_event_handler() override;
+  void start_ble_reload_();
+  void service_ble_reload_();
 #ifdef USE_API
   void on_passkey_service_(int32_t pin);  // int32_t: distinct from int on xtensa
   void on_ota_test_service_(std::string url, int32_t size, std::string bundle, int32_t component);
@@ -682,6 +685,15 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   bool passkey_req_open_{false};  // a PASSKEY_REQ is outstanding right now
   uint32_t pair_backoff_until_ms_{0};  // don't re-attempt pairing before this (see auth failures)
   uint8_t reauth_fail_count_{0};  // consecutive silent re-encryption failures while bonded
+  // Authentication failed on the current connection: its service discovery describes a link that is
+  // being torn down and must not be evaluated. Cleared when the next connection opens.
+  bool auth_failed_conn_{false};
+  // Reloading the BLE stack after the stack lost the scooter's key in RAM while the bond is still
+  // stored (reason 82 with the bond held). 0 idle, 1 disable requested, 2 stack down, 3 enable
+  // requested, 4 up and waiting for the bond list. Once per incident: reset by a successful auth.
+  uint8_t ble_reload_phase_{0};
+  bool ble_reload_used_{false};
+  uint32_t ble_reload_started_ms_{0};
   bool bond_seen_{false};  // last observed bond-list membership, to log the transition
   // The update check may release the BLE link on a board whose heap cannot carry both.
   bool check_link_release_{false};

@@ -807,7 +807,17 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
       if (this->ota_state_ == OtaState::STREAMING)
         ESP_LOGD("ota", "congest %s", param->congest.congested ? "ON" : "off");
       break;
+    case ESP_GATTC_OPEN_EVT:
+      this->auth_failed_conn_ = false;  // a new connection: its discovery is evaluated again
+      break;
     case ESP_GATTC_SEARCH_CMPL_EVT: {
+      // A discovery that completes on a link we are already dropping (authentication failed, or the
+      // client was disabled) finds nothing usable. Evaluating it would report every characteristic
+      // as absent and the OTA and alarm services as missing. Keep what the last real connection found.
+      if (this->auth_failed_conn_ || !this->enabled_) {
+        ESP_LOGD(TAG, "service discovery on a closing link — not evaluated");
+        break;
+      }
       for (auto &e : this->chars_) {
         auto *chr = this->get_characteristic(e.service, e.chr);
         if (chr == nullptr) {
@@ -969,6 +979,7 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
           this->pair_arm_until_ms_ = 0;  // bonded — disarm
           this->pairing_blocked_ = false;
           this->reauth_fail_count_ = 0;
+          this->ble_reload_used_ = false;  // the incident is over; a later one may reload again
           this->pair_backoff_until_ms_ = 0;
           this->pending_passkey_until_ms_ = 0;  // bonded; forget the code
           if (this->ble_passkey_text_ != nullptr)
@@ -1001,6 +1012,24 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
           // are retried with a growing pause; a forgotten bond on the scooter's side still surfaces,
           // because the scooter then asks for a passkey, and an unrequested PASSKEY_REQ blocks.
           const bool key_missing = (r == 0x06);
+          this->auth_failed_conn_ = true;
+          // The scooter refusing a PAIRING while the bond is stored means this ESP's BLE stack has lost
+          // the scooter's key from RAM: with the key it would re-encrypt and never start a pairing.
+          // Retrying cannot help — only reloading the stack from flash does. Once per incident, and
+          // not while the OTA engine holds anything (the reload drops every BLE state).
+          const bool ota_busy = this->ota_state_ != OtaState::IDLE || this->ota_active_ ||
+                                !this->ota_jobs_.empty() || this->ota_resolve_running_ ||
+                                this->ota_awaiting_version_;
+          if (r == 77 + 0x05 && this->is_bonded_() && !this->ble_reload_used_ && !ota_busy &&
+              this->ble_reload_phase_ == 0) {
+            ESP_LOGW(TAG, "Re-encryption failed: %s (reason %d), but the bond is stored — the BLE stack "
+                          "lost the scooter's key from RAM. Reloading the BLE stack from flash.",
+                     auth_fail_reason(r), r);
+            this->ble_reload_used_ = true;
+            this->set_enabled(false);
+            this->defer([this]() { this->start_ble_reload_(); });
+            break;
+          }
           if (!key_missing && this->is_bonded_()) {
             const uint8_t step = this->reauth_fail_count_ < REAUTH_BACKOFF_STEPS
                                      ? this->reauth_fail_count_
@@ -2166,6 +2195,64 @@ void LibrescootBleClient::apply_security_params_() {
   ESP_LOGI(TAG, "pairing capability: keyboard-only IO, secure connections + MITM, bonding, 16 B key");
 }
 
+// Tear the BLE stack down and bring it back, so Bluedroid reloads the bonds from flash. ESPHome's
+// esp32_ble owns the stack; disable() is serviced in its loop, which first calls
+// ble_before_disabled_event_handler() on every client (resetting them) and then deinitialises
+// Bluedroid. enable() may only follow once that has happened — requested earlier, it cancels the
+// teardown instead.
+void LibrescootBleClient::start_ble_reload_() {
+  if (esp32_ble::global_ble == nullptr || this->ble_reload_phase_ != 0)
+    return;
+  this->ble_reload_phase_ = 1;
+  this->ble_reload_started_ms_ = millis();
+  esp32_ble::global_ble->disable();
+  this->set_interval("ble_reload", 200, [this]() { this->service_ble_reload_(); });
+}
+
+void LibrescootBleClient::ble_before_disabled_event_handler() {
+  // A torn-down stack delivers no CLOSE_EVT, so do here what the disconnect handler would.
+  for (auto &e : this->chars_)
+    e.handle = 0;
+  this->pending_queries_.clear();
+  this->mark_unknown_();
+  BLEClientBase::ble_before_disabled_event_handler();
+  if (this->ble_reload_phase_ == 1)
+    this->ble_reload_phase_ = 2;  // the stack is deinitialised right after this returns
+}
+
+void LibrescootBleClient::service_ble_reload_() {
+  auto *ble = esp32_ble::global_ble;
+  const uint32_t elapsed = millis() - this->ble_reload_started_ms_;
+  if (this->ble_reload_phase_ == 2) {
+    this->ble_reload_phase_ = 3;
+    ble->enable();
+    return;
+  }
+  if (this->ble_reload_phase_ == 3 && ble->is_active()) {
+    this->apply_security_params_();  // ours are not part of esp32_ble's setup; the teardown lost them
+    this->ble_reload_phase_ = 4;
+    return;
+  }
+  // Bluedroid loads the bonds while it starts; wait until ours is visible before taking the link.
+  if (this->ble_reload_phase_ == 4 && this->is_bonded_()) {
+    ESP_LOGI(TAG, "BLE stack reloaded in %u ms, bond with the scooter is back — reconnecting",
+             (unsigned) elapsed);
+    this->ble_reload_phase_ = 0;
+    this->cancel_interval("ble_reload");
+    this->apply_link_state_();
+    return;
+  }
+  if (elapsed > 20000) {
+    ESP_LOGE(TAG, "BLE stack reload did not finish (phase %u after %u ms) — giving up, the regular "
+                  "retries take over", this->ble_reload_phase_, (unsigned) elapsed);
+    if (this->ble_reload_phase_ < 3)
+      ble->enable();
+    this->ble_reload_phase_ = 0;
+    this->cancel_interval("ble_reload");
+    this->apply_link_state_();
+  }
+}
+
 #ifdef USE_API
 // Passkey as a service, for automations and the companion integration. Registered from C++ so
 // pairing does not depend on the YAML API config.
@@ -2228,6 +2315,10 @@ void LibrescootBleClient::service_presence_() {
 }
 
 void LibrescootBleClient::service_pairing_watch_() {
+  // While the BLE stack is reloaded the bond list is unreadable; judging it now would report the bond
+  // as gone and flip BLE Pairing Required for nothing.
+  if (this->ble_reload_phase_ != 0)
+    return;
   // Periodic re-evaluation of the link decision; every other apply_link_state_() call is
   // event-driven, so a client left disabled would stay disabled. Idempotent (set_enabled() returns
   // early when unchanged). Skipped while the link is deliberately down.
