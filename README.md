@@ -3,9 +3,7 @@ ESPHome Components and configurations for "UNU Scooter Pro" with opensource [Lib
 
 
 - [MDB nRF-BLE-Client](#mdb-nrf-ble-client)
-    - [Quick start](#quick-start)
     - [What you get](#what-you-get)
-    - [Which ESP32 — and do I need the Home Assistant integration?](#which-esp32--and-do-i-need-the-home-assistant-integration)
 - [CBB monitoring via I²C addr 0x36 and 0x0B](#cbb-monitoring-via-ic-addr-0x36-and-0x0b)
     - [Wiring](#wiring)
     - [I2C Addressing](#i2c-addressing)
@@ -28,19 +26,17 @@ ESPHome Components and configurations for "UNU Scooter Pro" with opensource [Lib
 
 ### [MDB nRF-BLE-Client](librescoot-ble-client-example.yaml)
 
-**Component edition.** Bluetooth interface for the unu Scooter Pro (Librescoot FW, nRF >v2.0.0-ls),
-built as the [`librescoot_ble_client`](components/librescoot_ble_client/) external component: the
-BLE client, passkey pairing, every characteristic parser, the extended-command engine, the link
-manager and the **BLE-OTA firmware transfer** all live in C++. **The YAML only names the entities it
-wants.** Characteristic reference:
-[LibreScoot Tech Reference — Bluetooth Interface](https://reference.librescoot.org/latest/bluetooth/)
+Bluetooth bridge for the unu Scooter Pro on LibreScoot firmware, built as the
+[`librescoot_ble_client`](components/librescoot_ble_client/) external component: lock, blinkers,
+seatbox, alarm, batteries, odometer and state as Home Assistant entities — plus firmware updates
+for the scooter over Bluetooth, straight from the LibreScoot GitHub releases. **The YAML only
+names the entities it wants.**
 
 ```yaml
 external_components:
   - source: github://dtill/librescoot-esphome
     components: [librescoot_ble_client]
 
-# BLE stack plumbing (shared, stack-level; stays in the YAML)
 esp32_ble:
 esp32_ble_tracker:
 
@@ -51,76 +47,29 @@ librescoot_ble_client:
   status:       {name: "Status"}
   odometer:     {name: "Odometer"}
   scooter_lock: {name: "Scooter Lock"}
-  # ... only the entities you name are created ...
+  # … only the entities you name are created
 ```
 
-Every option and every entity key is documented in the
-**[component README](components/librescoot_ble_client/README.md)** — start there for anything beyond
-the walkthrough below.
-
-#### Quick start
-
-**1. Flash.** Put your Wi-Fi, an API key and the scooter's Bluetooth MAC into `secrets.yaml`, then
-flash [`librescoot-ble-client-example.yaml`](librescoot-ble-client-example.yaml) once over USB
-(`esphome run …`). After that it updates itself over Wi-Fi. Add the ESP to Home Assistant — it is
-discovered automatically. **Control and all sensors work from here on.**
-
-**2. Pair.** The scooter must be **on and unlocked**, and you need to see its dashboard.
-
-1. Press **BLE Pairing Start** — the only thing that starts pairing.
-2. Read the **6-digit code** off the dashboard (10–15 s until it appears).
-3. Type it into **BLE Pairing Passkey**.
-4. Press **BLE Pairing Send Passkey**.
-
-**The code expires ~30 s after it appears**, so do 2–4 in one go; if it expires the scooter shows a
-new one. **BLE Pairing Required** turns *OK* only once the bond really exists. From then on the ESP
-reconnects on its own.
-
-**3. Update the scooter's firmware.** Pick a channel (**OTA channel**) and a method
-(**OTA Update Method**: `full` always applies, `delta` is a small patch against the immediately
-preceding release). When a release is available, **OTA MDB Update** and **OTA DBC Update** each
-offer their board's next step — press **Install** on either. Unattended installation
-(**OTA Auto Update**) keeps them in order and does one at a time. The scooter reboots after each
-install; the component waits that out. Nothing is ever installed on its own.
-
-**Several releases behind?** With `delta` each release patches only its predecessor, so the scooter
-is normally brought forward one install and one reboot at a time. **OTA Update Method
-delta-chaining** (off by default, needs the companion integration) merges the whole run into a
-single artifact instead — one install, one reboot. It does not save bytes, and on a board with PSRAM
-the ESP verifies the result against the official release over TLS before accepting the merged
-artifact.
+**Getting started:** flash [`librescoot-ble-client-example.yaml`](librescoot-ble-client-example.yaml)
+(one config for an ESP32 classic or an ESP32-S3 — only the `esp32:`/`psram:` block differs), pair
+with the code from the scooter's dashboard, done. Every step, option, entity and troubleshooting
+table is in the **[component README](components/librescoot_ble_client/README.md)**.
 
 #### What you get
 
-Lock/unlock, seatbox, blinkers, alarm, dashboard power, USB/UMS mode, navigation and power-management
-controls;
-battery, CBB and aux-battery telemetry, odometer, operating state, versions and RSSI; alarm state
-and an **alarm trigger event** (what set it off, delivered even if it happened while the ESP was
-out of range — nRF v2.11 firmware or newer); the freeform extended-command channel; and firmware
-updates for both scooter boards straight from GitHub releases, with resume, self-healing transfers
-and progress/throughput sensors.
+| | Entities |
+| :--- | :--- |
+| Control | lock/unlock, blinkers, seatbox, hibernate/wake/reboot, USB mode, navigation target |
+| Telemetry | operating state, odometer, both traction batteries, aux and connectivity battery, versions, RSSI |
+| Alarm | state, armed switch, trigger **event** (what set it off), last trigger |
+| Dashboard | power switch and ready state |
+| Firmware updates | update entities for the scooter computer and the dashboard, unattended mode, delta (incl. the smaller HDiffPatch `.hdelta`) / full / chained deltas, live progress |
+| Extended commands | freeform command channel |
 
-#### Which ESP32 — and do I need the Home Assistant integration?
-
-| | ESP32 classic | ESP32-S3 (PSRAM) |
-| :--- | :---: | :---: |
-| Control, all sensors, pairing | ✅ | ✅ |
-| Check for firmware updates | ✅ (via the integration, no TLS needed) | ✅ (direct) |
-| Firmware download **via Home Assistant** | ✅ (the only way) | ✅ (selectable) |
-| Firmware download **direct from GitHub** | ❌ (not enough memory) | ✅ (default) |
-| Home Assistant companion integration needed for updates | **Yes** | No — but supported |
-
-The classic cannot hold the GitHub-CDN TLS session next to the Bluetooth stack, so the companion
-integration downloads the release and serves the bytes over the local network. On an S3 the byte
-source is a runtime choice (**OTA Source**), so it can use the relay too. **Everything that is not a
-firmware download works without the integration on both boards.**
-
-> **One config for both boards.** The component sets the board-specific sdkconfig itself (BLE
-> connect mode on the S3, Wi-Fi/BLE buffer trimming and API batching on a board without PSRAM);
-> the example config only differs in its `esp32:`/`psram:` block. On an ESP32 classic, leave
-> `web_server` out — it competes for the internal RAM a firmware transfer needs. A device that
-> suddenly stops accepting Home Assistant connections is the symptom to watch for.
-
+**Firmware updates on an ESP32 classic** go through the
+[Home Assistant integration](homeassistant-integration/README.md), which downloads the release and
+serves it over the local network. On an **ESP32-S3** the ESP can download from GitHub itself —
+no Home Assistant needed. Everything else works on both boards without the integration.
 
 ### [CBB monitoring via I²C addr 0x36 and 0x0B](librescoot-cbb-example.yaml)
 
