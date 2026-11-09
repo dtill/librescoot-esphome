@@ -155,7 +155,11 @@ void LibrescootBleClient::ota_start(const std::string &url, const std::string &s
 
   bool eff_stage = this->stage_only_;
   ESP_LOGI(OTAG, "START %s %s size=%u chunk=%u gap=%ums bundle='%s'",
-           comp_name(component), eff_stage ? "(stage-only)" : "(install)", (unsigned) size,
+           comp_name(component),
+           this->ota_job_staged_ ? (this->ota_job_apply_ ? "(staged, last of the chain)" : "(staged)")
+           : eff_stage           ? "(stage-only)"
+                                 : "(install)",
+           (unsigned) size,
            this->ota_chunk_, this->ota_send_gap_ms_, bundle_id.c_str());
   ESP_LOGI(OTAG, "heap at start: %u B free, largest block %u B",
            (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -198,7 +202,7 @@ void LibrescootBleClient::ota_user_abort() {
 
 void LibrescootBleClient::ota_send_start_() {
   std::vector<uint8_t> m;
-  m.push_back(0x01);               // START
+  m.push_back(this->ota_job_staged_ ? 0x02 : 0x01);  // START_STAGED keeps it, START installs it
   m.push_back(0x01);               // version
   m.push_back(this->ota_component_);
   m.push_back(this->ota_chunk_ & 0xFF);
@@ -330,7 +334,13 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       }
       this->ota_progress_();
       if (this->ota_acked_ >= this->ota_total_ && this->ota_state_ == OtaState::STREAMING) {
-        if (this->stage_only_) {
+        if (this->ota_job_staged_) {
+          // A staged upload's COMPLETE only verifies and keeps it — nothing is installed, so it is
+          // sent even with OTA Stage Only on (that one holds back the APPLY instead).
+          this->ota_set_state_(OtaState::COMPLETING);
+          this->ota_park_rates_();
+          this->ota_send_complete_();
+        } else if (this->stage_only_) {
           ESP_LOGI(OTAG, "stage-only: all %u bytes acked, stopping before COMPLETE", (unsigned) this->ota_total_);
           this->ota_finish_(true);
         } else {
@@ -358,7 +368,28 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
     case 0x83: {  // COMPLETE_ACK [status]
       if (len < 2)
         return;
-      if (x[1] == 0x00) {
+      if (x[1] == 0x00 && this->ota_job_staged_) {
+        ESP_LOGI(OTAG, "COMPLETE_ACK: %s verified and staged", this->ota_bundle_id_.c_str());
+        if (!this->ota_job_apply_) {
+          this->ota_finish_(true);  // the next release of the chain follows
+        } else if (this->stage_only_) {
+          ESP_LOGW(OTAG, "staged chain uploaded — not applying it (OTA Stage Only is on)");
+          this->ota_finish_(true);
+        } else {
+          // The last artifact is on the scooter: install the whole staged set. A dashboard set is
+          // copied over at apply time, so the dashboard has to be running — power it on first, its
+          // reply sends the APPLY (the COMPLETING timeout is the fallback).
+          this->ota_apply_pending_ = true;
+          this->ota_set_state_(OtaState::COMPLETING);
+          if (this->ota_component_ == 1 && this->dbc_present_ && this->dbc_auto_power_) {
+            this->ota_complete_pending_ = true;
+            ESP_LOGW(OTAG, "staged chain complete -> powering the dashboard on before APPLY_STAGED");
+            this->send_ext_query_("dbc:on-wait");
+          } else {
+            this->ota_send_complete_();
+          }
+        }
+      } else if (x[1] == 0x00) {
         ESP_LOGI(OTAG, "COMPLETE_ACK: verified & queued");
         this->ota_set_state_(OtaState::INSTALLING);
       } else {
@@ -372,7 +403,10 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       if (len < 3)
         break;
       uint8_t phase = x[1], pct = x[2];
-      this->ota_state_ms_ = millis();  // progress arrived → reset the no-progress timeout
+      // Progress arrived → reset the no-progress timeout. Not on "idle": a STATUS_REQ answered
+      // with idle is no sign of an install still running.
+      if (phase != 0x06)
+        this->ota_state_ms_ = millis();
       if (phase == 0x00 || phase == 0x01) {  // verify / install — two 0-100% sub-phases
         if (this->ota_install_sub_ == 0 && this->ota_install_pct_ > 60 && pct + 30 < this->ota_install_pct_)
           this->ota_install_sub_ = 1;  // percent dropped a lot → second sub-phase started
@@ -380,7 +414,14 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
         this->ota_install_progress_();
       } else if (phase == 0x02 || phase == 0x04 || phase == 0x05) {
         ESP_LOGI(OTAG, "install terminal phase 0x%02X", phase);
+        if (phase == 0x02 && this->ota_component_ == 0) {
+          this->mdb_reboot_dbc_off_ms_ = 0;
+          this->mdb_reboot_release_dbc_("install reached pending reboot");
+        }
         this->ota_finish_(phase != 0x05);
+      } else if (phase == 0x07 && this->ota_state_ == OtaState::INSTALLING) {
+        // "Up to date": update-service found nothing in the staged set newer than what runs.
+        this->ota_fail_("the staged set had nothing newer to install");
       }
       break;
     }
@@ -442,9 +483,17 @@ void LibrescootBleClient::ota_step_() {
       }
       break;
     case OtaState::INSTALLING:
-      // No-progress timeout: the on-scooter install can take ~10 min (verify + install), so only
-      // fail if NO INSTALL_PROGRESS arrives for a while (ota_state_ms_ is reset on each 0x84).
-      if (now - this->ota_state_ms_ > 180000)
+      // No-progress timeout (ota_state_ms_ is reset on each non-idle 0x84). The scooter only
+      // notifies on a change, and a DBC delta apply can stay on one percent for minutes, so silence
+      // alone proves nothing: ask with STATUS_REQ once a minute — an install still running answers
+      // with its phase. Give up only after 20 min without an active phase.
+      if (now - this->ota_state_ms_ > 60000 && now - this->ota_install_poll_ms_ > 60000) {
+        this->ota_install_poll_ms_ = now;
+        ESP_LOGD(OTAG, "install quiet for %u s — STATUS_REQ", (unsigned) ((now - this->ota_state_ms_) / 1000));
+        const uint8_t d[] = {0x05};  // STATUS_REQ — read-only
+        this->write_raw_(CharId::OTA_CONTROL, d, sizeof(d));
+      }
+      if (now - this->ota_state_ms_ > 1200000)
         this->ota_fail_("install stalled (no progress)");
       break;
     case OtaState::DONE:
@@ -998,29 +1047,20 @@ void LibrescootBleClient::ota_resolve_task_(void *arg) {
   vTaskDelete(nullptr);
 }
 
-void LibrescootBleClient::ota_resolve_() {
-  this->rs_resolved_ = false;  // per run: set only once GitHub has actually answered
-  // Nothing else on the network while this runs: a concurrent update-check worker holds a task
-  // stack and its own buffers, and that is what leaves the heap too fragmented for the handshake.
-  // Also gives the BLE link, released just before, time to actually close.
-  for (int w = 0; w < 40 && this->gh_running_; w++)
-    vTaskDelay(pdMS_TO_TICKS(500));
-  vTaskDelay(pdMS_TO_TICKS(1500));
-  const std::string url =
-      "https://api.github.com/repos/" + this->github_repo_ + "/releases/tags/" + this->rs_tag_;
+bool LibrescootBleClient::fetch_release_assets_(const std::string &tag, RelAsset out[2][2]) {
+  for (int c = 0; c < 2; c++)
+    out[c][0] = out[c][1] = RelAsset{};
+  const std::string url = "https://api.github.com/repos/" + this->github_repo_ + "/releases/tags/" + tag;
   // "delta" → small patch asset; "full" → complete .mender image (hundreds of MB).
   const std::string ext = (this->ota_method_str_ == "full") ? ".mender" : ".delta";
-  const std::string tmdb = "librescoot-unu-mdb-" + this->rs_tag_ + ext;
-  const std::string tdbc = "librescoot-unu-dbc-" + this->rs_tag_ + ext;
-  // The HDiffPatch variant, only for a board that confirmed its decoder. Sent under its own name:
-  // bluetooth-service stages .hdelta verbatim and update-service dispatches on the extension.
-  const std::string hmdb = this->use_hdelta_(0) ? "librescoot-unu-mdb-" + this->rs_tag_ + ".hdelta" : "";
-  const std::string hdbc = this->use_hdelta_(1) ? "librescoot-unu-dbc-" + this->rs_tag_ + ".hdelta" : "";
-  struct Cand { std::string name, sha; uint32_t size{0}; bool ok{false}; } h_mdb, h_dbc;
+  const std::string names[2][2] = {
+      {"librescoot-unu-mdb-" + tag + ext, "librescoot-unu-mdb-" + tag + ".hdelta"},
+      {"librescoot-unu-dbc-" + tag + ext, "librescoot-unu-dbc-" + tag + ".hdelta"}};
+  bool answered = false;
 
   // The handshake wants ~4.5 kB; on a board without PSRAM availability depends on what WiFi and
   // the BLE stack hold at that instant, so the same call succeeds and fails minutes apart.
-  for (int attempt = 1; attempt <= RESOLVE_ATTEMPTS && !this->rs_resolved_; attempt++) {
+  for (int attempt = 1; attempt <= RESOLVE_ATTEMPTS && !answered; attempt++) {
   if (attempt > 1) {
     ESP_LOGW(OTAG, "resolve: retrying (%d/%d)", attempt, RESOLVE_ATTEMPTS);
     vTaskDelay(pdMS_TO_TICKS(RESOLVE_RETRY_MS));
@@ -1038,9 +1078,9 @@ void LibrescootBleClient::ota_resolve_() {
   esp_http_client_set_header(c, "Accept", "application/vnd.github+json");
   this->github_auth_(c, url);
 
-  // Scan the release JSON for each delta asset's name/size/digest (they appear in that order
-  // within an asset object). browser_download_url is not needed — the URL is built from the
-  // configured source base so a local mirror can serve the bytes without TLS.
+  // Scan the release JSON for each asset's name/size/digest (they appear in that order within an
+  // asset object). browser_download_url is not needed — the URL is built from the configured
+  // source base so a local mirror can serve the bytes without TLS.
   static const char N_NAME[] = "\"name\":\"";
   static const char N_SIZE[] = "\"size\":";
   static const char N_DIG[] = "\"digest\":\"";
@@ -1051,21 +1091,10 @@ void LibrescootBleClient::ota_resolve_() {
     std::string sha = cur_dig;
     if (sha.rfind("sha256:", 0) == 0)
       sha = sha.substr(7);
-    if (!hmdb.empty() && cur_name == hmdb) {
-      h_mdb = {cur_name, sha, (uint32_t) strtoul(cur_size.c_str(), nullptr, 10), true};
-    } else if (!hdbc.empty() && cur_name == hdbc) {
-      h_dbc = {cur_name, sha, (uint32_t) strtoul(cur_size.c_str(), nullptr, 10), true};
-    } else if (cur_name == tmdb) {
-      this->rs_mdb_name_ = cur_name;
-      this->rs_mdb_size_ = (uint32_t) strtoul(cur_size.c_str(), nullptr, 10);
-      this->rs_mdb_sha_ = sha;
-      this->rs_mdb_ok_ = true;
-    } else if (cur_name == tdbc) {
-      this->rs_dbc_name_ = cur_name;
-      this->rs_dbc_size_ = (uint32_t) strtoul(cur_size.c_str(), nullptr, 10);
-      this->rs_dbc_sha_ = sha;
-      this->rs_dbc_ok_ = true;
-    }
+    for (int comp = 0; comp < 2; comp++)
+      for (int v = 0; v < 2; v++)
+        if (cur_name == names[comp][v])
+          out[comp][v] = {cur_name, sha, (uint32_t) strtoul(cur_size.c_str(), nullptr, 10), true};
   };
 
   if (esp_http_client_open(c, 0) == ESP_OK) {
@@ -1110,7 +1139,7 @@ void LibrescootBleClient::ota_resolve_() {
           if (N_DIG[mD] == 0) { cap = CD; cur_dig.clear(); mN = mS = mD = 0; continue; }
         }
       }
-      this->rs_resolved_ = true;  // GitHub answered; an empty result really means "no such asset"
+      answered = true;  // GitHub answered; an empty result really means "no such asset"
     } else if (status == 401) {
       ESP_LOGE(OTAG, "resolve: HTTP 401 — GitHub rejected the token (expired, revoked or "
                      "malformed); check github_token");
@@ -1131,18 +1160,108 @@ void LibrescootBleClient::ota_resolve_() {
   esp_http_client_close(c);
   esp_http_client_cleanup(c);
   }  // retry loop
+  return answered;
+}
 
-  // Prefer the .hdelta when the release has one and it is smaller (or the .delta is missing).
-  auto prefer = [](const Cand &h, std::string &name, uint32_t &size, std::string &sha, bool &ok) {
-    if (!h.ok || h.size == 0 || h.sha.size() != 64 || (ok && size > 0 && h.size >= size))
-      return;
-    name = h.name;
-    size = h.size;
-    sha = h.sha;
-    ok = true;
-  };
-  prefer(h_mdb, this->rs_mdb_name_, this->rs_mdb_size_, this->rs_mdb_sha_, this->rs_mdb_ok_);
-  prefer(h_dbc, this->rs_dbc_name_, this->rs_dbc_size_, this->rs_dbc_sha_, this->rs_dbc_ok_);
+LibrescootBleClient::RelAsset LibrescootBleClient::pick_variant_(uint8_t component, const std::string &tag,
+                                                                 const RelAsset &regular,
+                                                                 const RelAsset &hdelta) const {
+  const char *cn = comp_name(component);
+  if (this->ota_method_str_ == "full") {
+    if (regular.ok)
+      ESP_LOGI(OTAG, "variant: %s %s — full image %s (%u B)", cn, tag.c_str(), regular.name.c_str(),
+               (unsigned) regular.size);
+    return regular;
+  }
+  const bool hd_valid = hdelta.ok && hdelta.size > 0 && hdelta.sha.size() == 64;
+  const bool decodes = component == 0 ? this->hdelta_mdb_ : this->hdelta_dbc_;
+  if (hd_valid && decodes && (!regular.ok || regular.size == 0 || hdelta.size < regular.size)) {
+    ESP_LOGI(OTAG, "variant: %s %s — .hdelta (HDiffPatch) %u B instead of .delta %u B", cn, tag.c_str(),
+             (unsigned) hdelta.size, (unsigned) regular.size);
+    return hdelta;
+  }
+  const char *why = !hd_valid ? "the release has no .hdelta"
+                    : !decodes ? "the board does not report an HDiffPatch decoder"
+                               : "the .hdelta is not smaller";
+  if (regular.ok)
+    ESP_LOGI(OTAG, "variant: %s %s — .delta (xdelta) %u B (%s)", cn, tag.c_str(), (unsigned) regular.size, why);
+  return regular;
+}
+
+// Resolve a staged chain: one official asset per release from the installed version to rs_tag_,
+// each picked like a single step (.hdelta where the board decodes it). Every step's base is read
+// from the archive itself, so a gap in the run — a release that was patched against something else,
+// or a version missing from the fetched window — refuses the chain before a byte moves. An
+// unreadable base does not block (update-service resolves the chain by payload checksums anyway
+// and refuses the whole set before unpacking if it does not hold).
+bool LibrescootBleClient::ota_staged_resolve_(uint8_t component, const std::string &installed) {
+  static const size_t STAGED_MAX_STEPS = 30;  // GitHub lookups per chain; the unauthenticated limit is 60/h
+  this->rs_steps_.clear();
+  this->rs_staged_ok_ = false;
+  const auto &tags = this->rs_chain_tags_;
+  if (tags.size() < 2) {
+    ESP_LOGW(OTAG, "staged chain: %s -> %s is not inside the known release window", installed.c_str(),
+             this->rs_tag_.c_str());
+    return false;
+  }
+  if (tags.size() > STAGED_MAX_STEPS) {
+    ESP_LOGW(OTAG, "staged chain: %u releases is more than %u — not staging", (unsigned) tags.size(),
+             (unsigned) STAGED_MAX_STEPS);
+    return false;
+  }
+  ESP_LOGI(OTAG, "staged chain: %s %s -> %s, %u releases", comp_name(component), installed.c_str(),
+           this->rs_tag_.c_str(), (unsigned) tags.size());
+  std::string prev = installed;
+  for (const auto &tag : tags) {
+    if (this->ota_cancel_)
+      return false;
+    RelAsset a[2][2];
+    if (!this->fetch_release_assets_(tag, a)) {
+      ESP_LOGW(OTAG, "staged chain: could not look up %s", tag.c_str());
+      return false;
+    }
+    const RelAsset pick = this->pick_variant_(component, tag, a[component][0], a[component][1]);
+    if (!pick.ok || pick.size == 0 || pick.sha.size() != 64) {
+      ESP_LOGW(OTAG, "staged chain: %s has no usable delta for %s", tag.c_str(), comp_name(component));
+      return false;
+    }
+    const std::string base = this->ota_delta_base_(this->rs_source_ + "/" + tag + "/" + pick.name);
+    if (!base.empty() && !ieq(base, prev)) {
+      ESP_LOGW(OTAG, "staged chain: %s patches %s, not %s — the run has a gap", tag.c_str(), base.c_str(),
+               prev.c_str());
+      return false;
+    }
+    this->rs_steps_.push_back({tag, pick.name, pick.sha, pick.size});
+    prev = tag;
+  }
+  this->rs_staged_ok_ = true;
+  return true;
+}
+
+void LibrescootBleClient::ota_resolve_() {
+  this->rs_resolved_ = false;  // per run: set only once GitHub has actually answered
+  // Nothing else on the network while this runs: a concurrent update-check worker holds a task
+  // stack and its own buffers, and that is what leaves the heap too fragmented for the handshake.
+  // Also gives the BLE link, released just before, time to actually close.
+  for (int w = 0; w < 40 && this->gh_running_; w++)
+    vTaskDelay(pdMS_TO_TICKS(500));
+  vTaskDelay(pdMS_TO_TICKS(1500));
+  RelAsset a[2][2];
+  this->rs_resolved_ = this->fetch_release_assets_(this->rs_tag_, a);
+  for (uint8_t comp = 0; comp < 2; comp++) {
+    // Only the component being installed gets the variant log; the other is resolved for the
+    // summary line alone.
+    RelAsset pick = comp == this->ota_install_component_ ? this->pick_variant_(comp, this->rs_tag_, a[comp][0], a[comp][1])
+                    : a[comp][0];
+    std::string &name = comp == 0 ? this->rs_mdb_name_ : this->rs_dbc_name_;
+    std::string &sha = comp == 0 ? this->rs_mdb_sha_ : this->rs_dbc_sha_;
+    uint32_t &size = comp == 0 ? this->rs_mdb_size_ : this->rs_dbc_size_;
+    bool &ok = comp == 0 ? this->rs_mdb_ok_ : this->rs_dbc_ok_;
+    name = pick.name;
+    sha = pick.sha;
+    size = pick.size;
+    ok = pick.ok;
+  }
 
   ESP_LOGI(OTAG, "resolve: MDB %s DBC %s", this->rs_mdb_ok_ ? this->rs_mdb_name_.c_str() : "(none)",
            this->rs_dbc_ok_ ? this->rs_dbc_name_.c_str() : "(none)");
@@ -1165,8 +1284,16 @@ void LibrescootBleClient::ota_resolve_() {
       const std::string installed = version_to_tag(mdb ? this->mdb_version_ : this->dbc_version_);
       const bool gap = !installed.empty() && !ieq(installed, "unknown") &&
                        !this->rs_delta_base_.empty() && !ieq(this->rs_delta_base_, installed);
-      if (gap && this->ota_delta_chain_)
-        this->ota_chain_resolve_(this->ota_install_component_, installed, this->rs_tag_);
+      // The scooter's own staging comes first: it installs the official artifacts unchanged. The
+      // relay merge is the fallback for scooters without it (or when a step cannot be resolved).
+      if (gap && this->ota_delta_chain_) {
+        const bool staged = this->ota_staged_cap_ && this->ota_staged_resolve_(this->ota_install_component_, installed);
+        if (!staged && this->rs_source_.find("/ota/") != std::string::npos)
+          this->ota_chain_resolve_(this->ota_install_component_, installed, this->rs_tag_);
+        else if (!staged)
+          this->rs_chain_err_ = this->ota_staged_cap_ ? "the staged chain could not be resolved"
+                                                      : "no way to chain: the scooter cannot stage and no HA relay is set";
+      }
     }
   }
   this->ota_resolve_done_ = true;
@@ -1339,6 +1466,9 @@ void LibrescootBleClient::ota_kick_next_job_() {
   this->ota_active_update_ = (job.component == 1) ? this->dbc_update_ : this->mdb_update_;
   this->ota_current_job_ = job;         // keep it so a mid-transfer disconnect can resume it
   this->ota_have_current_job_ = true;
+  this->ota_job_staged_ = job.staged;
+  this->ota_job_apply_ = job.apply;
+  this->ota_apply_pending_ = false;
   ESP_LOGI(OTAG, "install: starting %s (%s, %u B)", comp_name(job.component), job.bundle_id.c_str(),
            (unsigned) job.size);
   // A dashboard update is handed to the dashboard at COMPLETE and it must have been running for
@@ -1362,7 +1492,11 @@ void LibrescootBleClient::ota_install_progress_() {
 // A BLE drop mid-OTA: during the transfer, re-queue the job so it resumes on reconnect; during
 // the install, the scooter finishes on its own, so just wait for the reboot + new version.
 void LibrescootBleClient::ota_handle_disconnect_() {
-  if (this->ota_state_ == OtaState::STARTING || this->ota_state_ == OtaState::STREAMING) {
+  // A staged step that dropped before its APPLY went out has installed nothing: redo it like a
+  // transfer (the scooter resumes or restarts it), the apply follows from the last step as before.
+  const bool staged_unapplied = this->ota_state_ == OtaState::COMPLETING && this->ota_job_staged_;
+  if (this->ota_state_ == OtaState::STARTING || this->ota_state_ == OtaState::STREAMING || staged_unapplied) {
+    this->ota_apply_pending_ = false;
     this->ota_producer_run_ = false;
     this->ota_park_rates_();
     this->ota_note_no_progress_();
@@ -1396,6 +1530,15 @@ void LibrescootBleClient::ota_handle_disconnect_() {
 void LibrescootBleClient::ota_send_complete_() {
   this->ota_complete_pending_ = false;
   this->ota_complete_after_ms_ = 0;
+  if (this->ota_apply_pending_) {
+    // APPLY_STAGED [0x06][component]: update-service installs the whole staged set as one chain.
+    this->ota_apply_pending_ = false;
+    const uint8_t m[2] = {0x06, this->ota_component_};
+    this->write_now_(CharId::OTA_CONTROL, m, sizeof(m));
+    this->ota_set_state_(OtaState::INSTALLING);  // its INSTALL_PROGRESS drives the rest
+    ESP_LOGW(OTAG, "APPLY_STAGED sent (installing the staged %s chain)", comp_name(this->ota_component_));
+    return;
+  }
   const uint8_t c = 0x03;
   this->write_now_(CharId::OTA_CONTROL, &c, 1);
   this->ota_state_ms_ = millis();  // COMPLETE_ACK timeout counts from here
@@ -1545,6 +1688,7 @@ void LibrescootBleClient::ota_learn_rate_(uint32_t moved, uint32_t dt_ms) {
 void LibrescootBleClient::ota_finish_(bool ok) {
   this->ota_producer_run_ = false;  // ask the download task to stop; buffer freed in ota_step_
   this->ota_complete_pending_ = false;
+  this->ota_apply_pending_ = false;
   this->ota_complete_after_ms_ = 0;
   // Flush the final partial window into the lifetime byte counter and the target-transferred
   // sensor, then park the two speed sensors at 0 (a transfer is no longer running).

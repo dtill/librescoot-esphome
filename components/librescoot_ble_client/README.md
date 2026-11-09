@@ -81,8 +81,7 @@ librescoot_ble_client:
 | `update_check_interval` | `6h` | How often to look for a new release. |
 | `github_token` | — | Optional GitHub token (read-only). Lifts the release-check limit from 60 to 5000 per hour. |
 | `dbc_auto_power` | `true` | Switch the dashboard on when a dashboard update needs it: to hand the update over, to apply it, and to read its version. |
-| `delta_chaining` | `true` | Offer the newest release and let Home Assistant merge the deltas in between into one install. Needs method `delta` and the HA relay; see [Chained delta updates](#chained-delta-updates). |
-| `hdelta` | `true` | Send the smaller `.hdelta` (HDiffPatch) instead of the `.delta` for a one-release step, when the release has one and the scooter part says it can apply it. Starting value of the **OTA Update Method hdelta** switch. |
+| `delta_chaining` | `true` | Offer the newest (or pinned) release and install every release in between in one go — staged on the scooter where it supports that, else merged by Home Assistant. Needs method `delta`; see [Chained delta updates](#chained-delta-updates). |
 | `link_auto_hold` | `3min` | Link mode `auto`: how long to hold the connection before letting a phone in for ~20 s. |
 | `link_interval` | `5min` | Link mode `interval`: how often to connect and refresh the sensors. |
 | `presence_timeout` | `60s` | How long **BLE Presence** stays on after the scooter was last heard. |
@@ -241,10 +240,10 @@ Press *Install* and the ESP transfers the firmware to the scooter over Bluetooth
 
 1. **OTA channel** → `stable`, `testing` or `nightly`.
 2. **OTA Update Method** → `delta` (small, default) or `full` (whole image).
-   With **OTA Update Method hdelta** on (default) a delta step uses the `.hdelta` file where the
-   release has one — about a third of the size. The ESP asks the scooter computer and the dashboard
-   separately whether they can apply it, and sends the regular `.delta` to a part that cannot (older
-   firmware, stable releases). The update entity's *Upload method* line says which one it will be.
+   A delta always uses the smallest file that fits: the `.hdelta` (HDiffPatch, about a third of
+   the size) where the release has one and the scooter part says it can apply it, the regular
+   `.delta` otherwise (older firmware, stable releases). The ESP asks the scooter computer and the
+   dashboard separately, and its log names the variant it chose for every release.
 3. **OTA MDB Update** / **OTA DBC Update** show the next release with its notes. Press *Install*.
 4. Follow **OTA Status**. When it says `Installed` and **SW MDB** / **SW DBC** show the new
    version, install the other one if it is offered.
@@ -254,8 +253,10 @@ Press *Install* and the ESP transfers the firmware to the scooter over Bluetooth
 1. Set **OTA channel** and **OTA Update Method**.
 2. Switch **OTA Auto Update** on.
 
-The ESP installs one release after the other — scooter computer first, dashboard second — and
-waits out each reboot until the scooter is current. Before every step it waits a few minutes
+The ESP brings both parts to the goal — the version in **OTA Version** if you set one, otherwise
+the newest release — scooter computer first, dashboard second, and waits out each reboot. With
+[chaining](#chained-delta-updates) each part gets there in one install; without it, one release
+at a time. Before every step it waits a few minutes
 (2 after switching on, 5 after a scooter reboot), switches the dashboard on and asks both parts
 for their versions; it never decides on a cached version. Before a scooter-computer step it
 switches the dashboard off again, because the scooter only reboots into the new version with the
@@ -266,10 +267,13 @@ on the first failed install, and after every ESP restart. Switch it on in the ev
 ### A specific version
 
 1. Type the release tag into **OTA Version** (for example `nightly-20260909T063445`).
-2. Press **OTA MDB Install** or **OTA DBC Install**.
+2. Press **OTA MDB Install** or **OTA DBC Install** — or switch **OTA Auto Update** on to bring
+   both parts there.
 
-With method `delta` the tag must be the release right after the installed one — unless
-[chained delta updates](#chained-delta-updates) are active, which allow any newer release.
+The pinned version is the goal for the update entities and for **OTA Auto Update** alike; clear
+the field to follow the newest release again. With method `delta` the tag must be the release
+right after the installed one — unless [chained delta updates](#chained-delta-updates) are
+active, which allow any newer release.
 
 ### Delta or full?
 
@@ -285,31 +289,38 @@ mismatch (`OTA Status: Error: delta needs …`).
 
 ### Chained delta updates
 
-Several releases behind but no appetite for a full image: Home Assistant merges all deltas
-between the installed version and the target into one — one transfer, one install, one reboot.
+Several releases behind but no appetite for a full image: every release between the installed
+version and the goal is installed in **one install and one reboot**. There are two ways, and the
+ESP picks the first that works:
 
-**This is on by default.** Whenever the conditions below are met, the update entities offer the
-**newest** release instead of the next one. On an ESP32-S3 the release notes then list every
-release in between; on an ESP32 classic they show the target release only (its memory is needed
-for the transfer).
-The summary then reads *Upload method: delta-chaining (N releases, one install)*; the size is only
-known once Home Assistant has built the bundle, so none is shown up front.
+1. **Staged on the scooter** (Librescoot nightly from 9 Nov 2026 on, which reports staged
+   installs): the ESP uploads the official delta of every release — `.hdelta` where supported — and
+   then tells the scooter to install them all at once. No Home Assistant involved, works with
+   direct GitHub too. *Upload method: staged delta chain (N releases, one install).*
+2. **Merged by Home Assistant** (older scooters): Home Assistant merges the regular deltas into
+   one file. *Upload method: delta-chaining (N releases, one install)*; the size is only known
+   once Home Assistant has built the bundle.
 
-You need:
+**This is on by default.** Whenever one of the two is available, the update entities offer the
+**newest** release (or the one pinned in **OTA Version**) instead of the next one. On an ESP32-S3
+the release notes then list every release in between; on an ESP32 classic they show the target
+release only (its memory is needed for the transfer).
+
+For the Home Assistant way you need:
 
 - the [Home Assistant integration](../../homeassistant-integration/README.md), and
   **OTA Source HA Relay** showing *Connected*
 - **OTA Source** = `HA relay`
 - **OTA Update Method** = `delta`
-- **OTA Update Method delta-chaining** on — it turns itself on as soon as the other three hold, and
-  shows as off while they do not
+- **OTA Update Method delta-chaining** on — it turns itself on as soon as the conditions hold (for
+  staging: method `delta` and a scooter that supports it), and shows as off while they do not
 
 Then simply press **Install** on the update entity (or type a target into **OTA Version** and press
 **OTA MDB Install**). **OTA Status** shows `Relay: building …` while Home Assistant prepares the
 bundle (up to a few minutes), then the usual transfer and install.
 
-Without chaining — on an ESP32-S3 downloading directly from GitHub, for instance — the entities
-offer the next release only, and a scooter several releases behind is walked forward one step at a
+Without chaining — an older scooter on an ESP32-S3 downloading directly from GitHub, for
+instance — the entities offer the next release only, and a scooter several releases behind is walked forward one step at a
 time (**OTA Auto Update** does that unattended).
 
 ### Direct GitHub download (ESP32-S3)
@@ -320,7 +331,7 @@ On an **ESP32-S3** the ESP can download the firmware from GitHub by itself, so u
 | | `HA relay` (plain ESP32 and S3) | `direct GitHub` (S3 only) |
 | :--- | :--- | :--- |
 | Needs | the Home Assistant integration | nothing but the ESP |
-| Chained delta updates | yes | no |
+| Chained delta updates | yes | staged on the scooter only |
 
 ### OTA entities
 
@@ -328,11 +339,10 @@ On an **ESP32-S3** the ESP can download the firmware from GitHub by itself, so u
 | :--- | :--- | :--- | :--- |
 | OTA MDB Update / OTA DBC Update | update | Available release, release notes, install progress. | `mdb_update` / `dbc_update` |
 | OTA MDB Install / OTA DBC Install | button | Install now — **OTA Version** if set, else the next release. | `ota_mdb_update` / `ota_dbc_update` |
-| OTA Version | text | Target release. Prefilled with the next one. | `ota_version` |
+| OTA Version | text | Goal release for the install buttons, the update entities and OTA Auto Update. Prefilled with the offered one; clear it to follow the newest. | `ota_version` |
 | OTA channel | select | `stable` / `testing` / `nightly` | `ota_channel` |
 | OTA Update Method | select | `delta` / `full` | `ota_update_method` |
 | OTA Update Method delta-chaining | switch | See above. On by default; shows off while its conditions are not met, and comes back by itself when they are. | `ota_delta_chaining` |
-| OTA Update Method hdelta | switch | Prefer the `.hdelta` file for a delta step where the scooter part supports it. On by default. Chained installs are always built from `.delta` files. | `ota_hdelta` |
 | OTA Auto Update | switch | See above. Off after every ESP restart. | `ota_auto_update` |
 | OTA Stage Only | switch | Transfer but do not install (for testing). Off after every ESP restart. | `ota_stage_only` |
 | OTA Source | select | `HA relay` / `direct GitHub` | `ota_source` |
@@ -350,7 +360,7 @@ On an **ESP32-S3** the ESP can download the firmware from GitHub by itself, so u
 
 | OTA Status says | Meaning | Do this |
 | :--- | :--- | :--- |
-| `Error: delta needs <tag>` | This delta does not fit the installed version, and chaining was not available to bridge the gap. | Check **OTA Update Method delta-chaining** is on (it needs the HA relay), install the next release first, or use method `full`. |
+| `Error: delta needs <tag>` | This delta does not fit the installed version, and chaining was not available to bridge the gap. | Check **OTA Update Method delta-chaining** is on (it needs a scooter with staged installs or the HA relay), install the next release first, or use method `full`. |
 | `Error: chain: …` | Home Assistant could not merge the deltas (the text says why). | Pick a nearer target, or method `full`. |
 | `Auto-resume #n (…)` | Bluetooth dropped some bytes. The transfer continues by itself. | Nothing. Closer is faster. |
 | `Pending reboot` for a long time / **OTA Reboot Required** on | The scooter did not reboot after an MDB update. It waits for the dashboard to be off before it does. | Switch **DBC Power** off. If it still does not reboot, press **Reboot MDB (hard)**. |

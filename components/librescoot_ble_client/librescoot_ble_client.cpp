@@ -375,8 +375,6 @@ void LibrescootBleClient::setup() {
     // restore write would overwrite the default want before anything could be known.
     if (this->chain_sw_ != nullptr)
       this->chain_sw_->publish_state(false);
-    if (this->hdelta_sw_ != nullptr)
-      this->hdelta_sw_->publish_state(this->ota_hdelta_want_);
     // The idle-gate only opens once the scooter has reported its OTA phase, so a reply that never
     // arrives means no update is ever offered. Keep asking while it is unknown — from the
     // scheduler, not loop(), which is disabled exactly when the link sits connected and idle.
@@ -531,8 +529,11 @@ void LibrescootBleClient::loop() {
       // mismatch that would otherwise refuse the install does not apply to it.
       const bool chained = this->rs_chain_ok_ && ieq(this->rs_chain_from_, installed) &&
                            ieq(this->rs_chain_to_, this->rs_tag_);
+      // A staged chain starts at the installed version by construction (its first step's base was
+      // checked against it), so the target's own base is not the one that has to match.
+      const bool staged = this->rs_staged_ok_ && !this->rs_steps_.empty();
       const bool base_mismatch =
-          ok && known && !chained && !this->rs_delta_base_.empty() &&
+          ok && known && !chained && !staged && !this->rs_delta_base_.empty() &&
           !ieq(this->rs_delta_base_, installed);
       if (ok && !known && !this->rs_delta_base_.empty())
         ESP_LOGW("ota", "install: the scooter has not reported its version yet — proceeding without "
@@ -567,8 +568,8 @@ void LibrescootBleClient::loop() {
                    installed.c_str(), this->rs_tag_.c_str());
         else if (!this->ota_delta_chain_)
           ESP_LOGW("ota", "install: 'OTA Update Method delta-chaining' would merge the missing "
-                          "steps, but it needs OTA Update Method 'delta' and a reachable HA relay "
-                          "(method '%s', relay %s).",
+                          "steps, but it needs OTA Update Method 'delta' and either a scooter with "
+                          "staged installs or a reachable HA relay (method '%s', relay %s).",
                    this->ota_method_str_.c_str(), this->integration_reachable_ ? "up" : "down");
         else
           ESP_LOGW("ota", "install: delta chaining is on but the relay could not merge this run: %s",
@@ -583,6 +584,22 @@ void LibrescootBleClient::loop() {
             this->auto_update_sw_->publish_state(false);
         }
         this->ota_settle_update_entity_();
+      } else if (staged) {
+        // Every official artifact of the run goes up as a staged upload; the last one's completion
+        // sends APPLY_STAGED, and update-service installs the whole set as one chain.
+        uint32_t total = 0;
+        for (size_t i = 0; i < this->rs_steps_.size(); i++) {
+          const StagedStep &st = this->rs_steps_[i];
+          OtaJob j{this->rs_source_ + "/" + st.tag + "/" + st.name, st.sha, st.name, st.size,
+                   this->ota_install_component_};
+          j.staged = true;
+          j.apply = (i + 1 == this->rs_steps_.size());
+          this->ota_jobs_.push_back(j);
+          total += st.size;
+        }
+        ESP_LOGI("ota", "install: %s staged chain %s -> %s queued: %u releases, %u B in total, one install",
+                 mdb ? "MDB" : "DBC", installed.c_str(), this->rs_tag_.c_str(),
+                 (unsigned) this->rs_steps_.size(), (unsigned) total);
       } else if (ok && chained) {
         // The merged bundle is served by the relay, not by GitHub: /ota/<secret> becomes
         // /chainbytes/<secret>/<component>/<from>/<to>/<file>.
@@ -647,6 +664,8 @@ void LibrescootBleClient::loop() {
       // 100 %"; without it the entity waits for a reconnect that may never come.
       this->ota_await_poll_ms_ = now + 15000;
       this->ota_request_installed_version_();
+      if (this->ota_install_component_ == 0)
+        this->mdb_reboot_release_dbc_("waiting for the MDB to reboot");
       // A DBC bundle applies on the dashboard's next power-on. With the dashboard off the version
       // above can never change, so — when allowed — power it on and let the install happen.
       if (this->ota_install_component_ == 1 && this->dbc_auto_power_ && this->dbc_present_ &&
@@ -1256,6 +1275,9 @@ void LibrescootBleClient::on_connected_() {
   if (this->mdb_update_ != nullptr || this->dbc_update_ != nullptr) {
     this->pending_queries_.push_back("status:hdelta:mdb");
     this->pending_queries_.push_back("status:hdelta:dbc");
+    // Staged installs (one install for a whole run of deltas) need OTA capability version 2.
+    if (!this->ota_staged_cap_)
+      this->pending_queries_.push_back("cap:ota");
   }
   if (this->maps_available_ != nullptr)
     this->pending_queries_.push_back("status:maps-available");
@@ -1521,7 +1543,16 @@ void LibrescootBleClient::parse_cmd_response_(const std::string &line) {
     if (yes && !flag) {
       flag = true;
       ESP_LOGI(TAG, "%s supports hdelta", mdb ? "MDB" : "DBC");
-      this->request_update_check(false);  // the offered size may change
+      this->next_check_ms_ = millis();  // the offered size may change; the loop coalesces re-checks
+      this->enable_loop();
+    }
+  } else if (line == "cap:ota:staged") {
+    if (!this->ota_staged_cap_) {
+      this->ota_staged_cap_ = true;
+      ESP_LOGI(TAG, "scooter supports staged installs — a run of deltas installs in one go");
+      this->update_chain_switch_();
+      this->next_check_ms_ = millis();  // the offered target may now be the goal; coalesced in loop()
+      this->enable_loop();
     }
   } else if (line.rfind("keycard:count:", 0) == 0) {
     if (this->keycard_count_ != nullptr)
@@ -1880,6 +1911,22 @@ void LibrescootBleClient::dbc_autopower_finish_() {
 // Switch the dashboard off again if OTA Auto Update's version probe switched it on. Not while an
 // install is in flight (a DBC install needs it running); the flag then stays and a later tick
 // retries. Without a link the command cannot be sent either, so the flag waits for the reconnect.
+void LibrescootBleClient::mdb_reboot_release_dbc_(const char *why) {
+  if (!this->dbc_present_ || !this->dbc_auto_power_ || this->state() != espbt::ClientState::ESTABLISHED)
+    return;
+  if (this->dbc_power_known_ && !this->dbc_power_on_)
+    return;  // already off — nothing holds the reboot
+  const uint32_t now = millis();
+  if (this->mdb_reboot_dbc_off_ms_ != 0 && now - this->mdb_reboot_dbc_off_ms_ < 60000)
+    return;  // sent a minute ago; give it time to take effect
+  this->mdb_reboot_dbc_off_ms_ = now;
+  this->dbc_probe_powered_ = false;  // whoever powered it, it goes off now
+  ESP_LOGW(TAG, "MDB install pending reboot — powering the dashboard off, update-service reboots the "
+                "MDB only with the dashboard off (%s)", why);
+  this->send_ext_query_("dbc:off");
+  this->pending_queries_.push_back("dbc:status");
+}
+
 void LibrescootBleClient::dbc_probe_release_(const char *why) {
   if (!this->dbc_probe_powered_)
     return;
@@ -2057,6 +2104,10 @@ void LibrescootBleClient::set_mdb_version_(const std::string &v) {
     this->hdelta_mdb_ = false;  // new firmware: ask again
     this->pending_queries_.push_back("status:hdelta:mdb");
   }
+  if (!this->mdb_version_.empty() && !ieq(v, this->mdb_version_) && this->ota_staged_cap_) {
+    this->ota_staged_cap_ = false;  // capability belongs to the MDB's bluetooth-service build
+    this->pending_queries_.push_back("cap:ota");
+  }
   this->mdb_version_ = v;
   this->reflect_channel_(v);
   if (this->sw_mdb_ != nullptr)
@@ -2116,6 +2167,7 @@ void LibrescootBleClient::request_update_check(bool may_release_link, bool user_
   // Chaining turns the check into a "jump to the channel latest" check: one target, and the notes of
   // every release in between (Home Assistant merges the run into a single install).
   this->gh_chain_ = this->ota_delta_chain_;
+  this->gh_goal_ = version_to_tag(this->ota_target_version_);
   this->gh_hdelta_mdb_ = this->use_hdelta_(0);
   this->gh_hdelta_dbc_ = this->use_hdelta_(1);
   // The parse grows std::strings alongside WiFi and the BLE stack. Builds are without exceptions,
@@ -2634,6 +2686,11 @@ void LibrescootBleClient::github_fetch_() {
   // as one merged delta run instead of one whole image. Everything that follows treats the two the
   // same way for the TARGET and the CHANGELOG; only the asset (and its size) still differ.
   const bool jump = full || this->gh_chain_;
+  // A pinned version replaces the channel latest as the goal; a stepwise target never passes it.
+  auto goal = [&]() -> std::string { return this->gh_goal_.empty() ? best : this->gh_goal_; };
+  auto capped = [&](const std::string &t) -> std::string {
+    return (!this->gh_goal_.empty() && !t.empty() && t > this->gh_goal_) ? std::string() : t;
+  };
 
   // With the relay as byte source, the whole check goes over it: plain HTTP, no TLS session, and
   // one request instead of three. Only the display data travels this way; the integrity anchor is
@@ -2646,8 +2703,8 @@ void LibrescootBleClient::github_fetch_() {
       src_complete = true;
       // Same target rule as the GitHub path: full jumps to the channel latest, delta steps to each
       // component's own adjacent successor. The bodies come from the relay in fetch_asset below.
-      mdb_target = jump ? best : this->gh_successor_(this->gh_current_tag_);
-      dbc_target = jump ? best : this->gh_successor_(this->gh_current_dbc_tag_);
+      mdb_target = jump ? goal() : capped(this->gh_successor_(this->gh_current_tag_));
+      dbc_target = jump ? goal() : capped(this->gh_successor_(this->gh_current_dbc_tag_));
 #ifdef LSC_HEAP_RICH
       if (jump) {
         // The relay serves one release's notes per request, so the run's changelog is assembled
@@ -2655,10 +2712,10 @@ void LibrescootBleClient::github_fetch_() {
         // PSRAM boards only: on a board without it the internal heap is what std::string grows in,
         // and a failed allocation aborts the firmware (no exceptions). Such a board keeps the
         // single-release changelog it has always shown — see the fallback after fetch_asset.
-        mdb_summary = this->relay_changelog_(this->gh_current_tag_, best);
+        mdb_summary = this->relay_changelog_(this->gh_current_tag_, goal());
         dbc_summary = (this->gh_current_dbc_tag_ == this->gh_current_tag_)
                           ? mdb_summary
-                          : this->relay_changelog_(this->gh_current_dbc_tag_, best);
+                          : this->relay_changelog_(this->gh_current_dbc_tag_, goal());
       }
 #endif
     }
@@ -2803,8 +2860,9 @@ void LibrescootBleClient::github_fetch_() {
     const size_t agg_cap = this->changelog_cap_();
     auto aggregate = [&](const std::string &from) -> std::string {
       std::vector<const Rel *> inc;
+      const std::string to = goal();
       for (auto &r : rels) {
-        bool q = from.empty() ? (r.tag == best) : (r.tag > from && r.tag <= best);
+        bool q = from.empty() ? (r.tag == to) : (r.tag > from && r.tag <= to);
         if (q) inc.push_back(&r);
       }
       std::string s;
@@ -2826,8 +2884,8 @@ void LibrescootBleClient::github_fetch_() {
     // Full → jump each component to the channel latest with the aggregated (all-in-between) changelog.
     // Delta → step each component to the successor of ITS OWN installed version, with that single
     // release's changelog (a delta only applies to the immediately-preceding release).
-    mdb_target = jump ? best : successor(this->gh_current_tag_);
-    dbc_target = jump ? best : successor(this->gh_current_dbc_tag_);
+    mdb_target = jump ? goal() : capped(successor(this->gh_current_tag_));
+    dbc_target = jump ? goal() : capped(successor(this->gh_current_dbc_tag_));
     mdb_summary = jump ? aggregate(this->gh_current_tag_) : single_body(mdb_target);
     dbc_summary = jump ? aggregate(this->gh_current_dbc_tag_) : single_body(dbc_target);
     summary = jump ? mdb_summary : std::string();  // legacy gh_summary_, unused by the entities
@@ -2951,9 +3009,9 @@ void LibrescootBleClient::github_fetch_() {
   // official asset size would be a wrong number shown with confidence, so publish none — unless the
   // span is a single release, where the official delta IS what gets transferred.
   if (this->gh_chain_ && !full) {
-    if (this->gh_steps_ahead_(this->gh_current_tag_) != 1)
+    if (this->gh_steps_ahead_(this->gh_current_tag_, goal()) != 1)
       mdb_sz = 0;
-    if (this->gh_steps_ahead_(this->gh_current_dbc_tag_) != 1)
+    if (this->gh_steps_ahead_(this->gh_current_dbc_tag_, goal()) != 1)
       dbc_sz = 0;
   }
   this->gh_mdb_size_ = mdb_sz;
@@ -3223,19 +3281,20 @@ std::string LibrescootBleClient::gh_successor_(const std::string &from) const {
 // now) AND the link mode must be one that will connect on its own ("always"/"auto"/"interval").
 // In "scan"/"disconnect" the component deliberately never takes the link, so an offer could not be
 // acted on; out of range the cached versions are stale and must not drive an offer either.
-// Chaining is only meaningful where the merge can actually happen: the delta method, and a Home
-// Assistant relay that can run xdelta3 and serve the result.
+// Chaining needs the delta method and one of two ways to cover a run in one install: the scooter
+// stages the official deltas and applies them together (OTA capability version 2), or a Home
+// Assistant relay merges them with xdelta3. The scooter's own staging is preferred.
 bool LibrescootBleClient::chain_possible_() const {
-  return this->ota_method_str_ == "delta" && this->integration_reachable_;
+  return this->ota_method_str_ == "delta" && (this->ota_staged_cap_ || this->integration_reachable_);
 }
 
 void LibrescootBleClient::update_chain_switch_() {
   const bool possible = this->chain_possible_();
   if (possible != this->chain_sw_available_) {
     this->chain_sw_available_ = possible;
-    ESP_LOGI(TAG, "delta chaining is %s (method '%s', HA relay %s)",
+    ESP_LOGI(TAG, "delta chaining is %s (method '%s', staged installs %s, HA relay %s)",
              possible ? "selectable" : "not selectable", this->ota_method_str_.c_str(),
-             this->integration_reachable_ ? "up" : "down");
+             this->ota_staged_cap_ ? "yes" : "no", this->integration_reachable_ ? "up" : "down");
   }
   this->apply_chain_state_();
 }
@@ -3250,9 +3309,12 @@ void LibrescootBleClient::apply_chain_state_() {
   this->ota_delta_chain_ = eff;
   if (this->chain_sw_ != nullptr)
     this->chain_sw_->publish_state(eff);
-  ESP_LOGI(TAG, "delta chaining %s", eff ? "ON (the update entities offer the channel latest, "
-                                           "merged into one install by Home Assistant)"
-                                         : "off (targets fall back to the next release)");
+  ESP_LOGI(TAG, "delta chaining %s", !eff ? "off (targets fall back to the next release)"
+                                      : this->ota_staged_cap_
+                                          ? "ON (the update entities offer the goal; the scooter stages "
+                                            "each release's delta and installs them in one go)"
+                                          : "ON (the update entities offer the goal, merged into one "
+                                            "install by Home Assistant)");
   // The target and the changelog depend on it (chained → channel latest with every release's notes),
   // so the snapshot the worker built for the other mode is stale. Re-check unless one is running.
   this->refresh_update_availability_();
@@ -3262,15 +3324,16 @@ void LibrescootBleClient::apply_chain_state_() {
 // Releases strictly newer than `from` up to the channel latest, counted in the fetched tag window.
 // -1 when it cannot be told (no window, or `from` outside it) — the caller then must not claim a
 // span it does not know.
-int LibrescootBleClient::gh_steps_ahead_(const std::string &from) const {
-  if (from.empty() || this->gh_latest_tag_.empty() || this->gh_tags_.empty())
+int LibrescootBleClient::gh_steps_ahead_(const std::string &from, const std::string &to_tag) const {
+  const std::string &to = to_tag.empty() ? this->gh_latest_tag_ : to_tag;
+  if (from.empty() || to.empty() || this->gh_tags_.empty())
     return -1;
   bool in_window = false;
   int n = 0;
   for (const auto &t : this->gh_tags_) {
     if (t == from)
       in_window = true;
-    else if (t > from && t <= this->gh_latest_tag_)
+    else if (t > from && t <= to)
       n++;
   }
   return in_window ? n : -1;
@@ -3367,11 +3430,21 @@ void LibrescootBleClient::refresh_update_availability_() {
   // manual DBC install) must not be stepped further — the MDB catches up first.
   bool dbc_behind_mdb = have_mdb && have_dbc &&
                         version_to_tag(this->dbc_version_) < version_to_tag(this->mdb_version_);
-  bool mdb_at_latest = have_mdb && ieq(this->mdb_version_, latest);
+  // A version pinned in OTA Version is the goal for both components — for the update entities and for
+  // OTA Auto Update alike. Without a pin the goal is the channel latest.
+  const std::string pin = version_to_tag(this->ota_target_version_);
+  const std::string goal = pin.empty() ? latest : pin;
+  bool mdb_at_latest = have_mdb && ieq(version_to_tag(this->mdb_version_), goal);
   // Compute the target for the CURRENT method right here (independent of the worker's snapshot):
-  // full → the channel latest; delta → the adjacent successor of that component's installed version.
-  std::string mtar = jump ? latest : this->gh_successor_(have_mdb ? version_to_tag(this->mdb_version_) : "");
-  std::string dtar = jump ? latest : this->gh_successor_(have_dbc ? version_to_tag(this->dbc_version_) : "");
+  // jump (full / chaining) → the goal; stepwise delta → the adjacent successor, never past the goal.
+  auto step_to = [&](bool have, const std::string &installed) -> std::string {
+    if (jump)
+      return goal;
+    std::string nx = this->gh_successor_(have ? version_to_tag(installed) : "");
+    return (!nx.empty() && nx > goal) ? std::string() : nx;
+  };
+  std::string mtar = step_to(have_mdb, this->mdb_version_);
+  std::string dtar = step_to(have_dbc, this->dbc_version_);
   this->gh_mdb_target_ = mtar;  // keep in sync so perform_update + the auto-update tick agree
   this->gh_dbc_target_ = dtar;
 
@@ -3407,7 +3480,7 @@ void LibrescootBleClient::refresh_update_availability_() {
     if (u == nullptr)
       return;
     const bool have = !installed.empty() && !ieq(installed, "unknown");
-    if (have && ieq(installed, latest)) {
+    if (have && ieq(version_to_tag(installed), goal)) {
       u->set_latest(installed, title, "", "");
       u->set_available(false);
     } else {
@@ -3427,12 +3500,13 @@ void LibrescootBleClient::refresh_update_availability_() {
     // asset that exists on GitHub: Home Assistant merges the run (or encodes one delta across it)
     // when the install starts, so its size is only known then — say so instead of showing the
     // single release's size, which would be wrong by a factor.
-    const int steps = chaining ? this->gh_steps_ahead_(version_to_tag(installed)) : 0;
+    const int steps = chaining ? this->gh_steps_ahead_(version_to_tag(installed), goal) : 0;
     if (chaining && steps != 1) {
-      s += "  \nUpload method: delta-chaining";
+      s += this->ota_staged_cap_ ? "  \nUpload method: staged delta chain" : "  \nUpload method: delta-chaining";
       if (steps > 1)
         s += " (" + std::to_string(steps) + " releases, one install)";
-      s += "  \nUpload size: computed by Home Assistant when the install starts";
+      s += this->ota_staged_cap_ ? "  \nUpload size: the official delta of each release (hdelta where supported)"
+                                 : "  \nUpload size: computed by Home Assistant when the install starts";
     } else if (sz) {
       s += "  \nUpload method: " + (hdelta ? std::string("hdelta") : method);
       s += "  \nUpload size: " + fmt_size(sz);
@@ -3578,7 +3652,9 @@ void LibrescootBleClient::ota_auto_update_tick_() {
       this->dbc_probe_release_("MDB install next");
     }
     this->ota_auto_check_pending_ = true;  // an install fired → require a fresh check before "done"
-    this->ota_target_version_.clear();     // auto mode uses the per-component target, not a manual pin
+    // The target refresh computed: a pin in OTA Version is the goal (reached in one install with
+    // chaining, step by step without), else the channel latest / the next release.
+    this->ota_auto_target_ = tgt;
     this->perform_update((uint8_t) comp, false);
     return;
   }
@@ -3629,7 +3705,10 @@ void LibrescootBleClient::perform_update(uint8_t component, bool force) {
   // Target: the OTA Version text if the user set one, else the per-component target the availability
   // logic computed (delta → the successor of that component's installed version; full → the channel
   // latest). Fall back to older heuristics if the check hasn't produced a target yet.
-  std::string tag = version_to_tag(this->ota_target_version_);  // pin may predate the normalisation
+  std::string tag = version_to_tag(this->ota_auto_target_);  // auto-update's step, if it asked
+  this->ota_auto_target_.clear();
+  if (tag.empty())
+    tag = version_to_tag(this->ota_target_version_);  // pin may predate the normalisation
   if (tag.empty())
     tag = (component == 1) ? this->gh_dbc_target_ : this->gh_mdb_target_;
   if (tag.empty())
@@ -3646,6 +3725,24 @@ void LibrescootBleClient::perform_update(uint8_t component, bool force) {
   this->rs_tag_ = tag;
   this->rs_source_ = this->ota_source_url_;
   this->rs_mdb_ok_ = this->rs_dbc_ok_ = false;
+  // The releases a staged chain steps through: after the installed version, up to the target, in
+  // order, on the target's channel. Snapshotted here because gh_tags_ belongs to the main loop.
+  this->rs_chain_tags_.clear();
+  this->rs_steps_.clear();
+  this->rs_staged_ok_ = false;
+  if (this->ota_delta_chain_ && this->ota_staged_cap_ && this->ota_method_str_ == "delta") {
+    const std::string installed = version_to_tag(component == 1 ? this->dbc_version_ : this->mdb_version_);
+    const size_t dash = tag.find('-');
+    const std::string chan = dash == std::string::npos ? std::string() : tag.substr(0, dash + 1);
+    if (!installed.empty() && !ieq(installed, "unknown") && !chan.empty()) {
+      for (const auto &t : this->gh_tags_)
+        if (t.rfind(chan, 0) == 0 && t > installed && t <= tag)
+          this->rs_chain_tags_.push_back(t);
+      std::sort(this->rs_chain_tags_.begin(), this->rs_chain_tags_.end());
+      if (this->rs_chain_tags_.empty() || this->rs_chain_tags_.back() != tag)
+        this->rs_chain_tags_.clear();  // the target is not in the known window — no chain
+    }
+  }
   this->ota_resolve_running_ = true;
   this->ota_resolve_done_ = false;
   ESP_LOGI("ota", "install %s: resolving %s assets for '%s' (bytes from %s)",
@@ -3883,19 +3980,10 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
       // not be honoured.
       this->ota_chain_want_ = state;
       if (state && !this->chain_possible_())
-        ESP_LOGW(TAG, "delta chaining needs OTA Update Method 'delta' and a reachable HA relay "
+        ESP_LOGW(TAG, "delta chaining needs OTA Update Method 'delta' and staged installs or a reachable HA relay "
                       "(method '%s', relay %s) — it engages as soon as both hold",
                  this->ota_method_str_.c_str(), this->integration_reachable_ ? "up" : "down");
       this->apply_chain_state_();
-      break;
-    case SwKind::HDELTA:
-      // Local flag; the asset is chosen per install. Re-run the check so the offered size follows.
-      this->ota_hdelta_want_ = state;
-      if (this->hdelta_sw_ != nullptr)
-        this->hdelta_sw_->publish_state(state);
-      ESP_LOGI(TAG, "hdelta %s (board support: MDB %s, DBC %s)", state ? "ON" : "OFF",
-               this->hdelta_mdb_ ? "yes" : "no", this->hdelta_dbc_ ? "yes" : "no");
-      this->request_update_check(false);
       break;
     case SwKind::AUTO_UPDATE:
       // Install every offered update unattended (per the availability rules), then switch itself off
@@ -3969,9 +4057,20 @@ void LibrescootBleClient::on_text(TxtKind k, const std::string &value) {
       // tags carry an uppercase 'T', while the scooter reports its versions with a lowercase 't' —
       // which is exactly the form anyone copies out of the SW MDB / SW DBC sensors. Without this a
       // pasted version fails the resolve with "version not found" even though the release exists.
-      this->ota_target_version_ = version_to_tag(value);
-      if (this->ota_version_text_ != nullptr)
-        this->ota_version_text_->publish_state(this->ota_target_version_);  // echo what will be used
+      {
+        const std::string pin = version_to_tag(value);
+        const bool changed = pin != this->ota_target_version_;
+        this->ota_target_version_ = pin;
+        if (this->ota_version_text_ != nullptr)
+          this->ota_version_text_->publish_state(this->ota_target_version_);  // echo what will be used
+        // The pin is the goal for both update entities and OTA Auto Update: recompute the offer,
+        // and fetch the changelog / sizes for the new goal.
+        if (changed) {
+          ESP_LOGI(TAG, "OTA Version: goal %s", pin.empty() ? "is the channel latest" : pin.c_str());
+          this->refresh_update_availability_();
+          this->request_update_check(false);  // changelog + sizes for the new goal
+        }
+      }
       break;
     case TxtKind::BLE_PASSKEY: {
       // Holds the code shown on the scooter dashboard. Entering it does NOT send: 'BLE Send Code'

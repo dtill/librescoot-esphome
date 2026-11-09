@@ -61,7 +61,7 @@ enum class BtnAction : uint8_t {
   PAIR, PASSKEY_SEND,
 };
 enum class SelKind : uint8_t { BLINKER, USB_MODE, LINK_MODE, OTA_CHANNEL, OTA_METHOD, OTA_SOURCE };
-enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, DBC_POWER, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE, DELTA_CHAINING, HDELTA };
+enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, DBC_POWER, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE, DELTA_CHAINING };
 enum class TxtKind : uint8_t {
   COMMAND, NAV_DEST, CELLULAR_APN, PM_CRON, PM_DURATION, SYSTIME_ISO, OTA_SOURCE_URL, OTA_VERSION,
   BLE_PASSKEY
@@ -273,7 +273,6 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void set_dbc_ready(binary_sensor::BinarySensor *b) { dbc_ready_ = b; }
   void set_dbc_auto_power(bool v) { dbc_auto_power_ = v; }
   void set_delta_chaining(bool on) { this->ota_chain_want_ = on; }
-  void set_hdelta(bool on) { this->ota_hdelta_want_ = on; }
   void set_ums_status(binary_sensor::BinarySensor *b) { ums_status_ = b; }
   void set_maps_available(binary_sensor::BinarySensor *b) { maps_available_ = b; }
   void set_nav_available(binary_sensor::BinarySensor *b) { nav_available_ = b; }
@@ -305,7 +304,6 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void set_scooter_mac_sensor(text_sensor::TextSensor *t) { scooter_mac_sensor_ = t; }
   void set_ha_integration(binary_sensor::BinarySensor *b) { ha_integration_ = b; }
   void set_delta_chain_switch(switch_::Switch *s) { chain_sw_ = s; }
-  void set_hdelta_switch(switch_::Switch *s) { hdelta_sw_ = s; }
   void set_ota_eta(text_sensor::TextSensor *t) { ota_eta_ = t; }
 
   void set_blinker(LibrescootSelect *s) { blinker_ = s; }
@@ -555,6 +553,11 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   bool dbc_present_{false};
   bool dbc_power_on_{false};          // last dbc:status power field (unknown keeps the last)
   bool dbc_power_known_{false};
+  // update-service reboots the MDB into a new image only once the dashboard reports power off, and
+  // it waits for that without a deadline. After every MDB install (manual or unattended) the
+  // dashboard is therefore switched off while the reboot is pending.
+  uint32_t mdb_reboot_dbc_off_ms_{0};
+  void mdb_reboot_release_dbc_(const char *why);
   uint32_t dbc_suppress_until_{0};    // after a switch press: let the optimistic state stand briefly
   // Auto-power during the post-install version await (see ota_request_installed_version_):
   // a DBC bundle applies on the dashboard's next power-on, so with the dashboard off the awaited
@@ -628,24 +631,54 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // user's choice, `ota_delta_chain_` is what actually applies; the switch shows the latter, so it
   // reads as off while the preconditions are missing and turns itself back on when they return.
   bool ota_chain_want_{true};  // set from YAML (delta_chaining:), then by the switch
-  // HDiffPatch deltas (.hdelta). Wanted by default; used per board only when that board's
-  // update-service confirmed its decoder (status:hdelta:<board>:true, bluetooth-service probes it).
-  // A `true` holds until the board's installed version changes — a dark dashboard answers `false`
-  // ("unavailable board") although its decoder is there. Older firmware answers "unknown key",
-  // which leaves the flag false, so .delta is used.
-  switch_::Switch *hdelta_sw_{nullptr};
-  bool ota_hdelta_want_{true};
+  // HDiffPatch deltas (.hdelta, about a third of a .delta). Always preferred where they help: per
+  // board, only when that board's update-service confirmed its decoder (status:hdelta:<board>:true)
+  // and the release carries a smaller .hdelta. A `true` holds until the board's installed version
+  // changes — a dark dashboard answers `false` ("unavailable board") although its decoder is there.
+  // Older firmware answers "unknown key", which leaves the flag false, so .delta is used.
   bool hdelta_mdb_{false}, hdelta_dbc_{false};
   bool use_hdelta_(uint8_t component) const {
-    return this->ota_hdelta_want_ && this->ota_method_str_ == "delta" &&
-           (component == 0 ? this->hdelta_mdb_ : this->hdelta_dbc_);
+    return this->ota_method_str_ == "delta" && (component == 0 ? this->hdelta_mdb_ : this->hdelta_dbc_);
   }
+  // Staged installs (bluetooth-service "cap:ota:staged", OTA capability version 2): START_STAGED
+  // (0x02) uploads an artifact without installing it, APPLY_STAGED (0x06) installs everything staged
+  // for a component in one go. That is how a run of official deltas becomes one install and one
+  // reboot without merging anything. Older firmware ignores both opcodes silently, so this is only
+  // used once the capability was seen. Survives disconnects; re-queried when the MDB version changes.
+  bool ota_staged_cap_{false};
+  // A resolved staged chain (installed -> target), one official asset per release.
+  struct StagedStep {
+    std::string tag, name, sha;
+    uint32_t size{0};
+  };
+  std::vector<StagedStep> rs_steps_;
+  std::vector<std::string> rs_chain_tags_;  // snapshot for the resolve task: the releases to step through
+  bool rs_staged_ok_{false};
+  // The current job is a staged upload (START_STAGED); the last one of a chain also applies it.
+  bool ota_job_staged_{false};
+  bool ota_job_apply_{false};
+  bool ota_apply_pending_{false};  // the next "COMPLETE" is an APPLY_STAGED (DBC waits for power)
+  std::string ota_auto_target_;    // auto-update's explicit target for the next perform_update
+  // One release asset as the GitHub API describes it.
+  struct RelAsset {
+    std::string name, sha;
+    uint32_t size{0};
+    bool ok{false};
+  };
+  // Look up a release's assets: [component][0] = the method's asset (.delta / .mender),
+  // [component][1] = the .hdelta. Runs in the resolve task. True when GitHub answered.
+  bool fetch_release_assets_(const std::string &tag, RelAsset out[2][2]);
+  // The asset to transfer for one component of one release: the .hdelta when the board decodes it
+  // and it is smaller, else the regular one. Logs which variant and why.
+  RelAsset pick_variant_(uint8_t component, const std::string &tag, const RelAsset &regular,
+                         const RelAsset &hdelta) const;
+  bool ota_staged_resolve_(uint8_t component, const std::string &installed);
   bool ota_delta_chain_{false};
   bool chain_sw_available_{false};
   void apply_chain_state_();
   // How many releases lie between an installed version and the channel latest (0 = at latest,
   // 1 = the adjacent successor, >1 = only reachable as a chain).
-  int gh_steps_ahead_(const std::string &from) const;
+  int gh_steps_ahead_(const std::string &from, const std::string &to = "") const;
   bool chain_possible_() const;
   void update_chain_switch_();
 
@@ -789,6 +822,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   std::string gh_current_dbc_tag_;        // installed DBC version (tag form) snapshot, for the range
   std::string gh_method_;                 // "delta"/"full" snapshot for the worker
   bool gh_chain_{false};                  // delta-chaining snapshot: target the channel latest
+  std::string gh_goal_;                   // OTA Version pin snapshot: the goal instead of the latest
   std::string gh_latest_tag_;             // channel latest (result written by the task)
   std::string gh_summary_;                // legacy aggregate (installed MDB → latest); kept for compat
   // Per-component target + changelog computed by the worker: delta → the NEXT release (successor of
@@ -861,6 +895,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   bool ota_congested_{false};
   int ota_rewinds_{0};
   uint32_t ota_state_ms_{0};             // for phase timeouts
+  uint32_t ota_install_poll_ms_{0};      // last STATUS_REQ sent because the install went quiet
   bool ota_complete_pending_{false};     // all bytes acked; COMPLETE waits for the dashboard's on-wait
   uint32_t ota_complete_after_ms_{0};    // ...and for the dashboard to have been up long enough
   uint32_t ota_last_ack_ms_{0};
@@ -884,6 +919,8 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
     std::string url, sha, bundle_id;
     uint32_t size;
     uint8_t component;
+    bool staged{false};  // START_STAGED: keep it on the scooter, do not install
+    bool apply{false};   // after this one, APPLY_STAGED installs the whole staged set
   };
   std::vector<OtaJob> ota_jobs_;
   std::string rs_tag_, rs_source_;       // snapshot for the resolve task
