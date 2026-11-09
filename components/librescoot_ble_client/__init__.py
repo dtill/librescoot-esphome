@@ -119,6 +119,7 @@ CONF_LINK_INTERVAL = "link_interval"
 CONF_LINK_AUTO_HOLD = "link_auto_hold"
 CONF_DBC_AUTO_POWER = "dbc_auto_power"
 CONF_DELTA_CHAINING = "delta_chaining"
+CONF_HDELTA = "hdelta"
 # DEFAULT OTA byte source ("github"/"relay"); distinct key from the `ota_source` select entity.
 CONF_OTA_SOURCE_DEFAULT = "ota_source_default"
 CONF_FIRMWARE_SOURCE = "firmware_source"
@@ -310,6 +311,10 @@ SWITCHES = {
     # install), but only effective with the delta method and a reachable HA relay — the component
     # publishes the effective state. DISABLED: a boot write would overwrite that default want.
     "ota_delta_chaining": ("set_delta_chain_switch", SwKind.DELTA_CHAINING, "diagnostic", "mdi:link-variant", "DISABLED"),
+    # Prefer the HDiffPatch delta (.hdelta, ~1/3 of the .delta) where the release carries one and the
+    # board confirms its decoder (status:hdelta:<board>). Local flag only. DISABLED for the same
+    # reason as chaining: a boot write would overwrite the YAML default.
+    "ota_hdelta": ("set_hdelta_switch", SwKind.HDELTA, "diagnostic", "mdi:package-down", "DISABLED"),
 }
 
 # Alarm trigger provenance (9a590222): one event per trigger, typed by alarm-service's source name.
@@ -439,6 +444,10 @@ CONFIG_SCHEMA = cv.All(
             # "delta" and a reachable HA relay; the runtime switch follows this as its starting
             # point. false = always step one release at a time.
             cv.Optional(CONF_DELTA_CHAINING, default=True): cv.boolean,
+            # Use the smaller .hdelta asset instead of .delta for a single-release delta step, when
+            # the release has one and the scooter board reports hdelta support. Falls back to .delta
+            # otherwise. The runtime switch follows this as its starting point.
+            cv.Optional(CONF_HDELTA, default=True): cv.boolean,
             # OTA byte source default. Omitted → chip-based (ESP32-S3 → direct GitHub, else HA relay).
             cv.Optional(CONF_OTA_SOURCE_DEFAULT): cv.one_of("github", "relay", lower=True),
             # Compile-time default byte source for the OTA transfer (e.g. a local mirror). The
@@ -547,6 +556,7 @@ async def to_code(config):
     cg.add(var.set_auto_hold_ms(config[CONF_LINK_AUTO_HOLD]))
     cg.add(var.set_dbc_auto_power(config[CONF_DBC_AUTO_POWER]))
     cg.add(var.set_delta_chaining(config[CONF_DELTA_CHAINING]))
+    cg.add(var.set_hdelta(config[CONF_HDELTA]))
     cg.add(var.set_presence_timeout(config[CONF_PRESENCE_TIMEOUT]))
     if CONF_TIME_ID in config:
         cg.add(var.set_time(await cg.get_variable(config[CONF_TIME_ID])))

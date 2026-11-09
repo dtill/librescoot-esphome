@@ -375,6 +375,8 @@ void LibrescootBleClient::setup() {
     // restore write would overwrite the default want before anything could be known.
     if (this->chain_sw_ != nullptr)
       this->chain_sw_->publish_state(false);
+    if (this->hdelta_sw_ != nullptr)
+      this->hdelta_sw_->publish_state(this->ota_hdelta_want_);
     // The idle-gate only opens once the scooter has reported its OTA phase, so a reply that never
     // arrives means no update is ever offered. Keep asking while it is unknown — from the
     // scheduler, not loop(), which is disabled exactly when the link sits connected and idle.
@@ -1249,6 +1251,12 @@ void LibrescootBleClient::on_connected_() {
   // whole session. The extended command reads the live value, so ask it as well and let it win.
   if (this->sw_mdb_ != nullptr || this->mdb_update_ != nullptr || this->dbc_update_ != nullptr)
     this->pending_queries_.push_back("status:version:mdb");
+  // Which boards can apply an .hdelta. Answered by the board's own update-service, so it is the
+  // only reliable source; firmware without the query answers "unknown key" and .delta is used.
+  if (this->mdb_update_ != nullptr || this->dbc_update_ != nullptr) {
+    this->pending_queries_.push_back("status:hdelta:mdb");
+    this->pending_queries_.push_back("status:hdelta:dbc");
+  }
   if (this->maps_available_ != nullptr)
     this->pending_queries_.push_back("status:maps-available");
   if (this->nav_available_ != nullptr)
@@ -1503,6 +1511,17 @@ void LibrescootBleClient::parse_cmd_response_(const std::string &line) {
                  this->mdb_version_.c_str(), live.c_str());
       this->mdb_version_live_ = live;
       this->set_mdb_version_(live);
+    }
+  } else if (line.rfind("status:hdelta:", 0) == 0 && line.size() > 18) {
+    const bool mdb = line.compare(14, 4, "mdb:") == 0;
+    const bool yes = line.compare(18, std::string::npos, "true") == 0;
+    bool &flag = mdb ? this->hdelta_mdb_ : this->hdelta_dbc_;
+    // A dark dashboard answers false although its decoder is there; keep a confirmed true until
+    // the board's version changes (set_*_version_ clears it).
+    if (yes && !flag) {
+      flag = true;
+      ESP_LOGI(TAG, "%s supports hdelta", mdb ? "MDB" : "DBC");
+      this->request_update_check(false);  // the offered size may change
     }
   } else if (line.rfind("keycard:count:", 0) == 0) {
     if (this->keycard_count_ != nullptr)
@@ -1829,6 +1848,8 @@ void LibrescootBleClient::handle_dbc_response_(const std::string &line) {
   if (this->dbc_version_probe_ && line.rfind("dbc:on-wait:", 0) == 0) {
     this->dbc_version_probe_ = false;
     this->pending_queries_.push_back("status:version:dbc");  // ok or not: the answer is the proof
+    if (!this->hdelta_dbc_)
+      this->pending_queries_.push_back("status:hdelta:dbc");  // the dashboard answers itself now
   }
   if (this->dbc_autopower_active_ && line.rfind("dbc:on-wait:", 0) == 0) {
     if (ok) {
@@ -2032,6 +2053,10 @@ void LibrescootBleClient::reflect_channel_(const std::string &mdb_version) {
 }
 
 void LibrescootBleClient::set_mdb_version_(const std::string &v) {
+  if (!this->mdb_version_.empty() && !ieq(v, this->mdb_version_) && this->hdelta_mdb_) {
+    this->hdelta_mdb_ = false;  // new firmware: ask again
+    this->pending_queries_.push_back("status:hdelta:mdb");
+  }
   this->mdb_version_ = v;
   this->reflect_channel_(v);
   if (this->sw_mdb_ != nullptr)
@@ -2046,6 +2071,10 @@ void LibrescootBleClient::set_mdb_version_(const std::string &v) {
 
 void LibrescootBleClient::set_dbc_version_(const std::string &v) {
   bool changed = !ieq(v, this->dbc_version_);
+  if (changed && !this->dbc_version_.empty() && this->hdelta_dbc_) {
+    this->hdelta_dbc_ = false;  // new firmware: ask again
+    this->pending_queries_.push_back("status:hdelta:dbc");
+  }
   this->dbc_version_ = v;
   if (!v.empty() && !ieq(v, "unknown"))
     this->dbc_version_seen_ms_ = millis();
@@ -2087,6 +2116,8 @@ void LibrescootBleClient::request_update_check(bool may_release_link, bool user_
   // Chaining turns the check into a "jump to the channel latest" check: one target, and the notes of
   // every release in between (Home Assistant merges the run into a single install).
   this->gh_chain_ = this->ota_delta_chain_;
+  this->gh_hdelta_mdb_ = this->use_hdelta_(0);
+  this->gh_hdelta_dbc_ = this->use_hdelta_(1);
   // The parse grows std::strings alongside WiFi and the BLE stack. Builds are without exceptions,
   // so a failed allocation aborts the firmware — decline the check instead.
   const uint32_t now = millis();
@@ -2816,6 +2847,7 @@ void LibrescootBleClient::github_fetch_() {
   // per distinct target tag (MDB and DBC targets can differ under delta).
   const std::string aext = full ? ".mender" : ".delta";
   uint32_t mdb_sz = 0, dbc_sz = 0;
+  bool mdb_h = false, dbc_h = false;  // the size is the .hdelta's
   std::string fetched_body;  // the fetched release's full body (for the delta single-changelog / stable)
   auto fetch_asset = [&](const std::string &tag, bool want_mdb, bool want_dbc) {
     if (tag.empty())
@@ -2833,6 +2865,10 @@ void LibrescootBleClient::github_fetch_() {
 #endif
     const std::string tmdb = "librescoot-unu-mdb-" + tag + aext;
     const std::string tdbc = "librescoot-unu-dbc-" + tag + aext;
+    // The .hdelta counts when the board can apply it and it is smaller, as at install time.
+    const std::string hmdb = (!full && this->gh_hdelta_mdb_) ? "librescoot-unu-mdb-" + tag + ".hdelta" : "";
+    const std::string hdbc = (!full && this->gh_hdelta_dbc_) ? "librescoot-unu-dbc-" + tag + ".hdelta" : "";
+    uint32_t hm_sz = 0, hd_sz = 0;
     static const char AN[] = "\"name\":\"";
     static const char AS[] = "\"size\":";
     static const char BN[] = "\"body\":\"";
@@ -2850,6 +2886,8 @@ void LibrescootBleClient::github_fetch_() {
           acap = 0;
           uint32_t sz = (uint32_t) strtoul(asize.c_str(), nullptr, 10);
           if (want_mdb && aname == tmdb) mdb_sz = sz; else if (want_dbc && aname == tdbc) dbc_sz = sz;
+          else if (want_mdb && !hmdb.empty() && aname == hmdb) hm_sz = sz;
+          else if (want_dbc && !hdbc.empty() && aname == hdbc) hd_sz = sz;
           asize.clear();
         }
       } else {
@@ -2880,6 +2918,8 @@ void LibrescootBleClient::github_fetch_() {
         }
       }
     });
+    if (hm_sz > 0 && (mdb_sz == 0 || hm_sz < mdb_sz)) { mdb_sz = hm_sz; mdb_h = true; }
+    if (hd_sz > 0 && (dbc_sz == 0 || hd_sz < dbc_sz)) { dbc_sz = hd_sz; dbc_h = true; }
     if (fetched_body.size() >= body_cap) {
       // Mark the cut and link the full notes; the cap is well below a typical release body.
       fetched_body += "\n\n**… truncated — full release notes:** https://github.com/";
@@ -2918,6 +2958,8 @@ void LibrescootBleClient::github_fetch_() {
   }
   this->gh_mdb_size_ = mdb_sz;
   this->gh_dbc_size_ = dbc_sz;
+  this->gh_mdb_is_hdelta_ = mdb_h && mdb_sz > 0;
+  this->gh_dbc_is_hdelta_ = dbc_h && dbc_sz > 0;
 
   this->gh_latest_tag_ = best;
   this->gh_summary_ = summary;
@@ -3378,7 +3420,7 @@ void LibrescootBleClient::refresh_update_availability_() {
   };
   // Header block, one item per line (markdown hard breaks). The time is the estimated BLE UPLOAD
   // time (transfer only — the on-scooter install/reboot is separate and not estimated here).
-  auto sum_line = [&](const char *label, const std::string &tgt, uint32_t sz,
+  auto sum_line = [&](const char *label, const std::string &tgt, uint32_t sz, bool hdelta,
                       const std::string &installed, const std::string &notes) {
     std::string s = std::string("**") + label + " → " + tgt + "**";
     // How the bytes will be produced. A chained target spanning more than one release is not an
@@ -3392,7 +3434,7 @@ void LibrescootBleClient::refresh_update_availability_() {
         s += " (" + std::to_string(steps) + " releases, one install)";
       s += "  \nUpload size: computed by Home Assistant when the install starts";
     } else if (sz) {
-      s += "  \nUpload method: " + method;
+      s += "  \nUpload method: " + (hdelta ? std::string("hdelta") : method);
       s += "  \nUpload size: " + fmt_size(sz);
       s += "  \nUpload time (est.): " + fmt_est_time(sz, this->ota_rate_bps_);
     }
@@ -3428,7 +3470,7 @@ void LibrescootBleClient::refresh_update_availability_() {
   if (this->mdb_update_ != nullptr && !(busy && this->ota_active_update_ == this->mdb_update_)) {
     if (mdb_has) {
       this->mdb_update_->set_latest(mtar, "LibreScoot MDB", rel_url(mtar),
-                                    sum_line("MDB", mtar, mdb_sum_ok ? this->gh_mdb_size_ : 0,
+                                    sum_line("MDB", mtar, mdb_sum_ok ? this->gh_mdb_size_ : 0, this->gh_mdb_is_hdelta_,
                                              this->mdb_version_,
                                              mdb_sum_ok ? this->gh_mdb_summary_ : EMPTY));
       this->mdb_update_->set_available(true);
@@ -3439,7 +3481,7 @@ void LibrescootBleClient::refresh_update_availability_() {
   if (this->dbc_update_ != nullptr && !(busy && this->ota_active_update_ == this->dbc_update_)) {
     if (dbc_has) {
       this->dbc_update_->set_latest(dtar, "LibreScoot DBC", rel_url(dtar),
-                                    sum_line("DBC", dtar, dbc_sum_ok ? this->gh_dbc_size_ : 0,
+                                    sum_line("DBC", dtar, dbc_sum_ok ? this->gh_dbc_size_ : 0, this->gh_dbc_is_hdelta_,
                                              this->dbc_version_,
                                              dbc_sum_ok ? this->gh_dbc_summary_ : EMPTY));
       this->dbc_update_->set_available(true);
@@ -3845,6 +3887,15 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
                       "(method '%s', relay %s) — it engages as soon as both hold",
                  this->ota_method_str_.c_str(), this->integration_reachable_ ? "up" : "down");
       this->apply_chain_state_();
+      break;
+    case SwKind::HDELTA:
+      // Local flag; the asset is chosen per install. Re-run the check so the offered size follows.
+      this->ota_hdelta_want_ = state;
+      if (this->hdelta_sw_ != nullptr)
+        this->hdelta_sw_->publish_state(state);
+      ESP_LOGI(TAG, "hdelta %s (board support: MDB %s, DBC %s)", state ? "ON" : "OFF",
+               this->hdelta_mdb_ ? "yes" : "no", this->hdelta_dbc_ ? "yes" : "no");
+      this->request_update_check(false);
       break;
     case SwKind::AUTO_UPDATE:
       // Install every offered update unattended (per the availability rules), then switch itself off

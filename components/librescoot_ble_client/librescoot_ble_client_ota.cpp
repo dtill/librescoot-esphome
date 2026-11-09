@@ -1012,6 +1012,11 @@ void LibrescootBleClient::ota_resolve_() {
   const std::string ext = (this->ota_method_str_ == "full") ? ".mender" : ".delta";
   const std::string tmdb = "librescoot-unu-mdb-" + this->rs_tag_ + ext;
   const std::string tdbc = "librescoot-unu-dbc-" + this->rs_tag_ + ext;
+  // The HDiffPatch variant, only for a board that confirmed its decoder. Sent under its own name:
+  // bluetooth-service stages .hdelta verbatim and update-service dispatches on the extension.
+  const std::string hmdb = this->use_hdelta_(0) ? "librescoot-unu-mdb-" + this->rs_tag_ + ".hdelta" : "";
+  const std::string hdbc = this->use_hdelta_(1) ? "librescoot-unu-dbc-" + this->rs_tag_ + ".hdelta" : "";
+  struct Cand { std::string name, sha; uint32_t size{0}; bool ok{false}; } h_mdb, h_dbc;
 
   // The handshake wants ~4.5 kB; on a board without PSRAM availability depends on what WiFi and
   // the BLE stack hold at that instant, so the same call succeeds and fails minutes apart.
@@ -1046,7 +1051,11 @@ void LibrescootBleClient::ota_resolve_() {
     std::string sha = cur_dig;
     if (sha.rfind("sha256:", 0) == 0)
       sha = sha.substr(7);
-    if (cur_name == tmdb) {
+    if (!hmdb.empty() && cur_name == hmdb) {
+      h_mdb = {cur_name, sha, (uint32_t) strtoul(cur_size.c_str(), nullptr, 10), true};
+    } else if (!hdbc.empty() && cur_name == hdbc) {
+      h_dbc = {cur_name, sha, (uint32_t) strtoul(cur_size.c_str(), nullptr, 10), true};
+    } else if (cur_name == tmdb) {
       this->rs_mdb_name_ = cur_name;
       this->rs_mdb_size_ = (uint32_t) strtoul(cur_size.c_str(), nullptr, 10);
       this->rs_mdb_sha_ = sha;
@@ -1122,6 +1131,18 @@ void LibrescootBleClient::ota_resolve_() {
   esp_http_client_close(c);
   esp_http_client_cleanup(c);
   }  // retry loop
+
+  // Prefer the .hdelta when the release has one and it is smaller (or the .delta is missing).
+  auto prefer = [](const Cand &h, std::string &name, uint32_t &size, std::string &sha, bool &ok) {
+    if (!h.ok || h.size == 0 || h.sha.size() != 64 || (ok && size > 0 && h.size >= size))
+      return;
+    name = h.name;
+    size = h.size;
+    sha = h.sha;
+    ok = true;
+  };
+  prefer(h_mdb, this->rs_mdb_name_, this->rs_mdb_size_, this->rs_mdb_sha_, this->rs_mdb_ok_);
+  prefer(h_dbc, this->rs_dbc_name_, this->rs_dbc_size_, this->rs_dbc_sha_, this->rs_dbc_ok_);
 
   ESP_LOGI(OTAG, "resolve: MDB %s DBC %s", this->rs_mdb_ok_ ? this->rs_mdb_name_.c_str() : "(none)",
            this->rs_dbc_ok_ ? this->rs_dbc_name_.c_str() : "(none)");

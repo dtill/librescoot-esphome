@@ -61,7 +61,7 @@ enum class BtnAction : uint8_t {
   PAIR, PASSKEY_SEND,
 };
 enum class SelKind : uint8_t { BLINKER, USB_MODE, LINK_MODE, OTA_CHANNEL, OTA_METHOD, OTA_SOURCE };
-enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, DBC_POWER, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE, DELTA_CHAINING };
+enum class SwKind : uint8_t { ALARM_ENABLED, ALARM_ARMED, DBC_POWER, PM_SCHED_HIB, STAGE_ONLY, AUTO_UPDATE, DELTA_CHAINING, HDELTA };
 enum class TxtKind : uint8_t {
   COMMAND, NAV_DEST, CELLULAR_APN, PM_CRON, PM_DURATION, SYSTIME_ISO, OTA_SOURCE_URL, OTA_VERSION,
   BLE_PASSKEY
@@ -273,6 +273,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void set_dbc_ready(binary_sensor::BinarySensor *b) { dbc_ready_ = b; }
   void set_dbc_auto_power(bool v) { dbc_auto_power_ = v; }
   void set_delta_chaining(bool on) { this->ota_chain_want_ = on; }
+  void set_hdelta(bool on) { this->ota_hdelta_want_ = on; }
   void set_ums_status(binary_sensor::BinarySensor *b) { ums_status_ = b; }
   void set_maps_available(binary_sensor::BinarySensor *b) { maps_available_ = b; }
   void set_nav_available(binary_sensor::BinarySensor *b) { nav_available_ = b; }
@@ -304,6 +305,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void set_scooter_mac_sensor(text_sensor::TextSensor *t) { scooter_mac_sensor_ = t; }
   void set_ha_integration(binary_sensor::BinarySensor *b) { ha_integration_ = b; }
   void set_delta_chain_switch(switch_::Switch *s) { chain_sw_ = s; }
+  void set_hdelta_switch(switch_::Switch *s) { hdelta_sw_ = s; }
   void set_ota_eta(text_sensor::TextSensor *t) { ota_eta_ = t; }
 
   void set_blinker(LibrescootSelect *s) { blinker_ = s; }
@@ -626,6 +628,18 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // user's choice, `ota_delta_chain_` is what actually applies; the switch shows the latter, so it
   // reads as off while the preconditions are missing and turns itself back on when they return.
   bool ota_chain_want_{true};  // set from YAML (delta_chaining:), then by the switch
+  // HDiffPatch deltas (.hdelta). Wanted by default; used per board only when that board's
+  // update-service confirmed its decoder (status:hdelta:<board>:true, bluetooth-service probes it).
+  // A `true` holds until the board's installed version changes — a dark dashboard answers `false`
+  // ("unavailable board") although its decoder is there. Older firmware answers "unknown key",
+  // which leaves the flag false, so .delta is used.
+  switch_::Switch *hdelta_sw_{nullptr};
+  bool ota_hdelta_want_{true};
+  bool hdelta_mdb_{false}, hdelta_dbc_{false};
+  bool use_hdelta_(uint8_t component) const {
+    return this->ota_hdelta_want_ && this->ota_method_str_ == "delta" &&
+           (component == 0 ? this->hdelta_mdb_ : this->hdelta_dbc_);
+  }
   bool ota_delta_chain_{false};
   bool chain_sw_available_{false};
   void apply_chain_state_();
@@ -791,6 +805,8 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // snapshot (delta → adjacent successor, full → latest). Same worker→main handoff as gh_summary_.
   std::vector<std::string> gh_tags_;
   uint32_t gh_mdb_size_{0}, gh_dbc_size_{0};  // asset sizes for each component's target (summary line)
+  bool gh_hdelta_mdb_{false}, gh_hdelta_dbc_{false};  // worker snapshot: may use .hdelta
+  bool gh_mdb_is_hdelta_{false}, gh_dbc_is_hdelta_{false};  // the size above is the .hdelta's
   // refresh_update_availability_ decision, cached for the auto-update tick (single source of truth).
   bool ota_mdb_avail_{false}, ota_dbc_avail_{false};
   // OTA Auto Update: install every offered update unattended, then switch itself off when up to date.

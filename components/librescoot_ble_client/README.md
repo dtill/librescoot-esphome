@@ -82,6 +82,7 @@ librescoot_ble_client:
 | `github_token` | — | Optional GitHub token (read-only). Lifts the release-check limit from 60 to 5000 per hour. |
 | `dbc_auto_power` | `true` | Switch the dashboard on when a dashboard update needs it: to hand the update over, to apply it, and to read its version. |
 | `delta_chaining` | `true` | Offer the newest release and let Home Assistant merge the deltas in between into one install. Needs method `delta` and the HA relay; see [Chained delta updates](#chained-delta-updates). |
+| `hdelta` | `true` | Send the smaller `.hdelta` (HDiffPatch) instead of the `.delta` for a one-release step, when the release has one and the scooter part says it can apply it. Starting value of the **OTA Update Method hdelta** switch. |
 | `link_auto_hold` | `3min` | Link mode `auto`: how long to hold the connection before letting a phone in for ~20 s. |
 | `link_interval` | `5min` | Link mode `interval`: how often to connect and refresh the sensors. |
 | `presence_timeout` | `60s` | How long **BLE Presence** stays on after the scooter was last heard. |
@@ -240,6 +241,10 @@ Press *Install* and the ESP transfers the firmware to the scooter over Bluetooth
 
 1. **OTA channel** → `stable`, `testing` or `nightly`.
 2. **OTA Update Method** → `delta` (small, default) or `full` (whole image).
+   With **OTA Update Method hdelta** on (default) a delta step uses the `.hdelta` file where the
+   release has one — about a third of the size. The ESP asks the scooter computer and the dashboard
+   separately whether they can apply it, and sends the regular `.delta` to a part that cannot (older
+   firmware, stable releases). The update entity's *Upload method* line says which one it will be.
 3. **OTA MDB Update** / **OTA DBC Update** show the next release with its notes. Press *Install*.
 4. Follow **OTA Status**. When it says `Installed` and **SW MDB** / **SW DBC** show the new
    version, install the other one if it is offered.
@@ -327,6 +332,7 @@ On an **ESP32-S3** the ESP can download the firmware from GitHub by itself, so u
 | OTA channel | select | `stable` / `testing` / `nightly` | `ota_channel` |
 | OTA Update Method | select | `delta` / `full` | `ota_update_method` |
 | OTA Update Method delta-chaining | switch | See above. On by default; shows off while its conditions are not met, and comes back by itself when they are. | `ota_delta_chaining` |
+| OTA Update Method hdelta | switch | Prefer the `.hdelta` file for a delta step where the scooter part supports it. On by default. Chained installs are always built from `.delta` files. | `ota_hdelta` |
 | OTA Auto Update | switch | See above. Off after every ESP restart. | `ota_auto_update` |
 | OTA Stage Only | switch | Transfer but do not install (for testing). Off after every ESP restart. | `ota_stage_only` |
 | OTA Source | select | `HA relay` / `direct GitHub` | `ota_source` |

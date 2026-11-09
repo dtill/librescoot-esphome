@@ -126,6 +126,9 @@ librescoot_ble_client:
   # "delta" and a reachable HA relay; the "OTA Update Method delta-chaining" switch starts here and
   # shows off until both hold. false = always one release at a time.
   delta_chaining: true
+  # HDiffPatch deltas (.hdelta, about a third of a .delta) for a single-release step, where the
+  # release carries one and the scooter board reports support; .delta otherwise.
+  hdelta: true
   # --- OTA settings (defaults shown; the component picks the byte source and the TLS roots
   #     by board: with PSRAM straight from GitHub against the Mozilla bundle, without PSRAM
   #     via the Home Assistant relay with the GitHub roots pinned) ---
@@ -307,6 +310,9 @@ librescoot_ble_client:
   # It does not save bytes - a merged patch is usually larger than the steps it replaces.
   ota_delta_chaining:
     name: "OTA Update Method delta-chaining"
+  # Prefer the smaller .hdelta asset (see hdelta: above). Off = always .delta.
+  ota_hdelta:
+    name: "OTA Update Method hdelta"
   # Arm/disarm buttons: kept for firmware without the alarm service (the switch above needs it).
   alarm_arm:
     name: "Alarm Arm"
