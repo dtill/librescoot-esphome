@@ -7,7 +7,7 @@ LibreScoot GitHub releases.
 
 **You need:** ESPHome 2026.9 or newer · an ESP32 or ESP32-S3 · a scooter on LibreScoot firmware ·
 for firmware updates on a plain ESP32 the
-[Home Assistant integration](../../homeassistant-integration/README.md).
+[Home Assistant integration](https://github.com/dtill/librescoot-homeassistant).
 
 ## Contents
 
@@ -210,8 +210,10 @@ Needs scooter firmware with nRF **v2.11.0-ls** or newer. For instant alarm event
 ## Dashboard power
 
 The scooter switches its dashboard off while parked. **DBC Power** switches it on (~15 s) or off
-without changing the scooter's state; the scooter switches it off again by itself later. A
-dashboard firmware update needs the dashboard on — the ESP does that for you (`dbc_auto_power`).
+without changing the scooter's state; the scooter switches it off again by itself later. The
+switch is read back every 2 minutes and at each install step, so it shows the real state. A
+dashboard firmware update needs the dashboard on — the ESP does that for you (`dbc_auto_power`),
+and switches it on again if the scooter turns it off before the update has applied.
 
 | Entity | Type | Meaning | YAML key |
 | :--- | :--- | :--- | :--- |
@@ -308,7 +310,7 @@ release only (its memory is needed for the transfer).
 
 For the Home Assistant way you need:
 
-- the [Home Assistant integration](../../homeassistant-integration/README.md), and
+- the [Home Assistant integration](https://github.com/dtill/librescoot-homeassistant), and
   **OTA Source HA Relay** showing *Connected*
 - **OTA Source** = `HA relay`
 - **OTA Update Method** = `delta`
@@ -366,7 +368,7 @@ On an **ESP32-S3** the ESP can download the firmware from GitHub by itself, so u
 | `Pending reboot` for a long time / **OTA Reboot Required** on | The scooter did not reboot after an MDB update. It waits for the dashboard to be off before it does. | Switch **DBC Power** off. If it still does not reboot, press **Reboot MDB (hard)**. |
 | `Installing — waiting for scooter reboot…` after a DBC update | The dashboard is off, so the update has not applied yet. | Switch **DBC Power** on (`dbc_auto_power` does this by itself). |
 | No update shown although there is a newer release | Scooter out of range, link mode `scan`/`disconnect`, or the scooter is still busy with the last install. | Bring it in range, choose `auto`/`always`, or wait. |
-| Install refused: no firmware source | Neither the integration nor direct GitHub is available. | Install the [Home Assistant integration](../../homeassistant-integration/README.md), or use an ESP32-S3. |
+| Install refused: no firmware source | Neither the integration nor direct GitHub is available. | Install the [Home Assistant integration](https://github.com/dtill/librescoot-homeassistant), or use an ESP32-S3. |
 
 ---
 
