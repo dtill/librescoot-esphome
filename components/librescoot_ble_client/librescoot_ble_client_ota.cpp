@@ -407,6 +407,13 @@ void LibrescootBleClient::ota_handle_status_(uint8_t *x, uint16_t len) {
       // with idle is no sign of an install still running.
       if (phase != 0x06)
         this->ota_state_ms_ = millis();
+      // Each install phase change is a point where the vehicle may switch the dashboard: read the
+      // power back once per phase, not per percent.
+      if (phase != this->dbc_status_phase_) {
+        this->dbc_status_phase_ = phase;
+        if (this->dbc_present_)
+          this->request_dbc_status_();
+      }
       if (phase == 0x00 || phase == 0x01) {  // verify / install — two 0-100% sub-phases
         if (this->ota_install_sub_ == 0 && this->ota_install_pct_ > 60 && pct + 30 < this->ota_install_pct_)
           this->ota_install_sub_ = 1;  // percent dropped a lot → second sub-phase started

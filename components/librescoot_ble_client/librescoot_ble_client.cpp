@@ -27,6 +27,14 @@ namespace librescoot_ble_client {
 
 static const char *const TAG = "librescoot_ble_client";
 
+// Newer firmware appends a codename to the version ("nightly-20261109T110233 (wrynose…"), and the
+// characteristic may cut it off anywhere. Only the release tag counts: everything from the first
+// space or '(' on is dropped, or every read would look like a new version.
+static std::string version_token_(const std::string &v) {
+  const size_t cut = v.find_first_of(" (");
+  return cut == std::string::npos ? v : v.substr(0, cut);
+}
+
 // "auto" link mode: how long to keep the link released after a disconnect so another
 // central (the phone app) can win the reconnect race before we try again.
 static const uint32_t LINK_YIELD_MS = 20000;
@@ -359,6 +367,13 @@ void LibrescootBleClient::setup() {
   this->set_interval("pairing_watch", 2000, [this]() { this->service_pairing_watch_(); });
   // Same reason: BLE Connection / BLE Presence must keep reporting while the link is idle.
   this->set_interval("presence", 1000, [this]() { this->service_presence_(); });
+  // The dashboard's power has no notify characteristic: read it back every 2 min so DBC Power
+  // follows what the vehicle does with it (it switches the dashboard on and off by itself).
+  if (this->dbc_power_ != nullptr || this->dbc_ready_ != nullptr)
+    this->set_interval("dbc_status", 120000, [this]() {
+      if (this->dbc_present_)
+        this->request_dbc_status_();
+    });
   // Drives the "interval" link mode (connect → refresh all sensors → release, every N minutes).
   // Also a scheduler timer so it fires while the link is down and loop() is disabled.
   this->set_interval("link_interval", 2000, [this]() { this->service_link_interval_(); });
@@ -649,6 +664,8 @@ void LibrescootBleClient::loop() {
       ESP_LOGI("ota", "%s now reports %s — install confirmed",
                this->ota_install_component_ == 0 ? "MDB" : "DBC", t.c_str());
       this->ota_awaiting_version_ = false;
+      if (this->dbc_present_)
+        this->request_dbc_status_();
       if (this->ota_status_ != nullptr)
         this->ota_status_->publish_state("Installed");
       this->dbc_autopower_finish_();
@@ -668,6 +685,16 @@ void LibrescootBleClient::loop() {
         this->mdb_reboot_release_dbc_("waiting for the MDB to reboot");
       // A DBC bundle applies on the dashboard's next power-on. With the dashboard off the version
       // above can never change, so — when allowed — power it on and let the install happen.
+      // An on-wait sent while the dashboard was still running does not restart it; once the
+      // vehicle switches it off, that try is spent and the next one powers it on again.
+      if (this->dbc_present_)
+        this->request_dbc_status_();
+      if (this->ota_install_component_ == 1 && this->dbc_auto_power_ && this->dbc_present_) {
+        if (this->dbc_autopower_active_ && this->dbc_power_known_ && !this->dbc_power_on_) {
+          ESP_LOGI("ota", "DBC: dashboard went off without the new version — powering it on again");
+          this->dbc_autopower_active_ = false;
+        }
+      }
       if (this->ota_install_component_ == 1 && this->dbc_auto_power_ && this->dbc_present_ &&
           !this->dbc_autopower_active_ && this->dbc_autopower_tries_ < 3 &&
           this->ota_scooter_phase_ != 0x01 && this->state() == espbt::ClientState::ESTABLISHED) {
@@ -1446,7 +1473,7 @@ void LibrescootBleClient::handle_char_value_(CharId id, uint8_t *v, uint16_t len
       break;
     }
     case CharId::SW_MDB: {
-      const std::string c = clean_str_(v, len);
+      const std::string c = version_token_(clean_str_(v, len));
       // A live status:version:mdb answer outranks the nRF's cached characteristic until the
       // characteristic itself moves to a new value.
       if (!this->mdb_version_live_.empty() && !ieq(c, this->mdb_version_live_) &&
@@ -1523,9 +1550,9 @@ void LibrescootBleClient::handle_char_value_(CharId id, uint8_t *v, uint16_t len
 void LibrescootBleClient::parse_cmd_response_(const std::string &line) {
   // Typed responses — parsed always so on-connect queries and manual commands both work.
   if (line.rfind("status:version:dbc:", 0) == 0) {
-    this->set_dbc_version_(line.substr(19));
+    this->set_dbc_version_(version_token_(line.substr(19)));
   } else if (line.rfind("status:version:mdb:", 0) == 0) {
-    const std::string live = line.substr(19);
+    const std::string live = version_token_(line.substr(19));
     if (!live.empty() && !ieq(live, "unknown")) {
       this->mdb_version_seen_ms_ = millis();
       if (!this->mdb_version_.empty() && !ieq(live, this->mdb_version_))
@@ -1999,6 +2026,22 @@ void LibrescootBleClient::end_ondemand_() {
 
 void LibrescootBleClient::write_str_(CharId id, const std::string &s) {
   this->write_raw_(id, reinterpret_cast<const uint8_t *>(s.data()), s.size());
+}
+
+// Read the dashboard's power back. Never while chunks stream (the command channel shares the link);
+// during COMPLETING / INSTALLING the query queue is cleared, so it goes out directly.
+void LibrescootBleClient::request_dbc_status_() {
+  if (this->state() != espbt::ClientState::ESTABLISHED)
+    return;
+  if (this->ota_state_ == OtaState::IDLE) {
+    for (const auto &q : this->pending_queries_)
+      if (q == "dbc:status")
+        return;
+    this->pending_queries_.push_back("dbc:status");
+    this->enable_loop();
+  } else if (this->ota_state_ == OtaState::COMPLETING || this->ota_state_ == OtaState::INSTALLING) {
+    this->send_ext_query_("dbc:status");
+  }
 }
 
 void LibrescootBleClient::send_ext_query_(const std::string &q) {

@@ -62,7 +62,7 @@ table is in the **[component README](components/librescoot_ble_client/README.md)
 | Control | lock/unlock, blinkers, seatbox, hibernate/wake/reboot, USB mode, navigation target |
 | Telemetry | operating state, odometer, both traction batteries, aux and connectivity battery, versions, RSSI |
 | Alarm | state, armed switch, trigger **event** (what set it off), last trigger |
-| Dashboard | power switch and ready state |
+| Dashboard | power switch that follows the real state, ready state |
 | Firmware updates | update entities for the scooter computer and the dashboard, unattended mode, delta (incl. the smaller HDiffPatch `.hdelta`) / full / chained deltas, live progress |
 | Extended commands | freeform command channel |
 

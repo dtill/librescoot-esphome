@@ -551,6 +551,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   LibrescootSwitch *dbc_power_{nullptr};
   binary_sensor::BinarySensor *dbc_ready_{nullptr};
   bool dbc_present_{false};
+  uint8_t dbc_status_phase_{0xFF};  // last install phase the dashboard power was read back for
   bool dbc_power_on_{false};          // last dbc:status power field (unknown keeps the last)
   bool dbc_power_known_{false};
   // update-service reboots the MDB into a new image only once the dashboard reports power off, and
@@ -578,6 +579,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   uint32_t ota_auto_armed_ms_{0};
   void handle_dbc_response_(const std::string &line);
   void dbc_autopower_finish_();
+  void request_dbc_status_();
   void dbc_probe_release_(const char *why);
   binary_sensor::BinarySensor *maps_available_{nullptr}, *nav_available_{nullptr};
   binary_sensor::BinarySensor *ble_connection_{nullptr}, *ble_presence_{nullptr};
