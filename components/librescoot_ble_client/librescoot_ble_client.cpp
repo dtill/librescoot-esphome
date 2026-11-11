@@ -859,6 +859,19 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
       this->auth_failed_conn_ = false;  // a new connection: its discovery is evaluated again
       this->enc_started_conn_ = false;
       this->read_auth_warned_ = false;
+      this->link_encrypted_ = false;
+      this->subs_before_auth_ = false;
+      this->sub_refused_warned_ = false;
+      break;
+    case ESP_GATTC_WRITE_DESCR_EVT:
+      // The only descriptor writes on this link are the notification subscriptions (CCCD) ESPHome
+      // sends after register_for_notify. A refusal means that value will never arrive by notify.
+      if (param->write.status != ESP_GATT_OK && !this->sub_refused_warned_) {
+        this->sub_refused_warned_ = true;
+        ESP_LOGW(TAG, "scooter refused a notification subscription (handle 0x%04X, status 0x%02X)%s",
+                 param->write.handle, param->write.status,
+                 this->link_encrypted_ ? "" : " — link not encrypted yet; subscribing again once it is");
+      }
       break;
     case ESP_GATTC_SEARCH_CMPL_EVT: {
       // A discovery that completes on a link we are already dropping (authentication failed, or the
@@ -893,9 +906,15 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
                       "Triggered / Armed stay unknown; Alarm Enabled falls back to get:alarm.enabled");
       ESP_LOGI(TAG, "Service discovery complete. OTA service %s", this->ota_present_ ? "present" : "absent");
       // Not every scooter sends a security request after connecting; without one nothing starts SMP
-      // and every read is refused. While pairing is armed and no bond exists, start it ourselves.
-      if (this->pairing_armed_() && !this->is_bonded_())
-        this->start_pairing_encryption_("pairing armed, no bond yet");
+      // and every read is refused. Start it ourselves: a fresh pairing while armed, or re-encryption
+      // from the stored bond. The subscriptions above went out unencrypted in that case.
+      if (!this->link_encrypted_) {
+        this->subs_before_auth_ = true;
+        if (this->is_bonded_())
+          this->start_pairing_encryption_("re-encrypting from the bond");
+        else if (this->pairing_armed_())
+          this->start_pairing_encryption_("pairing armed, no bond yet");
+      }
       this->on_connected_();
       break;
     }
@@ -909,7 +928,7 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
           ESP_LOGW(TAG, "scooter refuses reads (status 0x%02X): the link is not encrypted%s", param->read.status,
                    this->pairing_armed_() ? "" : " — not paired? Press BLE Pairing Start");
         }
-        if (auth && this->pairing_armed_())
+        if (auth && (this->pairing_armed_() || this->is_bonded_()))
           this->start_pairing_encryption_("read refused");
         ESP_LOGV(TAG, "read of handle 0x%04X failed, status 0x%02X", param->read.handle, param->read.status);
         break;
@@ -1051,6 +1070,14 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
             this->ble_passkey_text_->publish_state("");  // spent — leave the field ready, not stale
           if (this->passkey_required_ != nullptr)
             this->passkey_required_->publish_state(false);
+          this->link_encrypted_ = true;
+          if (this->subs_before_auth_) {
+            // Encryption came after discovery: the notification subscriptions and the first reads
+            // were refused. Subscribe again and refresh everything on the encrypted link.
+            this->subs_before_auth_ = false;
+            this->resubscribe_notifications_();
+            this->on_connected_();
+          }
         } else if (this->pairing_armed_()) {
           // A deliberate attempt failed (wrong code or session timeout). Stay armed for the rest of
           // the window so the next PASSKEY_REQ is honoured, and back off before retrying: immediate
@@ -2433,6 +2460,18 @@ void LibrescootBleClient::start_pairing_encryption_(const char *why) {
   } else {
     ESP_LOGW(TAG, "could not start pairing (%s): %s", why, esp_err_to_name(err));
   }
+}
+
+void LibrescootBleClient::resubscribe_notifications_() {
+  this->sub_refused_warned_ = false;  // a refusal of this round is news again
+  int n = 0;
+  for (auto &e : this->chars_) {
+    if (e.notify && e.handle != 0) {
+      esp_ble_gattc_register_for_notify(this->get_gattc_if(), this->get_remote_bda(), e.handle);
+      n++;
+    }
+  }
+  ESP_LOGI(TAG, "link encrypted after discovery — notifications subscribed again (%d)", n);
 }
 
 bool LibrescootBleClient::is_bonded_() {
@@ -3889,7 +3928,10 @@ void LibrescootBleClient::on_button(BtnAction a) {
       break;
     case BtnAction::OTA_STATUS_REQ: {
       const uint8_t d[] = {0x05};
-      this->write_raw_(CharId::OTA_CONTROL, d, sizeof(d));
+      const bool linked = this->state() == espbt::ClientState::ESTABLISHED;
+      if (this->write_raw_(CharId::OTA_CONTROL, d, sizeof(d)))
+        ESP_LOGD("ota", "OTA Status Request: STATUS_REQ %s — the answer arrives as 'OTA_STATUS raw'",
+                 linked ? "sent" : "queued until the scooter is connected");
       break;
     }
     case BtnAction::OTA_ABORT:

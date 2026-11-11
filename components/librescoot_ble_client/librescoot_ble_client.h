@@ -741,7 +741,14 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // security request, so an armed pairing must start SMP itself). Cleared when a connection opens.
   bool enc_started_conn_{false};
   bool read_auth_warned_{false};  // one "read refused" warning per connection
+  bool sub_refused_warned_{false};  // one "subscription refused" warning per subscription round
+  // The current connection is encrypted (AUTH_CMPL success). Discovery subscribes to notifications
+  // right away; if that happened before encryption the scooter refused the subscriptions, so they
+  // are written again once the link is encrypted (subs_before_auth_).
+  bool link_encrypted_{false};
+  bool subs_before_auth_{false};
   void start_pairing_encryption_(const char *why);
+  void resubscribe_notifications_();
   // Reloading the BLE stack after the stack lost the scooter's key in RAM while the bond is still
   // stored (reason 82 with the bond held). 0 idle, 1 disable requested, 2 stack down, 3 enable
   // requested, 4 up and waiting for the bond list. Once per incident: reset by a successful auth.
