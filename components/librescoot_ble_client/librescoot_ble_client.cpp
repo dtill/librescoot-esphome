@@ -1021,7 +1021,7 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
           }
           this->passkey_req_open_ = true;
           ESP_LOGW(TAG, "!!! PIN REQUIRED !!! enter the passkey shown on the scooter dashboard");
-          ESP_LOGW(TAG, "    (HA pairing Repair, or the '<node>_passkey_reply' action).");
+          ESP_LOGW(TAG, "    (BLE Pairing Passkey + BLE Pairing Send Passkey, or the HA pairing Repair).");
           if (this->passkey_required_ != nullptr)
             this->passkey_required_->publish_state(true);
         } else {
@@ -3866,7 +3866,7 @@ void LibrescootBleClient::on_button(BtnAction a) {
       // the explicit second trigger, for a retry or for a caller that fills the field and then
       // presses (the Home Assistant pairing dialog drives exactly this pair of entities).
       if (this->pending_passkey_until_ms_ == 0) {
-        ESP_LOGW(TAG, "BLE Send Code: no passkey entered — type the dashboard code into BLE Passkey first");
+        ESP_LOGW(TAG, "BLE Pairing Send Passkey: no passkey entered — type the dashboard code into BLE Pairing Passkey first");
         break;
       }
       this->passkey_reply(this->pending_passkey_);
@@ -4147,7 +4147,7 @@ void LibrescootBleClient::on_text(TxtKind k, const std::string &value) {
       }
       break;
     case TxtKind::BLE_PASSKEY: {
-      // Holds the code shown on the scooter dashboard. Entering it does NOT send: 'BLE Send Code'
+      // Holds the code shown on the scooter dashboard. Entering it does NOT send: 'BLE Pairing Send Passkey'
       // does. Typing digits and pressing one button is the whole flow, and the value stays visible
       // so it can be sent again if the pairing session expired before the button was pressed.
       std::string digits;
@@ -4162,8 +4162,8 @@ void LibrescootBleClient::on_text(TxtKind k, const std::string &value) {
       this->pending_passkey_until_ms_ = millis() + PAIR_ARM_WINDOW_MS;
       this->pending_passkey_used_ = false;
       if (this->ble_passkey_text_ != nullptr)
-        this->ble_passkey_text_->publish_state(digits);  // keep it visible for 'BLE Send Code'
-      ESP_LOGI(TAG, "BLE Passkey %s stored — press 'BLE Send Code' to send it", digits.c_str());
+        this->ble_passkey_text_->publish_state(digits);  // keep it visible for 'BLE Pairing Send Passkey'
+      ESP_LOGI(TAG, "BLE Pairing Passkey %s stored — press 'BLE Pairing Send Passkey' to send it", digits.c_str());
       break;
     }
     case TxtKind::SYSTIME_ISO: {
