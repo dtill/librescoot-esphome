@@ -857,6 +857,8 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
       break;
     case ESP_GATTC_OPEN_EVT:
       this->auth_failed_conn_ = false;  // a new connection: its discovery is evaluated again
+      this->enc_started_conn_ = false;
+      this->read_auth_warned_ = false;
       break;
     case ESP_GATTC_SEARCH_CMPL_EVT: {
       // A discovery that completes on a link we are already dropping (authentication failed, or the
@@ -890,13 +892,28 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
         ESP_LOGW(TAG, "alarm state needs nRF >= v2.11.0-ls (service 9a590220 absent) — Alarm Status / "
                       "Triggered / Armed stay unknown; Alarm Enabled falls back to get:alarm.enabled");
       ESP_LOGI(TAG, "Service discovery complete. OTA service %s", this->ota_present_ ? "present" : "absent");
+      // Not every scooter sends a security request after connecting; without one nothing starts SMP
+      // and every read is refused. While pairing is armed and no bond exists, start it ourselves.
+      if (this->pairing_armed_() && !this->is_bonded_())
+        this->start_pairing_encryption_("pairing armed, no bond yet");
       this->on_connected_();
       break;
     }
     case ESP_GATTC_READ_CHAR_EVT: {
       this->read_in_flight_ = false;  // allow the next serialized read
-      if (param->read.status != ESP_GATT_OK)
+      if (param->read.status != ESP_GATT_OK) {
+        const bool auth = param->read.status == ESP_GATT_INSUF_AUTHENTICATION ||
+                          param->read.status == ESP_GATT_INSUF_ENCRYPTION;
+        if (auth && !this->read_auth_warned_) {
+          this->read_auth_warned_ = true;
+          ESP_LOGW(TAG, "scooter refuses reads (status 0x%02X): the link is not encrypted%s", param->read.status,
+                   this->pairing_armed_() ? "" : " — not paired? Press BLE Pairing Start");
+        }
+        if (auth && this->pairing_armed_())
+          this->start_pairing_encryption_("read refused");
+        ESP_LOGV(TAG, "read of handle 0x%04X failed, status 0x%02X", param->read.handle, param->read.status);
         break;
+      }
       for (auto &e : this->chars_) {
         if (e.handle != 0 && e.handle == param->read.handle) {
           e.force = false;  // this characteristic is confirmed read
@@ -2403,6 +2420,20 @@ void LibrescootBleClient::on_ota_test_service_(std::string url, int32_t size, st
 
 void LibrescootBleClient::on_ota_abort_service_() { this->ota_user_abort(); }
 #endif
+
+// Start SMP from our side (once per connection). The scooter then asks for the passkey shown on its
+// dashboard, exactly as when it sends the security request itself.
+void LibrescootBleClient::start_pairing_encryption_(const char *why) {
+  if (this->enc_started_conn_ || this->passkey_req_open_)
+    return;
+  this->enc_started_conn_ = true;
+  esp_err_t err = esp_ble_set_encryption(this->get_remote_bda(), ESP_BLE_SEC_ENCRYPT_MITM);
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "starting pairing from the ESP (%s) — the scooter should now show a code", why);
+  } else {
+    ESP_LOGW(TAG, "could not start pairing (%s): %s", why, esp_err_to_name(err));
+  }
+}
 
 bool LibrescootBleClient::is_bonded_() {
   if (this->get_address() == 0)

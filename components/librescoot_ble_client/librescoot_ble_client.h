@@ -737,6 +737,11 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // Authentication failed on the current connection: its service discovery describes a link that is
   // being torn down and must not be evaluated. Cleared when the next connection opens.
   bool auth_failed_conn_{false};
+  // Pairing started from the ESP side on the current connection (some scooters never send a
+  // security request, so an armed pairing must start SMP itself). Cleared when a connection opens.
+  bool enc_started_conn_{false};
+  bool read_auth_warned_{false};  // one "read refused" warning per connection
+  void start_pairing_encryption_(const char *why);
   // Reloading the BLE stack after the stack lost the scooter's key in RAM while the bond is still
   // stored (reason 82 with the bond held). 0 idle, 1 disable requested, 2 stack down, 3 enable
   // requested, 4 up and waiting for the bond list. Once per incident: reset by a successful auth.
