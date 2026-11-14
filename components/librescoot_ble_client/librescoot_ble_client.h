@@ -567,6 +567,9 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   bool dbc_autopower_active_{false};  // an on-wait is out or the dashboard is on because of us
   bool dbc_autopower_was_off_{false}; // power off again afterwards only if we switched it on
   uint8_t dbc_autopower_tries_{0};
+  bool hdelta_asked_{false};         // a manual DBC install waits for status:hdelta:dbc first
+  bool hdelta_ask_force_{false};
+  void hdelta_ask_done_();
   bool dbc_version_probe_{false};     // auto-update powered the dashboard on to learn its version
   bool dbc_probe_powered_{false};     // ...and it was off before: auto-update must switch it off again
   uint32_t dbc_probe_ms_{0};          // last fresh-version fetch round

@@ -1628,6 +1628,8 @@ void LibrescootBleClient::parse_cmd_response_(const std::string &line) {
     const bool mdb = line.compare(14, 4, "mdb:") == 0;
     const bool yes = line.compare(18, std::string::npos, "true") == 0;
     bool &flag = mdb ? this->hdelta_mdb_ : this->hdelta_dbc_;
+    if (!mdb && this->hdelta_asked_)
+      this->defer([this]() { this->hdelta_ask_done_(); });  // a DBC install waited for this answer
     // A dark dashboard answers false although its decoder is there; keep a confirmed true until
     // the board's version changes (set_*_version_ clears it).
     if (yes && !flag) {
@@ -3812,6 +3814,15 @@ void LibrescootBleClient::ota_settle_update_entity_() {
   this->refresh_update_availability_();
 }
 
+// The dashboard answered status:hdelta:dbc (or did not within 40 s): start the DBC install that
+// waited for it. hdelta_asked_ is still set, so perform_update goes straight on.
+void LibrescootBleClient::hdelta_ask_done_() {
+  if (!this->hdelta_asked_)
+    return;
+  this->cancel_timeout("hdelta_ask");
+  this->perform_update(1, this->hdelta_ask_force_);
+}
+
 void LibrescootBleClient::perform_update(uint8_t component, bool force) {
   if (this->ota_state_ != OtaState::IDLE || this->ota_resolve_running_ || !this->ota_jobs_.empty() ||
       this->ota_awaiting_version_) {
@@ -3827,6 +3838,24 @@ void LibrescootBleClient::perform_update(uint8_t component, bool force) {
       this->ota_status_->publish_state("Error: no byte source (HA integration/relay not reachable)");
     return;
   }
+  // A dark dashboard answers status:hdelta:dbc with false although it decodes .hdelta, so a DBC
+  // install started by hand would take the ~3x larger .delta. Power the dashboard on and ask once
+  // before resolving; OTA Auto Update's version probe has usually done this already.
+  if (component == 1 && this->ota_method_str_ == "delta" && !this->hdelta_dbc_ && !this->hdelta_asked_ &&
+      this->dbc_present_ && this->dbc_auto_power_ && this->connected()) {
+    this->hdelta_asked_ = true;
+    this->hdelta_ask_force_ = force;
+    if (this->dbc_power_known_ && !this->dbc_power_on_)
+      this->dbc_probe_powered_ = true;  // ours to switch off again, as with the version probe
+    this->dbc_version_probe_ = true;    // its on-wait reply queues status:hdelta:dbc
+    this->send_ext_query_("dbc:on-wait");
+    ESP_LOGI("ota", "install DBC: powering the dashboard on to ask whether it decodes .hdelta");
+    if (this->ota_status_ != nullptr)
+      this->ota_status_->publish_state("Waiting for the dashboard (hdelta check)");
+    this->set_timeout("hdelta_ask", 40000, [this]() { this->hdelta_ask_done_(); });
+    return;
+  }
+  this->hdelta_asked_ = false;
   this->ota_cancel_ = false;
   this->ota_resume_count_ = 0;
   this->ota_selfheal_count_ = 0;   // fresh user-initiated install: reset the auto-resume streak

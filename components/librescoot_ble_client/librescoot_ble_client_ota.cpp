@@ -185,6 +185,10 @@ void LibrescootBleClient::ota_user_abort() {
   }
   this->ota_jobs_.clear();               // don't start the next queued component (e.g. DBC)
   this->ota_cancel_ = true;              // discard a resolve result that may still be in flight
+  if (this->hdelta_asked_) {            // still waiting for the dashboard's hdelta answer
+    this->hdelta_asked_ = false;
+    this->cancel_timeout("hdelta_ask");
+  }
   this->ota_awaiting_version_ = false;   // stop waiting for the post-install reboot/version
   this->dbc_autopower_finish_();         // hand the dashboard back if we powered it on
   if (this->ota_state_ != OtaState::IDLE) {
