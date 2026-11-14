@@ -253,7 +253,8 @@ def _apply_board_tuning(use_cert_bundle: bool) -> None:
     ESP32-S3: force the legacy LE Create Connection. The tracker stops the scan and connects at
     once, which the BLE-5 extended connect rejects mid scan-disable ("Cmd Disallowed" → status 133
     in a loop). 2M PHY / extended advertising are unused here; MTU 247 and DLE are unaffected.
-    With PSRAM: let an internal-heap allocation fall back to PSRAM (the RSA-4096 CDN handshake).
+    With PSRAM: mbedTLS allocates through the component's own allocator — internal RAM first, PSRAM
+    only when no internal block is large enough (a 16 kB TLS record buffer on a fragmented heap).
     Without PSRAM: trade Wi-Fi/LwIP bandwidth the BLE-bound pipeline never uses for internal RAM
     (measured +22 kB free during a transfer), and leave the 100 kB certificate bundle out unless
     it was asked for — the component pins the GitHub roots itself.
@@ -268,7 +269,8 @@ def _apply_board_tuning(use_cert_bundle: bool) -> None:
     if variant == "ESP32S3":
         _sdk_default("CONFIG_BT_BLE_50_FEATURES_SUPPORTED", False)
     if _heap_rich():
-        _sdk_default("CONFIG_SPIRAM_TRY_ALLOCATE_WHEN_FAIL", True)
+        _sdk_default("CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC", False)
+        _sdk_default("CONFIG_MBEDTLS_CUSTOM_MEM_ALLOC", True)
         return
     if not use_cert_bundle:
         _sdk_default("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", False)

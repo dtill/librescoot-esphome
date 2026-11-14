@@ -22,6 +22,22 @@
 
 #include "github_ca.h"
 
+#ifdef CONFIG_MBEDTLS_CUSTOM_MEM_ALLOC
+// mbedTLS allocator on a PSRAM board (set by the component's codegen). Internal RAM first, as the
+// stock INTERNAL_MEM_ALLOC does — all of mbedTLS in PSRAM stalled the update check. PSRAM only when
+// the internal heap has no block large enough: with DYNAMIC_BUFFER every incoming 16 kB TLS record
+// needs ~16.7 kB contiguous, and a fragmented internal heap (largest block 16384 B, seen) failed
+// every direct-GitHub download with "alloc(16749 bytes) failed".
+// CUSTOM_MEM_ALLOC leaves mbedTLS on libc calloc until mbedtls_platform_set_calloc_free() is
+// called — setup() does that before any TLS session exists.
+#include "mbedtls/platform.h"
+static void *lsc_tls_calloc(size_t n, size_t size) {
+  return heap_caps_calloc_prefer(n, size, 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+static void lsc_tls_free(void *ptr) { heap_caps_free(ptr); }
+#endif
+
 namespace esphome {
 namespace librescoot_ble_client {
 
@@ -268,6 +284,9 @@ CharEntry *LibrescootBleClient::find_char_(CharId id) {
 }
 
 void LibrescootBleClient::setup() {
+#ifdef CONFIG_MBEDTLS_CUSTOM_MEM_ALLOC
+  mbedtls_platform_set_calloc_free(lsc_tls_calloc, lsc_tls_free);
+#endif
   BLEClientBase::setup();
   this->build_char_table_();
 
