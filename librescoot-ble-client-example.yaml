@@ -302,6 +302,11 @@ librescoot_ble_client:
   # out each reboot, then switch itself off when everything is up to date.
   ota_auto_update:
     name: "OTA Auto Update"
+    # RESTORE_DEFAULT_OFF: off on the first boot, then kept across restarts (ALWAYS_OFF: off every boot).
+    restore_mode: RESTORE_DEFAULT_OFF
+    # false: switches itself off once everything is installed. true: stays on and installs the next
+    # release when it appears.
+    keep_on: false
   # Merge a run of consecutive deltas into one artifact, so a scooter several releases behind needs
   # one install and one reboot instead of several. ON by default: while it applies, the update
   # entities offer the channel LATEST (with every release's notes) instead of the next release.

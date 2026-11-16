@@ -320,6 +320,7 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void set_pm_sched_hib(LibrescootSwitch *s) { pm_sched_hib_ = s; }
   void set_stage_only_switch(LibrescootSwitch *s) { stage_only_sw_ = s; }
   void set_auto_update_switch(LibrescootSwitch *s) { auto_update_sw_ = s; }
+  void set_auto_update_keep_on(bool on) { ota_auto_keep_on_ = on; }
 
   void set_command_text(text::Text *t) { command_text_ = t; }
   void set_apn_text(text::Text *t) { apn_text_ = t; }
@@ -635,7 +636,8 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // method and a reachable Home Assistant relay (the merge runs there). `ota_chain_want_` is the
   // user's choice, `ota_delta_chain_` is what actually applies; the switch shows the latter, so it
   // reads as off while the preconditions are missing and turns itself back on when they return.
-  bool ota_chain_want_{true};  // set from YAML (delta_chaining:), then by the switch
+  bool ota_chain_want_{true};  // set from YAML (delta_chaining:), then by the switch (NVS-persisted)
+  ESPPreferenceObject chain_want_pref_;
   // HDiffPatch deltas (.hdelta, about a third of a .delta). Always preferred where they help: per
   // board, only when that board's update-service confirmed its decoder (status:hdelta:<board>:true)
   // and the release carries a smaller .hdelta. A `true` holds until the board's installed version
@@ -816,7 +818,8 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void ota_learn_rate_(uint32_t moved, uint32_t dt_ms);
   std::string github_base_() const { return "https://github.com/" + this->github_repo_ + "/releases/download"; }
   void apply_ota_source_(const std::string &mode, bool persist);  // set mode → url, publish, persist
-  std::string ota_method_str_{"delta"};  // delta (default) or full (.mender image)
+  std::string ota_method_str_{"delta"};  // delta (default) or full (.mender image), NVS-persisted
+  ESPPreferenceObject ota_method_pref_;
   LibrescootSwitch *alarm_enabled_{nullptr}, *pm_sched_hib_{nullptr};
   LibrescootSwitch *stage_only_sw_{nullptr}, *auto_update_sw_{nullptr};
   text::Text *command_text_{nullptr}, *apn_text_{nullptr}, *pm_cron_text_{nullptr}, *pm_duration_text_{nullptr};
@@ -862,6 +865,8 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   bool ota_mdb_avail_{false}, ota_dbc_avail_{false};
   // OTA Auto Update: install every offered update unattended, then switch itself off when up to date.
   bool ota_auto_update_{false};
+  bool ota_auto_keep_on_{false};  // YAML ota_auto_update: keep_on — stay on after a finished run
+  bool ota_auto_idle_{false};     // kept on, everything installed; waiting for a new offer
   bool ota_auto_check_pending_{false};    // an auto-install fired; wait for a fresh check before "done"
   uint32_t ota_auto_next_ms_{0};          // periodic auto-update re-evaluation while the switch is on
   uint32_t next_avail_refresh_ms_{0};     // periodic refresh so a stale changelog/target self-corrects

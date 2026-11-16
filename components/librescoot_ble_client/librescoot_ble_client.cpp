@@ -311,6 +311,17 @@ void LibrescootBleClient::setup() {
   static const char *const MODES[] = {"disconnect", "scan", "auto", "always", "interval"};
   this->link_mode_str_ = MODES[idx <= 4 ? idx : 2];
 
+  // OTA Update Method and the delta-chaining choice survive a restart; without a saved value the
+  // defaults stand (delta, and the YAML's delta_chaining:).
+  this->ota_method_pref_ = global_preferences->make_preference<uint8_t>(fnv1_hash("librescoot_ble_client_ota_method"));
+  uint8_t mv;
+  if (this->ota_method_pref_.load(&mv))
+    this->ota_method_str_ = mv ? "full" : "delta";
+  this->chain_want_pref_ = global_preferences->make_preference<uint8_t>(fnv1_hash("librescoot_ble_client_chain_want"));
+  uint8_t cw;
+  if (this->chain_want_pref_.load(&cw))
+    this->ota_chain_want_ = cw != 0;
+
   if (this->scooter_lock_ != nullptr)
     this->scooter_lock_->publish_state(lock::LOCK_STATE_LOCKED);
   if (this->cmd_response_ != nullptr)
@@ -378,6 +389,19 @@ void LibrescootBleClient::setup() {
     osmode = osv ? "github" : "relay";
   this->apply_ota_source_(osmode, false);  // don't re-persist on boot
 
+  // OTA Auto Update follows its restore_mode (default RESTORE_DEFAULT_OFF: off on the first boot,
+  // then whatever it was before the restart). Switching it on runs the whole arm sequence, so do it
+  // after setup, once the other entities have their boot state.
+  if (this->auto_update_sw_ != nullptr) {
+    const bool on = this->auto_update_sw_->get_initial_state_with_restore_mode().value_or(false);
+    if (on) {
+      ESP_LOGI(TAG, "OTA Auto Update restored ON");
+      this->defer([this]() { this->on_switch(SwKind::AUTO_UPDATE, true); });
+    } else {
+      this->auto_update_sw_->publish_state(false);
+    }
+  }
+
   // Reachability of the HA-integration relay runs on the scheduler, not loop(): BLEClientBase
   // disables our loop() whenever the BLE link is idle, but this check must keep working then.
   this->set_interval("hi_check", 5000, [this]() { this->service_integration_check_(); });
@@ -403,10 +427,10 @@ void LibrescootBleClient::setup() {
     // Before the first check the entities are still in their default state, which Home Assistant
     // shows as an available update with an empty target. Park them right away.
     this->squelch_updates_();
-    // Chaining is wanted by default but cannot be effective before the relay has answered, so show
-    // it off now and let the first reachability check turn it on. The switch deliberately does NOT
-    // restore at boot: a restored OFF would be indistinguishable from "the relay was down", and a
-    // restore write would overwrite the default want before anything could be known.
+    // The wanted state is restored from NVS above, but chaining cannot be effective before the relay
+    // or the scooter has answered, so show it off now and let the first check turn it on if wanted.
+    // The switch itself does not restore: a restore write would go through control() and overwrite
+    // the saved want with the effective state, which is off at boot.
     if (this->chain_sw_ != nullptr)
       this->chain_sw_->publish_state(false);
     // The idle-gate only opens once the scooter has reported its OTA phase, so a reply that never
@@ -3714,6 +3738,18 @@ void LibrescootBleClient::ota_auto_update_tick_() {
     this->dbc_probe_release_("OTA Auto Update is off");
     return;
   }
+  // Kept on after a finished run (keep_on): wait quietly until the update entities offer something
+  // again, then start over as if just switched on — fresh versions first, with the settle time.
+  if (this->ota_auto_idle_) {
+    if (!this->ota_mdb_avail_ && !this->ota_dbc_avail_)
+      return;
+    ESP_LOGI(TAG, "auto-update: a new release is offered — fetching fresh versions, then installing");
+    this->ota_auto_idle_ = false;
+    this->ota_auto_armed_ms_ = millis();
+    this->dbc_probe_ms_ = 0;
+    this->ota_auto_check_pending_ = false;
+    return;
+  }
   // Gate hard: only act with the scooter fully idle + connected, the engine free, and versions known.
   // These gates also make us wait out an install's reboot before the next step.
   if (this->ota_scooter_phase_ != 0x06)
@@ -3796,8 +3832,13 @@ void LibrescootBleClient::ota_auto_update_tick_() {
   // Nothing offered → conclude "all up to date" only after a fresh check has completed since the last
   // auto-install (ota_auto_check_pending_ is cleared in apply_check_result_), then switch off.
   if (!this->ota_auto_check_pending_ && this->gh_ok_) {
-    ESP_LOGI(TAG, "auto-update: everything up to date — switching OTA Auto Update off");
     this->dbc_probe_release_("nothing left to install");
+    if (this->ota_auto_keep_on_) {
+      ESP_LOGI(TAG, "auto-update: everything up to date — staying on for the next release");
+      this->ota_auto_idle_ = true;
+      return;
+    }
+    ESP_LOGI(TAG, "auto-update: everything up to date — switching OTA Auto Update off");
     this->ota_auto_update_ = false;
     if (this->auto_update_sw_ != nullptr)
       this->auto_update_sw_->publish_state(false);
@@ -4052,6 +4093,10 @@ void LibrescootBleClient::on_select(LibrescootSelect *sel, const std::string &va
       // re-run the update check so the entities and per-component targets reflect the new choice.
       this->ota_method_str_ = value;
       sel->publish_state(value);
+      {
+        uint8_t v = value == "full" ? 1 : 0;
+        this->ota_method_pref_.save(&v);
+      }
       this->update_chain_switch_();
       // The target is recomputed from the retained tag list for the new method immediately; a
       // background re-check just refreshes the changelog + asset sizes for the new method.
@@ -4143,6 +4188,10 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
       // report "unavailable" over the API, so refuse instead of accepting a setting that could
       // not be honoured.
       this->ota_chain_want_ = state;
+      {
+        uint8_t v = state ? 1 : 0;
+        this->chain_want_pref_.save(&v);
+      }
       if (state && !this->chain_possible_())
         ESP_LOGW(TAG, "delta chaining needs OTA Update Method 'delta' and staged installs or a reachable HA relay "
                       "(method '%s', relay %s) — it engages as soon as both hold",
@@ -4151,8 +4200,9 @@ void LibrescootBleClient::on_switch(SwKind k, bool state) {
       break;
     case SwKind::AUTO_UPDATE:
       // Install every offered update unattended (per the availability rules), then switch itself off
-      // once everything is up to date after a fresh GitHub check.
+      // once everything is up to date after a fresh GitHub check (or wait for the next one: keep_on).
       this->ota_auto_update_ = state;
+      this->ota_auto_idle_ = false;
       if (this->auto_update_sw_ != nullptr)
         this->auto_update_sw_->publish_state(state);
       ESP_LOGI(TAG, "OTA Auto Update %s", state ? "ON (2 min settle, fresh versions first)" : "off");

@@ -81,7 +81,7 @@ librescoot_ble_client:
 | `update_check_interval` | `6h` | How often to look for a new release. |
 | `github_token` | — | Optional GitHub token (read-only). Lifts the release-check limit from 60 to 5000 per hour. |
 | `dbc_auto_power` | `true` | Switch the dashboard on when a dashboard update needs it: to hand the update over, to apply it, and to read its version. |
-| `delta_chaining` | `true` | Offer the newest (or pinned) release and install every release in between in one go — staged on the scooter where it supports that, else merged by Home Assistant. Needs method `delta`; see [Chained delta updates](#chained-delta-updates). |
+| `delta_chaining` | `true` | Starting value of the switch; once set in Home Assistant, the switch's choice is kept across restarts. Offer the newest (or pinned) release and install every release in between in one go — staged on the scooter where it supports that, else merged by Home Assistant. Needs method `delta`; see [Chained delta updates](#chained-delta-updates). |
 | `link_auto_hold` | `3min` | Link mode `auto`: how long to hold the connection before letting a phone in for ~20 s. |
 | `link_interval` | `5min` | Link mode `interval`: how often to connect and refresh the sensors. |
 | `presence_timeout` | `60s` | How long **BLE Presence** stays on after the scooter was last heard. |
@@ -262,9 +262,16 @@ at a time. Before every step it waits a few minutes
 (2 after switching on, 5 after a scooter reboot), switches the dashboard on and asks both parts
 for their versions; it never decides on a cached version. Before a scooter-computer step it
 switches the dashboard off again, because the scooter only reboots into the new version with the
-dashboard off; a dashboard that was already on stays on. It switches itself **off** when done,
-on the first failed install, and after every ESP restart. Switch it on in the evening, check
-**SW MDB** / **SW DBC** in the morning.
+dashboard off; a dashboard that was already on stays on. It switches itself **off** when done
+and on the first failed install. Switch it on in the evening, check **SW MDB** / **SW DBC** in the
+morning.
+
+Options under `ota_auto_update:` in the YAML:
+
+| Option | Default | Description |
+| :--- | :--- | :--- |
+| `restore_mode` | `RESTORE_DEFAULT_OFF` | Off on the first boot, then kept across ESP restarts. `ALWAYS_OFF`: off after every restart. |
+| `keep_on` | `false` | `true`: stays on when everything is installed and installs the next release when it appears. It still switches off after a failed install. |
 
 ### A specific version
 
@@ -343,9 +350,9 @@ On an **ESP32-S3** the ESP can download the firmware from GitHub by itself, so u
 | OTA MDB Install / OTA DBC Install | button | Install now — **OTA Version** if set, else the next release. | `ota_mdb_update` / `ota_dbc_update` |
 | OTA Version | text | Goal release for the install buttons, the update entities and OTA Auto Update. Prefilled with the offered one; clear it to follow the newest. | `ota_version` |
 | OTA channel | select | `stable` / `testing` / `nightly` | `ota_channel` |
-| OTA Update Method | select | `delta` / `full` | `ota_update_method` |
-| OTA Update Method delta-chaining | switch | See above. On by default; shows off while its conditions are not met, and comes back by itself when they are. | `ota_delta_chaining` |
-| OTA Auto Update | switch | See above. Off after every ESP restart. | `ota_auto_update` |
+| OTA Update Method | select | `delta` / `full`, kept across restarts | `ota_update_method` |
+| OTA Update Method delta-chaining | switch | See above. On by default, your choice is kept across restarts; shows off while its conditions are not met, and comes back by itself when they are. | `ota_delta_chaining` |
+| OTA Auto Update | switch | See above. Kept across ESP restarts (see `restore_mode`). | `ota_auto_update` |
 | OTA Stage Only | switch | Transfer but do not install (for testing). Off after every ESP restart. | `ota_stage_only` |
 | OTA Source | select | `HA relay` / `direct GitHub` | `ota_source` |
 | OTA Source URL | text | Where the firmware bytes come from. Set by the integration. | `ota_source_url` |

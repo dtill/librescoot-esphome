@@ -304,10 +304,11 @@ SWITCHES = {
     # vehicle state. Refuses without the dbc commands (nRF >= v2.11.0-ls).
     "dbc_power": ("set_dbc_power", SwKind.DBC_POWER, "diagnostic", "mdi:monitor", "DISABLED"),
     "pm_scheduled_hibernate_enabled": ("set_pm_sched_hib", SwKind.PM_SCHED_HIB, "config", "mdi:calendar-clock", "DISABLED"),
-    # Runtime OTA controls (no scooter write, just local flags), so ALWAYS_OFF is right here: both
-    # start OFF every boot and auto-update can never restore ON and install unattended.
+    # Runtime OTA controls (no scooter write, just local flags). Stage Only starts OFF every boot.
+    # Auto Update applies its restore_mode itself: off on the first boot, then kept across restarts;
+    # ALWAYS_OFF in the YAML makes it start off every boot.
     "ota_stage_only": ("set_stage_only_switch", SwKind.STAGE_ONLY, "diagnostic", "mdi:package-variant-closed", "ALWAYS_OFF"),
-    "ota_auto_update": ("set_auto_update_switch", SwKind.AUTO_UPDATE, "diagnostic", "mdi:auto-download", "ALWAYS_OFF"),
+    "ota_auto_update": ("set_auto_update_switch", SwKind.AUTO_UPDATE, "diagnostic", "mdi:auto-download", "RESTORE_DEFAULT_OFF"),
     # Wanted ON by default (it is what makes a scooter several releases behind updatable in one
     # install), but only effective with the delta method and a reachable HA relay — the component
     # publishes the effective state. DISABLED: a boot write would overwrite that default want.
@@ -391,6 +392,12 @@ _ENTITY_SCHEMAS.update(
         cv.Optional(k): switch.switch_schema(LibrescootSwitch, default_restore_mode=rm, **_ekw(ec, icon))
         for k, (_s, _kd, ec, icon, rm) in SWITCHES.items()
     }
+)
+# keep_on: OTA Auto Update stays on after everything is installed and installs the next release
+# when it appears, instead of switching itself off.
+CONF_KEEP_ON = "keep_on"
+_ENTITY_SCHEMAS[cv.Optional("ota_auto_update")] = _ENTITY_SCHEMAS[cv.Optional("ota_auto_update")].extend(
+    {cv.Optional(CONF_KEEP_ON, default=False): cv.boolean}
 )
 _ENTITY_SCHEMAS.update(
     {cv.Optional(k): button.button_schema(LibrescootButton, **_ekw(ec, icon)) for k, (_a, ec, icon) in BUTTONS.items()}
@@ -584,6 +591,8 @@ async def to_code(config):
             await cg.register_parented(sw, var)
             cg.add(sw.set_kind(kind))
             cg.add(getattr(var, setter)(sw))
+            if key == "ota_auto_update":
+                cg.add(var.set_auto_update_keep_on(config[key][CONF_KEEP_ON]))
 
     # --- buttons ---
     for key, (action, _ec, _icon) in BUTTONS.items():
