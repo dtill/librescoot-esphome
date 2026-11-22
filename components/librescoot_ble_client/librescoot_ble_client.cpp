@@ -1598,7 +1598,7 @@ void LibrescootBleClient::handle_char_value_(CharId id, uint8_t *v, uint16_t len
     case CharId::ALARM_STATUS:
     case CharId::ALARM_TRIGGER: {
       // Raw dump kept at debug level: the formats are known only from the phone app's parser.
-      char hex[3 * 24 + 1];
+      char hex[3 * 24 + 1] = "";
       size_t n = 0;
       for (uint16_t i = 0; i < len && i < 24; i++)
         n += snprintf(hex + n, sizeof(hex) - n, "%02X ", v[i]);
