@@ -248,7 +248,7 @@ def _sdk_default(name: str, value) -> None:
 def _apply_board_tuning(use_cert_bundle: bool) -> None:
     """The sdkconfig this component needs on each board, so the YAML only says what hardware it is.
 
-    Both boards: a small mbedTLS footprint — only short requests are ever sent, the large input
+    Both boards: keep the stored bond when a pairing fails, and a small mbedTLS footprint — only short requests are ever sent, the large input
     buffer stays for the CDN's TLS records.
     ESP32-S3: force the legacy LE Create Connection. The tracker stops the scan and connects at
     once, which the BLE-5 extended connect rejects mid scan-disable ("Cmd Disallowed" → status 133
@@ -259,6 +259,10 @@ def _apply_board_tuning(use_cert_bundle: bool) -> None:
     (measured +22 kB free during a transfer), and leave the 100 kB certificate bundle out unless
     it was asked for — the component pins the GitHub roots itself.
     """
+    # A failed pairing must never erase the stored bond: the BLE stack can lose the scooter's key
+    # from RAM and then starts a pairing, which this component refuses; with the default the
+    # refusal would also delete the key from flash. Unbonding stays the explicit buttons' job.
+    _sdk_default("CONFIG_BT_BLE_SMP_REMOVE_BOND_ON_PAIR_FAIL_AS_CENTRAL", False)
     _sdk_default("CONFIG_MBEDTLS_DYNAMIC_BUFFER", True)
     _sdk_default("CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN", 4096)
     _sdk_default("CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN", True)

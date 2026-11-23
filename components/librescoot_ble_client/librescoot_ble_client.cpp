@@ -900,6 +900,7 @@ bool LibrescootBleClient::gattc_event_handler(esp_gattc_cb_event_t event, esp_ga
       break;
     case ESP_GATTC_OPEN_EVT:
       this->auth_failed_conn_ = false;  // a new connection: its discovery is evaluated again
+      this->passkey_refused_conn_ = false;
       this->enc_started_conn_ = false;
       this->read_auth_warned_ = false;
       this->link_encrypted_ = false;
@@ -1087,14 +1088,33 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
           if (this->passkey_required_ != nullptr)
             this->passkey_required_->publish_state(true);
         } else {
-          // Unrequested (lost/stale bond) — refuse and release the link so the scooter isn't
-          // spammed with pairing prompts. The user re-bonds intentionally via 'Pair Scooter'.
+          // Unrequested — refuse. With the bond still stored this is not a lost bond but the BLE
+          // stack having dropped the scooter's key from RAM (with the key it would re-encrypt and
+          // never start a pairing): reload the stack from flash once the refusal has completed.
+          // Without a stored bond, or when the reload did not help, release the link so the
+          // scooter isn't spammed with pairing prompts; re-bonding is a deliberate act.
           esp_ble_passkey_reply(param->ble_security.auth_cmpl.bd_addr, false, 0);
+          this->passkey_refused_conn_ = true;
+          if (this->is_bonded_() && !this->ble_reload_used_ && this->ble_reload_phase_ == 0) {
+            ESP_LOGW(TAG, "Scooter started a fresh pairing although the bond is stored — refused; the "
+                          "BLE stack lost the scooter's key from RAM, reloading it from flash");
+            this->lost_key_passkey_ = true;
+            // Normally the AUTH_CMPL failure of the refused pairing starts the reload; if it never
+            // arrives, start it anyway.
+            this->set_timeout("lost_key", 3000, [this]() {
+              if (this->lost_key_passkey_) {
+                this->lost_key_passkey_ = false;
+                this->recover_lost_key_("no answer to the refused pairing", 0);
+              }
+            });
+            this->set_enabled(false);
+            break;
+          }
           this->pairing_blocked_ = true;
           if (this->passkey_required_ != nullptr)
             this->passkey_required_->publish_state(true);
           ESP_LOGW(TAG, "Scooter wants to (re)pair but pairing is NOT armed — refused, link "
-                        "released. Press 'Pair Scooter' (or the HA pairing Repair) to bond.");
+                        "released. Press 'BLE Pairing Start' (or the HA pairing Repair) to bond.");
           this->set_enabled(false);
         }
       }
@@ -1107,6 +1127,7 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
           this->pairing_blocked_ = false;
           this->reauth_fail_count_ = 0;
           this->ble_reload_used_ = false;  // the incident is over; a later one may reload again
+          this->lost_key_passkey_ = false;
           this->pair_backoff_until_ms_ = 0;
           this->pending_passkey_until_ms_ = 0;  // bonded; forget the code
           if (this->ble_passkey_text_ != nullptr)
@@ -1148,23 +1169,23 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
           // because the scooter then asks for a passkey, and an unrequested PASSKEY_REQ blocks.
           const bool key_missing = (r == 0x06);
           this->auth_failed_conn_ = true;
-          // The scooter refusing a PAIRING while the bond is stored means this ESP's BLE stack has lost
-          // the scooter's key from RAM: with the key it would re-encrypt and never start a pairing.
-          // Retrying cannot help — only reloading the stack from flash does. Once per incident, and
-          // not while the OTA engine holds anything (the reload drops every BLE state).
-          const bool ota_busy = this->ota_state_ != OtaState::IDLE || this->ota_active_ ||
-                                !this->ota_jobs_.empty() || this->ota_resolve_running_ ||
-                                this->ota_awaiting_version_;
-          if (r == 77 + 0x05 && this->is_bonded_() && !this->ble_reload_used_ && !ota_busy &&
-              this->ble_reload_phase_ == 0) {
-            ESP_LOGW(TAG, "Re-encryption failed: %s (reason %d), but the bond is stored — the BLE stack "
-                          "lost the scooter's key from RAM. Reloading the BLE stack from flash.",
-                     auth_fail_reason(r), r);
-            this->ble_reload_used_ = true;
-            this->set_enabled(false);
-            this->defer([this]() { this->start_ble_reload_(); });
+          // The failure of a pairing we refused because the key was lost from RAM, or one arriving
+          // while the stack is being reloaded: the reload handles it, nothing to back off from.
+          if (this->lost_key_passkey_) {
+            this->lost_key_passkey_ = false;
+            this->cancel_timeout("lost_key");
+            if (this->recover_lost_key_("refused the fresh pairing the scooter started", r))
+              break;
+          }
+          if (this->ble_reload_phase_ != 0) {
+            ESP_LOGD(TAG, "authentication failure during the BLE stack reload (reason %d) — ignored", r);
             break;
           }
+          // The scooter refusing a PAIRING while the bond is stored means this ESP's BLE stack has lost
+          // the scooter's key from RAM: with the key it would re-encrypt and never start a pairing.
+          // Retrying cannot help — only reloading the stack from flash does.
+          if (r == 77 + 0x05 && this->recover_lost_key_("the scooter refused a fresh pairing", r))
+            break;
           if (!key_missing && this->is_bonded_()) {
             const uint8_t step = this->reauth_fail_count_ < REAUTH_BACKOFF_STEPS
                                      ? this->reauth_fail_count_
@@ -1173,9 +1194,18 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
             if (this->reauth_fail_count_ < 255)
               this->reauth_fail_count_++;
             this->pair_backoff_until_ms_ = millis() + wait;
-            ESP_LOGW(TAG, "Re-encryption failed: %s (reason %d) — bond still held, retrying in %u s "
-                          "(attempt %u)",
-                     auth_fail_reason(r), r, (unsigned) (wait / 1000), (unsigned) this->reauth_fail_count_);
+            if (r == 77 + 0x05) {
+              // The BLE stack started a pairing instead of re-encrypting, so it still misses the key
+              // after the reload. The scooter is fine; a restart of the ESP loads the key again.
+              ESP_LOGW(TAG, "Re-encryption failed: this ESP lost the scooter's key from RAM and the BLE "
+                            "stack reload did not bring it back (reason %d). The bond is still stored — "
+                            "restart the ESP. Retrying in %u s (attempt %u)",
+                       r, (unsigned) (wait / 1000), (unsigned) this->reauth_fail_count_);
+            } else {
+              ESP_LOGW(TAG, "Re-encryption failed: %s (reason %d) — bond still held, retrying in %u s "
+                            "(attempt %u)",
+                       auth_fail_reason(r), r, (unsigned) (wait / 1000), (unsigned) this->reauth_fail_count_);
+            }
             this->set_timeout("pair_backoff", wait, [this]() { this->apply_link_state_(); });
             this->apply_link_state_();
             break;
@@ -1185,7 +1215,8 @@ void LibrescootBleClient::gap_event_handler(esp_gap_ble_cb_event_t event, esp_bl
           ESP_LOGW(TAG, "Unrequested pairing failed: %s (reason %d) — link released so the scooter "
                         "isn't spammed. Press 'BLE Pairing Start' (or the HA pairing Repair) to "
                         "(re)bond.",
-                   auth_fail_reason(r), r);
+                   this->passkey_refused_conn_ ? "refused by this ESP (pairing not armed)" : auth_fail_reason(r),
+                   r);
           this->pairing_blocked_ = true;
           this->set_enabled(false);
         }
@@ -2172,6 +2203,7 @@ void LibrescootBleClient::apply_link_state_() {
   bool want = has_mac && !this->pairing_blocked_ && !backoff && may_link &&
               !this->check_link_release_ &&    // update check owns the heap for the moment
               !this->resolve_link_release_ &&  // asset lookup does, for its handshake
+              this->ble_reload_phase_ == 0 &&   // the BLE stack is being reloaded
               (this->ota_active_ || this->interval_refreshing_ || continuous);
   this->set_enabled(want);
 }
@@ -2424,11 +2456,25 @@ void LibrescootBleClient::start_ble_reload_() {
   this->set_interval("ble_reload", 200, [this]() { this->service_ble_reload_(); });
 }
 
+bool LibrescootBleClient::recover_lost_key_(const char *how, uint8_t reason) {
+  if (!this->is_bonded_() || this->ble_reload_used_ || this->ble_reload_phase_ != 0)
+    return false;
+  // Also while an update is queued or running: without the key no link can carry it anyway, and
+  // the reload hands a running transfer to the regular disconnect handling, which resumes it.
+  ESP_LOGW(TAG, "BLE stack lost the scooter's key from RAM (%s, reason %d) — the bond is stored, "
+                "reloading the BLE stack from flash", how, reason);
+  this->ble_reload_used_ = true;
+  this->set_enabled(false);
+  this->defer([this]() { this->start_ble_reload_(); });
+  return true;
+}
+
 void LibrescootBleClient::ble_before_disabled_event_handler() {
   // A torn-down stack delivers no CLOSE_EVT, so do here what the disconnect handler would.
   for (auto &e : this->chars_)
     e.handle = 0;
   this->pending_queries_.clear();
+  this->ota_handle_disconnect_();  // a running transfer resumes after the reload
   this->mark_unknown_();
   BLEClientBase::ble_before_disabled_event_handler();
   if (this->ble_reload_phase_ == 1)

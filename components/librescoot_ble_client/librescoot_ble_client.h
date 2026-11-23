@@ -725,6 +725,9 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   void ble_before_disabled_event_handler() override;
   void start_ble_reload_();
   void service_ble_reload_();
+  // The BLE stack lost the scooter's key from RAM while the bond is still stored: reload it, once
+  // per incident. False when that is not the case (no stored bond, already tried, reload running).
+  bool recover_lost_key_(const char *how, uint8_t reason);
 #ifdef USE_API
   void on_passkey_service_(int32_t pin);  // int32_t: distinct from int on xtensa
   void on_ota_test_service_(std::string url, int32_t size, std::string bundle, int32_t component);
@@ -759,6 +762,11 @@ class LibrescootBleClient : public esp32_ble_client::BLEClientBase
   // requested, 4 up and waiting for the bond list. Once per incident: reset by a successful auth.
   uint8_t ble_reload_phase_{0};
   bool ble_reload_used_{false};
+  // We refused an unrequested PASSKEY_REQ while the bond was stored (the RAM key loss shows up this
+  // way on a scooter that accepts a fresh pairing): the AUTH_CMPL failure that follows starts the
+  // reload instead of blocking pairing.
+  bool lost_key_passkey_{false};
+  bool passkey_refused_conn_{false};  // this ESP refused the pairing on the current connection
   uint32_t ble_reload_started_ms_{0};
   bool bond_seen_{false};  // last observed bond-list membership, to log the transition
   // The update check may release the BLE link on a board whose heap cannot carry both.
