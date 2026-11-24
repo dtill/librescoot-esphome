@@ -69,7 +69,7 @@ A full example with every sub-entity is in [`../../librescoot-battery-nfc-exampl
 
 ## Requirements
 
-* ESPHome  (tested on Version `2026.4.5`).
+* ESPHome  (compile-tested on Version `2026.11.0`).
 * An ESP board. Tested on ESP8266 NodeMCU; ESP32 should work without changes (the PN532 part is hardware-agnostic).
 * A **PN532 NFC board**. The **HW-147 PN-NFC v3** (red, large square antenna) is strongly recommended — the battery's NFC coil sits behind the pack housing and needs a stronger antenna than the small round-antenna breakouts can reliably provide.
 * The stock ESPHome `pn532_i2c` component (auto-loaded as a dependency).
@@ -209,7 +209,7 @@ The battery exposes an NT3H2111 NTAG surface over NFC Type-4. Telemetry sits at 
 | `CMD_SEATBOX_CLOSED` | `0x4D4B4D4B` | Seatbox just closed |
 | `CMD_HEARTBEAT_SCOOTER` | `0x534E4A41` | Active-keep ping (defined in the Go FSM but unused there — empirically required for our polling cadence) |
 
-PN532 access uses the standard C++ "Rob" idiom to reach upstream `pn532::PN532`'s protected `read_mifare_ultralight_bytes_` / `write_mifare_ultralight_page_` / inlist / RF-off primitives without modifying the upstream source. See the namespace `rob` block in [`lsc_battery_nfc.cpp`](lsc_battery_nfc.cpp).
+PN532 access uses the standard C++ "Rob" idiom to reach upstream `pn532::PN532`'s protected `write_command_` / `read_response` primitives (tag read/write, inlist and RF-off are built on those two) without modifying the upstream source. See the namespace `rob` block in [`lsc_battery_nfc.cpp`](lsc_battery_nfc.cpp).
 
 ---
 

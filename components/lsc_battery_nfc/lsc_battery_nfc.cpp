@@ -1,6 +1,7 @@
 #include "lsc_battery_nfc.h"
 
 #include "esphome/core/log.h"
+#include "esphome/core/version.h"
 
 #include <cstdio>
 #include <cstring>
@@ -17,6 +18,18 @@ static const char *const TAG_DUMP = "lsc_battery_nfc.full_dump";
 // instantiation does not enforce access checks on the template arguments.
 // ---------------------------------------------------------------------------
 
+// ESPHome 2026.10 moved the PN532 API from std::vector to std::span / a
+// fixed-size PN532Frame. Only write_command_ and read_response are used for
+// data transfer (the Ultralight helpers changed signature again in 2026.11),
+// so these two aliases cover every supported version.
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026, 10, 0)
+using PN532WriteArg = std::span<const uint8_t>;
+using PN532Response = pn532::PN532Frame;
+#else
+using PN532WriteArg = const std::vector<uint8_t> &;
+using PN532Response = std::vector<uint8_t>;
+#endif
+
 namespace rob {
 
 template<typename Tag, typename Tag::type M>
@@ -24,10 +37,10 @@ struct Accessor {
   friend typename Tag::type lsc_rob_ptr(Tag) { return M; }
 };
 
-struct TWrite { using type = bool (pn532::PN532::*)(const std::vector<uint8_t> &); friend type lsc_rob_ptr(TWrite); };
+struct TWrite { using type = bool (pn532::PN532::*)(PN532WriteArg); friend type lsc_rob_ptr(TWrite); };
 template struct Accessor<TWrite, &pn532::PN532::write_command_>;
 
-struct TResp  { using type = bool (pn532::PN532::*)(uint8_t, std::vector<uint8_t> &); friend type lsc_rob_ptr(TResp); };
+struct TResp  { using type = bool (pn532::PN532::*)(uint8_t, PN532Response &); friend type lsc_rob_ptr(TResp); };
 template struct Accessor<TResp,  &pn532::PN532::read_response>;
 
 struct TRdy   { using type = bool (pn532::PN532::*)(); friend type lsc_rob_ptr(TRdy); };
@@ -35,12 +48,6 @@ template struct Accessor<TRdy,   &pn532::PN532::is_read_ready>;
 
 struct TAck   { using type = void (pn532::PN532::*)(); friend type lsc_rob_ptr(TAck); };
 template struct Accessor<TAck,   &pn532::PN532::send_ack_>;
-
-struct TReadU { using type = bool (pn532::PN532::*)(uint8_t, uint16_t, std::vector<uint8_t> &); friend type lsc_rob_ptr(TReadU); };
-template struct Accessor<TReadU, &pn532::PN532::read_mifare_ultralight_bytes_>;
-
-struct TWriteU { using type = bool (pn532::PN532::*)(uint8_t, const uint8_t *, size_t); friend type lsc_rob_ptr(TWriteU); };
-template struct Accessor<TWriteU, &pn532::PN532::write_mifare_ultralight_page_>;
 
 struct TUid   { using type = nfc::NfcTagUid pn532::PN532::*; friend type lsc_rob_ptr(TUid); };
 template struct Accessor<TUid,   &pn532::PN532::current_uid_>;
@@ -191,13 +198,16 @@ bool LSCBatteryNFC::poll_for_tag_(uint32_t timeout_ms, std::vector<uint8_t> &res
   auto read_fn  = lsc_rob_ptr(rob::TResp{});
   auto rdy_fn   = lsc_rob_ptr(rob::TRdy{});
 
-  if (!(this->pn532_->*write_fn)({0x4A, 0x01, 0x00})) return false;
+  const std::vector<uint8_t> cmd{0x4A, 0x01, 0x00};
+  if (!(this->pn532_->*write_fn)(cmd)) return false;
 
   uint32_t start = millis();
   while (millis() - start < timeout_ms) {
     if ((this->pn532_->*rdy_fn)()) {
       resp.clear();
-      if (!(this->pn532_->*read_fn)(0x4A, resp)) return false;
+      PN532Response frame;
+      if (!(this->pn532_->*read_fn)(0x4A, frame)) return false;
+      resp.assign(frame.begin(), frame.end());
       return !resp.empty() && resp[0] >= 1;
     }
     delay(5);
@@ -207,18 +217,34 @@ bool LSCBatteryNFC::poll_for_tag_(uint32_t timeout_ms, std::vector<uint8_t> &res
 }
 
 bool LSCBatteryNFC::ntag_read_block_(uint8_t page, std::vector<uint8_t> &out) {
-  auto fn = lsc_rob_ptr(rob::TReadU{});
+  auto write_fn = lsc_rob_ptr(rob::TWrite{});
+  auto read_fn  = lsc_rob_ptr(rob::TResp{});
+  // InDataExchange, target 1, MIFARE READ (0x30): returns 4 pages = 16 bytes.
+  const std::vector<uint8_t> cmd{0x40, 0x01, 0x30, page};
   for (int attempt = 0; attempt < 2; attempt++) {
     out.clear();
-    if ((this->pn532_->*fn)(page, 16, out) && out.size() >= 16) return true;
+    PN532Response resp;
+    // Response layout: [0] status (0x00 = OK), [1..16] data.
+    if ((this->pn532_->*write_fn)(cmd) && (this->pn532_->*read_fn)(0x40, resp) &&
+        resp.size() >= 17 && resp[0] == 0x00) {
+      out.assign(resp.begin() + 1, resp.begin() + 17);
+      return true;
+    }
     delay(3);
   }
   return false;
 }
 
 bool LSCBatteryNFC::ntag_write_page_(uint8_t page, const uint8_t *data4) {
-  auto fn = lsc_rob_ptr(rob::TWriteU{});
-  return (this->pn532_->*fn)(page, data4, 4);
+  auto write_fn = lsc_rob_ptr(rob::TWrite{});
+  auto read_fn  = lsc_rob_ptr(rob::TResp{});
+  // InDataExchange, target 1, NTAG WRITE (0xA2): one 4-byte page.
+  const std::vector<uint8_t> cmd{0x40, 0x01, 0xA2, page, data4[0], data4[1], data4[2], data4[3]};
+  if (!(this->pn532_->*write_fn)(cmd)) return false;
+  PN532Response resp;
+  // The status byte is deliberately not evaluated: the pre-2026.10 upstream
+  // helper this replaces only required a response frame.
+  return (this->pn532_->*read_fn)(0x40, resp);
 }
 
 bool LSCBatteryNFC::write_command_raw_(uint32_t cmd) {
@@ -234,9 +260,10 @@ bool LSCBatteryNFC::write_command_raw_(uint32_t cmd) {
 void LSCBatteryNFC::rf_off_() {
   auto write_fn = lsc_rob_ptr(rob::TWrite{});
   auto read_fn  = lsc_rob_ptr(rob::TResp{});
-  if (!(this->pn532_->*write_fn)({0x32, 0x01, 0x00})) return;
+  const std::vector<uint8_t> cmd{0x32, 0x01, 0x00};
+  if (!(this->pn532_->*write_fn)(cmd)) return;
   delay(2);
-  std::vector<uint8_t> resp;
+  PN532Response resp;
   (this->pn532_->*read_fn)(0x32, resp);
 }
 
